@@ -1,0 +1,36 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "zna"
+version = "0.1.0"
+description = "Compressed (z) Nucleic (n) Acid (a) binary format"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "GPLv3"}
+
+authors = [
+  {name = "Matthew Iyer", email = "mkiyer@umich.edu"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "zstandard"
+]
+
+[project.scripts]
+# This creates the 'zna' command line tool
+zna = "zna.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "mypy"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
