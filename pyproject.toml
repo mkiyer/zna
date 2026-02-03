@@ -1,6 +1,6 @@
 [build-system]
-requires = ["flit_core >=3.2,<4"]
-build-backend = "flit_core.buildapi"
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "zna"
@@ -34,3 +34,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.scikit-build]
+wheel.packages = ["src/zna"]
+build-dir = "build/{wheel_tag}"
+cmake.minimum-version = "3.15"
+cmake.build-type = "Release"

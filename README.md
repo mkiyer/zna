@@ -1,28 +1,40 @@
 # ZNA: Compressed Nucleic Acid Format
 
-**ZNA** (Compressed **Z**-Nucleic **N**-Acid **A**) is a specialized binary format for storing DNA/RNA sequences with high compression efficiency and fast I/O performance.
+**ZNA** (Compressed **Z**-Nucleic **N**-Acid **A**) is a high-performance binary format for storing DNA/RNA sequences with exceptional compression and I/O speed.
+
+## Performance
+
+- **135 MB/s roundtrip** throughput (9.5x faster than Python baseline)
+- **2.8+ GB/s** encoding/decoding for long reads
+- **3.7-4.0x compression** ratio with Zstd
+- **C++ acceleration** with pure Python fallback
 
 ## Features
 
-- **High Compression**: 2-bit encoding (4 bases per byte) with optional Zstd compression
-- **Fast I/O**: Block-based architecture with streaming support
-- **Zero Dependencies**: Pure Python implementation (runtime dependency: `zstandard` only)
-- **Flexible**: Supports single-end, paired-end, and interleaved reads
-- **Efficient**: Pre-allocated buffers, memoryview parsing, reusable compressors
-- **Metadata Rich**: Store read groups, descriptions, and custom flags
-- **Unix-Friendly**: Pipe-compatible CLI for seamless integration
+- **High Compression**: 2-bit encoding (4 bases per byte) + optional Zstd compression
+- **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
+- **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
+- **Flexible**: Single-end, paired-end, and interleaved reads
+- **Metadata Rich**: Read groups, descriptions, and custom flags
+- **Unix-Friendly**: Pipe-compatible CLI for seamless workflow integration
+- **Streaming**: Memory-efficient block-based processing
 
 ## Installation
 
 ```bash
-# From source
-git clone https://github.com/yourusername/zna.git
+# From source (recommended - includes C++ acceleration)
+git clone https://github.com/mkiyer/zna.git
 cd zna
 pip install -e .
 
-# Or with flit
-flit install
+# Check if C++ acceleration is available
+python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_accelerated()}')"
 ```
+
+**Requirements:**
+- Python ≥3.8
+- C++ compiler (for optimal performance)
+- CMake ≥3.15 (auto-installed via pip)
 
 ## Quick Start
 
@@ -36,10 +48,28 @@ zna decode -i sample.zzna -o sample.fasta
 # Inspect file statistics
 zna inspect sample.zzna
 
-# Pipe-friendly
+# Pipe-friendly workflows
 cat reads.fastq | zna encode -o reads.zzna
 zna decode -i reads.zzna | head -n 1000
 ```
+
+## Performance Benchmarks
+
+### Throughput by Read Length
+
+| Read Type | Encode (MB/s) | Decode (MB/s) | Compression |
+|-----------|---------------|---------------|-------------|
+| Short (Illumina, 100-150bp) | 189.5 | 668.8 | 3.68x |
+| Medium (300-500bp) | 540.5 | 1,280.9 | 3.87x |
+| Long (PacBio, 1-5kb) | 1,921.5 | 2,864.6 | 3.98x |
+| Very Long (Nanopore, 5-15kb) | **2,824.7** | **3,392.7** | 3.99x |
+
+**Key Insights:**
+- Performance scales dramatically with read length
+- Compression ratio remains consistent across workloads
+- C++ acceleration provides 9.5x speedup over pure Python
+
+See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarking.
 
 ---
 
@@ -494,7 +524,6 @@ mypy src/zna/
 - [ ] Optional index for random access
 - [ ] Support for IUPAC ambiguity codes
 - [ ] Memory-mapped I/O for large files
-- [ ] C extension for critical paths
 - [ ] Streaming statistics (GC content, length distribution)
 
 ---
@@ -511,7 +540,7 @@ If you use ZNA in your research, please cite:
 
 ```
 Iyer, M. (2026). ZNA: A compressed binary format for nucleic acid sequences.
-GitHub: https://github.com/yourusername/zna
+GitHub: https://github.com/mkiyer/zna
 ```
 
 ---
@@ -532,4 +561,4 @@ Contributions are welcome! Please:
 
 - **Author**: Matthew Iyer
 - **Email**: mkiyer@umich.edu
-- **Issues**: https://github.com/yourusername/zna/issues
+- **Issues**: https://github.com/mkiyer/zna/issues

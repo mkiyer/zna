@@ -9,6 +9,18 @@ from dataclasses import dataclass
 from enum import IntFlag
 from typing import BinaryIO, Iterable, Iterator, Tuple
 
+# Try to import C++ accelerated functions, fall back to pure Python
+try:
+    from zna._accel import encode_sequence as _accel_encode_sequence
+    from zna._accel import decode_block_records as _accel_decode_block_records
+    _USE_ACCEL = True
+except ImportError:
+    _USE_ACCEL = False
+
+def is_accelerated() -> bool:
+    """Check if C++ acceleration is available."""
+    return _USE_ACCEL
+
 # --- CONSTANTS ---
 # File Magic and Version
 # 4-byte magic number to identify ZNA files
@@ -297,14 +309,19 @@ class ZnaReader:
         )
 
     def records(self) -> Iterator[Tuple[str, bool, bool, bool]]:
+        """Iterate over all records in the file."""
         read_exact = self._read_exact
         fh_read = self._fh.read
         len_bytes = self._header.seq_len_bytes
-        decode_table = _DECODE_TABLE  # Use string table
         compression_method = self._header.compression_method
+        use_accel = _USE_ACCEL
 
         if compression_method == COMPRESSION_ZSTD:
             dctx = zstandard.ZstdDecompressor()
+        
+        # Pure Python decode table (only used if C++ extension not available)
+        if not use_accel:
+            decode_table = _DECODE_TABLE
         
         while True:
             # 1. Read Block Header
@@ -324,33 +341,36 @@ class ZnaReader:
                 block_data = dctx.decompress(block_payload, max_output_size=uncomp_size)
             else:
                 block_data = block_payload
-                
-            # 4. Iterate records within block memory using memoryview
-            mv = memoryview(block_data)
-            offset = 0
-            for _ in range(count):
-                # Parse record: flags, length, sequence
-                flags = mv[offset]
-                offset += 1
-                
-                is_read1 = bool(flags & ZnaRecordFlags.IS_READ1)
-                is_read2 = bool(flags & ZnaRecordFlags.IS_READ2)
-                is_paired = bool(flags & ZnaRecordFlags.IS_PAIRED)
-                
-                # Read sequence length
-                seq_len = int.from_bytes(mv[offset:offset + len_bytes], "little")
-                offset += len_bytes
-                
-                # Read encoded sequence bytes
-                enc_len = (seq_len + 3) >> 2
-                seq_bytes = mv[offset:offset + enc_len]
-                offset += enc_len
-                
-                # Decode: Build list of 4-mers, join once, then trim to exact length
-                chunks = [decode_table[b] for b in seq_bytes]
-                full_seq = ''.join(chunks)
-                
-                yield full_seq[:seq_len], is_paired, is_read1, is_read2
+            
+            # 4. Decode records - use C++ extension if available
+            if use_accel:
+                # C++ decodes entire block at once
+                for record in _accel_decode_block_records(block_data, len_bytes, count):
+                    yield record
+            else:
+                # Pure Python fallback
+                mv = memoryview(block_data)
+                offset = 0
+                for _ in range(count):
+                    flags = mv[offset]
+                    offset += 1
+                    
+                    is_read1 = bool(flags & ZnaRecordFlags.IS_READ1)
+                    is_read2 = bool(flags & ZnaRecordFlags.IS_READ2)
+                    is_paired = bool(flags & ZnaRecordFlags.IS_PAIRED)
+                    
+                    seq_len = int.from_bytes(mv[offset:offset + len_bytes], "little")
+                    offset += len_bytes
+                    
+                    enc_len = (seq_len + 3) >> 2
+                    seq_bytes = mv[offset:offset + enc_len]
+                    offset += enc_len
+                    
+                    # Decode: Build list of 4-mers, join once, then trim
+                    chunks = [decode_table[b] for b in seq_bytes]
+                    full_seq = ''.join(chunks)
+                    
+                    yield full_seq[:seq_len], is_paired, is_read1, is_read2
 
 
 def _encode_sequence(seq: str) -> bytes:
@@ -369,7 +389,11 @@ def _encode_sequence(seq: str) -> bytes:
     Raises:
         ValueError: If sequence contains invalid characters
     """
-    # Vectorized character lookup using C-level bytes.translate()
+    # Use C++ implementation if available
+    if _USE_ACCEL:
+        return _accel_encode_sequence(seq)
+    
+    # Pure Python fallback with vectorized character lookup
     bseq = seq.encode('ascii')
     mapped = bseq.translate(_TRANS_TABLE)
     length = len(mapped)
