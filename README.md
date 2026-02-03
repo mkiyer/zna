@@ -32,7 +32,7 @@ python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_acceler
 ```
 
 **Requirements:**
-- Python ≥3.8
+- Python ≥3.10
 - C++ compiler (for optimal performance)
 - CMake ≥3.15 (auto-installed via pip)
 
