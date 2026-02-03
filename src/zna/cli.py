@@ -11,7 +11,8 @@ import struct
 from .core import (
     ZnaHeader, ZnaWriter, ZnaReader, 
     COMPRESSION_ZSTD, COMPRESSION_NONE, 
-    DEFAULT_ZSTD_LEVEL, _BLOCK_HEADER_SIZE, _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE
+    DEFAULT_ZSTD_LEVEL, _BLOCK_HEADER_SIZE, _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE,
+    ZnaHeaderFlags, reverse_complement
 )
 
 # --- I/O HELPERS ---
@@ -241,13 +242,30 @@ def encode_command(args):
     comp_method = COMPRESSION_ZSTD if should_compress else COMPRESSION_NONE
     comp_level = args.level
 
+    # Handle strand-specific flags
+    strand_specific_flag = args.strand_specific
+    
+    # Determine R1/R2 antisense settings
+    # Default for strand-specific: R1 antisense, R2 sense (dUTP protocol)
+    if strand_specific_flag:
+        # Check explicit flags, default to dUTP (R1 antisense, R2 sense)
+        read1_antisense = not getattr(args, 'read1_sense', False)  # Default: antisense
+        read2_antisense = getattr(args, 'read2_antisense', False)  # Default: sense
+    else:
+        read1_antisense = False
+        read2_antisense = False
+
     # Build header: use input header as defaults if reencoding, otherwise use CLI args
     if is_reencoding and input_header:
         # Start with existing header values
         read_group = args.read_group if args.read_group != "Unknown" else input_header.read_group
         description = args.description if args.description != "" else input_header.description
         seq_len_bytes = args.seq_len_bytes if args.seq_len_bytes != 2 else input_header.seq_len_bytes
-        strand_specific = args.strand_specific if args.strand_specific else input_header.strand_specific
+        strand_specific = strand_specific_flag if strand_specific_flag else input_header.strand_specific
+        # Inherit antisense settings from input header if not explicitly overridden
+        if not strand_specific_flag:
+            read1_antisense = input_header.read1_antisense
+            read2_antisense = input_header.read2_antisense
         
         # Always use new compression settings (that's usually why you reencode)
         # unless they match defaults, then keep original
@@ -259,7 +277,7 @@ def encode_command(args):
         read_group = args.read_group
         description = args.description
         seq_len_bytes = args.seq_len_bytes
-        strand_specific = args.strand_specific
+        strand_specific = strand_specific_flag
 
     # Header Setup
     header = ZnaHeader(
@@ -267,6 +285,8 @@ def encode_command(args):
         description=description,
         seq_len_bytes=seq_len_bytes,
         strand_specific=strand_specific,
+        read1_antisense=read1_antisense,
+        read2_antisense=read2_antisense,
         compression_method=comp_method,
         compression_level=comp_level
     )
@@ -349,8 +369,9 @@ def decode_command(args):
 
             # --- Decode Loop ---
             counter = 0
+            restore_strand = getattr(args, 'restore_strand', False)
 
-            for seq, is_paired, is_r1, is_r2 in reader.records():
+            for seq, is_paired, is_r1, is_r2 in reader.records(restore_strand=restore_strand):
                 
                 # --- Strict ID Logic ---
                 # Requirement: Read 1 (or Unpaired) always precedes Read 2.
@@ -401,15 +422,18 @@ def inspect_command(args):
             sys.exit(f"Error reading header: {e}")
 
         print("\n--- Header Metadata ---")
-        print(f"Read Group:      {h.read_group}")
-        print(f"Description:     {h.description}")
-        print(f"Seq Length:      {h.seq_len_bytes} bytes (Max: {(1<<(8*h.seq_len_bytes))-1} bp)")
-        print(f"Strand Specific: {h.strand_specific}")
+        print(f"Read Group:       {h.read_group}")
+        print(f"Description:      {h.description}")
+        print(f"Seq Length:       {h.seq_len_bytes} bytes (Max: {(1<<(8*h.seq_len_bytes))-1} bp)")
+        print(f"Strand Specific:  {h.strand_specific}")
+        if h.strand_specific:
+            print(f"R1 Antisense:     {h.read1_antisense}")
+            print(f"R2 Antisense:     {h.read2_antisense}")
         
         method = "None"
         if h.compression_method == COMPRESSION_ZSTD:
             method = f"ZSTD (Level {h.compression_level})"
-        print(f"Compression:     {method}")
+        print(f"Compression:      {method}")
 
         # Scan Blocks
         block_count = 0
@@ -468,7 +492,22 @@ def main():
     meta_group = enc.add_argument_group("Metadata")
     meta_group.add_argument("--read-group", default="Unknown", help="Read Group ID")
     meta_group.add_argument("--description", default="", help="Description string")
-    meta_group.add_argument("--strand-specific", action="store_true", help="Flag library as strand-specific")
+    meta_group.add_argument("--strand-specific", action="store_true", 
+                           help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
+    
+    # R1 strand orientation (mutually exclusive)
+    r1_strand = meta_group.add_mutually_exclusive_group()
+    r1_strand.add_argument("--read1-sense", dest="read1_sense", action="store_true",
+                          help="Read 1 represents sense strand")
+    r1_strand.add_argument("--read1-antisense", dest="read1_sense", action="store_false",
+                          help="Read 1 represents antisense strand (default for --strand-specific)")
+    
+    # R2 strand orientation (mutually exclusive)
+    r2_strand = meta_group.add_mutually_exclusive_group()
+    r2_strand.add_argument("--read2-sense", dest="read2_antisense", action="store_false",
+                          help="Read 2 represents sense strand (default for --strand-specific)")
+    r2_strand.add_argument("--read2-antisense", dest="read2_antisense", action="store_true",
+                          help="Read 2 represents antisense strand")
     
     fmt_group = enc.add_argument_group("Format Options")
     fmt_group.add_argument("-o", "--output", help="Output file. Defaults to stdout (-).")
@@ -488,6 +527,8 @@ def main():
     # Combined Output Logic
     dec.add_argument("-o", "--output", help="Output filename. Use '#' for split files (e.g. 'out#.fa'). Ends in .gz for gzip.")
     dec.add_argument("--gzip", action="store_true", help="Force gzip compression (useful for stdout)")
+    dec.add_argument("--restore-strand", action="store_true", 
+                    help="Restore original strand orientation for antisense reads (reverse complement)")
 
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")

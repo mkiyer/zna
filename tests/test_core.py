@@ -2,7 +2,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from zna.core import ZnaHeader, write_zna, read_zna, ZnaWriter, COMPRESSION_ZSTD, COMPRESSION_NONE
+from zna.core import ZnaHeader, write_zna, read_zna, ZnaWriter, ZnaReader, COMPRESSION_ZSTD, COMPRESSION_NONE
+from zna import reverse_complement
 
 
 
@@ -169,6 +170,245 @@ class TestZnaIO(unittest.TestCase):
         read_header, _, _ = self.roundtrip(sequences, header)
         self.assertEqual(read_header.compression_method, COMPRESSION_NONE)
 
+
+class TestReverseComplement(unittest.TestCase):
+    """Test the reverse complement function."""
+    
+    def test_simple_sequence(self):
+        """Test basic reverse complement."""
+        self.assertEqual(reverse_complement("ACGT"), "ACGT")  # palindrome
+        self.assertEqual(reverse_complement("AAAA"), "TTTT")
+        self.assertEqual(reverse_complement("CCCC"), "GGGG")
+        self.assertEqual(reverse_complement("GGGG"), "CCCC")
+        self.assertEqual(reverse_complement("TTTT"), "AAAA")
+    
+    def test_longer_sequence(self):
+        """Test longer sequences."""
+        self.assertEqual(reverse_complement("ACGTACGT"), "ACGTACGT")  # palindrome
+        self.assertEqual(reverse_complement("AACCGGTT"), "AACCGGTT")  # palindrome
+        self.assertEqual(reverse_complement("AAAACCCC"), "GGGGTTTT")
+    
+    def test_mixed_case(self):
+        """Test that mixed case is handled correctly."""
+        self.assertEqual(reverse_complement("AcGt"), "aCgT")
+        self.assertEqual(reverse_complement("acgt"), "acgt")
+    
+    def test_empty_sequence(self):
+        """Test empty sequence."""
+        self.assertEqual(reverse_complement(""), "")
+    
+    def test_single_base(self):
+        """Test single base."""
+        self.assertEqual(reverse_complement("A"), "T")
+        self.assertEqual(reverse_complement("C"), "G")
+        self.assertEqual(reverse_complement("G"), "C")
+        self.assertEqual(reverse_complement("T"), "A")
+
+
+class TestStrandSpecific(unittest.TestCase):
+    """Test strand-specific functionality in ZnaWriter and ZnaReader."""
+    
+    def test_header_antisense_flags(self):
+        """Test that antisense flags are properly stored in header."""
+        header = ZnaHeader(
+            read_group="strand_test",
+            description="dUTP protocol",
+            strand_specific=True,
+            read1_antisense=True,
+            read2_antisense=False,
+        )
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/strand.zna"
+            
+            # Write
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record("ACGT", True, True, False)  # R1
+            
+            # Read and check header
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                self.assertTrue(reader.header.strand_specific)
+                self.assertTrue(reader.header.read1_antisense)
+                self.assertFalse(reader.header.read2_antisense)
+    
+    def test_r1_antisense_normalization(self):
+        """Test that R1 antisense reads are normalized (reverse complemented) during encoding."""
+        header = ZnaHeader(
+            read_group="dutp",
+            strand_specific=True,
+            read1_antisense=True,  # R1 is antisense
+            read2_antisense=False,
+        )
+        
+        r1_seq = "AAAACCCC"  # Original antisense R1
+        r1_rc = "GGGGTTTT"   # Should be stored as this (sense)
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/strand.zna"
+            
+            # Write R1 (should be reverse complemented)
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r1_seq, True, True, False)  # R1
+            
+            # Read without strand restoration
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=False))
+                self.assertEqual(len(records), 1)
+                # Stored as reverse complement (sense strand)
+                self.assertEqual(records[0][0], r1_rc)
+    
+    def test_r2_antisense_normalization(self):
+        """Test that R2 antisense reads are normalized during encoding."""
+        header = ZnaHeader(
+            read_group="fr-secondstrand",
+            strand_specific=True,
+            read1_antisense=False,
+            read2_antisense=True,  # R2 is antisense
+        )
+        
+        r2_seq = "AAAACCCC"
+        r2_rc = "GGGGTTTT"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/strand.zna"
+            
+            # Write R2 (should be reverse complemented)
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r2_seq, True, False, True)  # R2
+            
+            # Read without strand restoration
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=False))
+                self.assertEqual(records[0][0], r2_rc)
+    
+    def test_sense_reads_not_modified(self):
+        """Test that sense reads are not reverse complemented."""
+        header = ZnaHeader(
+            read_group="dutp",
+            strand_specific=True,
+            read1_antisense=True,  # R1 is antisense
+            read2_antisense=False, # R2 is sense
+        )
+        
+        r2_seq = "AAAACCCC"  # R2 is sense, should NOT be modified
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/strand.zna"
+            
+            # Write R2 (should NOT be reverse complemented)
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r2_seq, True, False, True)  # R2
+            
+            # Read - should be unchanged
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=False))
+                self.assertEqual(records[0][0], r2_seq)
+    
+    def test_restore_strand_roundtrip(self):
+        """Test that restore_strand=True recovers original sequences."""
+        header = ZnaHeader(
+            read_group="dutp",
+            strand_specific=True,
+            read1_antisense=True,
+            read2_antisense=False,
+        )
+        
+        r1_original = "AAAACCCC"
+        r2_original = "TTTTGGGG"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/strand.zna"
+            
+            # Write paired reads
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r1_original, True, True, False)  # R1
+                    writer.write_record(r2_original, True, False, True)  # R2
+            
+            # Read with strand restoration
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=True))
+                
+                self.assertEqual(len(records), 2)
+                # R1 should be restored to original (reverse complemented back)
+                self.assertEqual(records[0][0], r1_original)
+                # R2 should be unchanged (it was sense, not modified)
+                self.assertEqual(records[1][0], r2_original)
+    
+    def test_dutp_protocol_paired_roundtrip(self):
+        """Test complete dUTP protocol roundtrip with paired-end reads."""
+        header = ZnaHeader(
+            read_group="dutp_full",
+            strand_specific=True,
+            read1_antisense=True,  # dUTP: R1 is antisense
+            read2_antisense=False, # dUTP: R2 is sense
+        )
+        
+        # Create test sequences
+        test_pairs = [
+            ("AAACCCGGG", "TTTAAACCC"),  # Pair 1
+            ("GGGCCCAAA", "CCCGGGTTT"),  # Pair 2
+        ]
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/dutp.zna"
+            
+            # Write all records
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for r1, r2 in test_pairs:
+                        writer.write_record(r1, True, True, False)
+                        writer.write_record(r2, True, False, True)
+            
+            # Read with restore_strand=True - should get original sequences
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=True))
+                
+                self.assertEqual(len(records), 4)
+                
+                # Check all sequences match original
+                for i, (r1, r2) in enumerate(test_pairs):
+                    rec_r1 = records[i * 2]
+                    rec_r2 = records[i * 2 + 1]
+                    self.assertEqual(rec_r1[0], r1)
+                    self.assertEqual(rec_r2[0], r2)
+                    self.assertTrue(rec_r1[2])  # is_r1
+                    self.assertTrue(rec_r2[3])  # is_r2
+    
+    def test_non_strand_specific_unchanged(self):
+        """Test that non-strand-specific libraries don't modify sequences."""
+        header = ZnaHeader(
+            read_group="unstranded",
+            strand_specific=False,  # NOT strand specific
+        )
+        
+        test_seq = "AAACCCGGG"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/unstranded.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(test_seq, True, True, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                self.assertFalse(reader.header.strand_specific)
+                self.assertFalse(reader.header.read1_antisense)
+                self.assertFalse(reader.header.read2_antisense)
+                
+                records = list(reader.records(restore_strand=True))
+                self.assertEqual(records[0][0], test_seq)
 
 
 if __name__ == "__main__":

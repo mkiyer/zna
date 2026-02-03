@@ -726,3 +726,220 @@ class TestIntegration:
                 lines = f.readlines()
             r2_decoded = [lines[i].strip() for i in range(1, len(lines), 2)]
             assert r2_decoded == ["AAAA", "CCCC"]
+
+
+# --- Strand-Specific CLI Tests ---
+
+class TestStrandProtocol:
+    """Test CLI strand-specific functionality."""
+    
+    def test_encode_with_strand_specific_defaults(self):
+        """Test encoding with --strand-specific uses dUTP defaults (R1 antisense, R2 sense)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create paired FASTQ files
+            r1_path = f"{tmpdir}/R1.fastq"
+            r2_path = f"{tmpdir}/R2.fastq"
+            
+            # R1: AAAACCCC, R2: TTTTGGGG
+            r1_data = b"@read1\nAAAACCCC\n+\nIIIIIIII\n"
+            r2_data = b"@read1\nTTTTGGGG\n+\nIIIIIIII\n"
+            
+            with open(r1_path, "wb") as f:
+                f.write(r1_data)
+            with open(r2_path, "wb") as f:
+                f.write(r2_data)
+            
+            # Encode with strand-specific (uses dUTP defaults)
+            zna_path = f"{tmpdir}/strand.zna"
+            
+            class Args:
+                files = [r1_path, r2_path]
+                interleaved = False
+                fasta = False
+                fastq = False
+                read_group = "dutp_test"
+                description = ""
+                strand_specific = True  # Enable strand-specific
+                read1_sense = False     # Default: R1 is antisense
+                read2_antisense = False # Default: R2 is sense
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(Args())
+            
+            # Read and verify header
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                assert reader.header.strand_specific == True
+                assert reader.header.read1_antisense == True
+                assert reader.header.read2_antisense == False
+    
+    def test_decode_restore_strand(self):
+        """Test decoding with --restore-strand flag."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create paired FASTQ files
+            r1_path = f"{tmpdir}/R1.fastq"
+            r2_path = f"{tmpdir}/R2.fastq"
+            
+            r1_original = "AAAACCCC"
+            r2_original = "TTTTGGGG"
+            
+            r1_data = f"@read1\n{r1_original}\n+\nIIIIIIII\n".encode()
+            r2_data = f"@read1\n{r2_original}\n+\nIIIIIIII\n".encode()
+            
+            with open(r1_path, "wb") as f:
+                f.write(r1_data)
+            with open(r2_path, "wb") as f:
+                f.write(r2_data)
+            
+            # Encode with strand-specific (dUTP defaults)
+            zna_path = f"{tmpdir}/strand.zna"
+            
+            class EncArgs:
+                files = [r1_path, r2_path]
+                interleaved = False
+                fasta = False
+                fastq = False
+                read_group = "dutp_test"
+                description = ""
+                strand_specific = True
+                read1_sense = False      # R1 is antisense
+                read2_antisense = False  # R2 is sense
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(EncArgs())
+            
+            # Decode WITH restore_strand=True (should get original sequences)
+            output_restored = f"{tmpdir}/restored.fasta"
+            
+            class DecArgsRestored:
+                input = zna_path
+                output = output_restored
+                quiet = True
+                gzip = False
+                restore_strand = True
+            
+            decode_command(DecArgsRestored())
+            
+            # Verify sequences are restored to original
+            with open(output_restored, "r") as f:
+                lines = f.readlines()
+            
+            seqs = [lines[i].strip() for i in range(1, len(lines), 2)]
+            assert seqs[0] == r1_original  # R1 restored
+            assert seqs[1] == r2_original  # R2 unchanged
+    
+    def test_decode_without_restore_strand(self):
+        """Test decoding without --restore-strand gives sense-normalized sequences."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create paired FASTQ files
+            r1_path = f"{tmpdir}/R1.fastq"
+            r2_path = f"{tmpdir}/R2.fastq"
+            
+            r1_original = "AAAACCCC"
+            r1_revcomp = "GGGGTTTT"  # This is what should be stored
+            r2_original = "TTTTGGGG"
+            
+            r1_data = f"@read1\n{r1_original}\n+\nIIIIIIII\n".encode()
+            r2_data = f"@read1\n{r2_original}\n+\nIIIIIIII\n".encode()
+            
+            with open(r1_path, "wb") as f:
+                f.write(r1_data)
+            with open(r2_path, "wb") as f:
+                f.write(r2_data)
+            
+            # Encode with strand-specific (dUTP defaults)
+            zna_path = f"{tmpdir}/strand.zna"
+            
+            class EncArgs:
+                files = [r1_path, r2_path]
+                interleaved = False
+                fasta = False
+                fastq = False
+                read_group = "dutp_test"
+                description = ""
+                strand_specific = True
+                read1_sense = False      # R1 is antisense
+                read2_antisense = False  # R2 is sense
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(EncArgs())
+            
+            # Decode WITHOUT restore_strand (default) - should get normalized sequences
+            output_normalized = f"{tmpdir}/normalized.fasta"
+            
+            class DecArgsNormal:
+                input = zna_path
+                output = output_normalized
+                quiet = True
+                gzip = False
+                restore_strand = False
+            
+            decode_command(DecArgsNormal())
+            
+            # Verify sequences are sense-normalized
+            with open(output_normalized, "r") as f:
+                lines = f.readlines()
+            
+            seqs = [lines[i].strip() for i in range(1, len(lines), 2)]
+            assert seqs[0] == r1_revcomp  # R1 is stored as reverse complement
+            assert seqs[1] == r2_original  # R2 is unchanged
+    
+    def test_inspect_shows_strand_info(self):
+        """Test that inspect command shows strand-specific information."""
+        import io
+        import sys
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a simple strand-specific file
+            r1_path = f"{tmpdir}/R1.fastq"
+            with open(r1_path, "wb") as f:
+                f.write(b"@read1\nACGT\n+\nIIII\n")
+            
+            zna_path = f"{tmpdir}/strand.zna"
+            
+            class EncArgs:
+                files = [r1_path]
+                interleaved = False
+                fasta = False
+                fastq = False
+                read_group = "inspect_test"
+                description = ""
+                strand_specific = True
+                read1_sense = False      # R1 is antisense (default)
+                read2_antisense = False  # R2 is sense (default)
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(EncArgs())
+            
+            # Capture inspect output
+            captured_output = io.StringIO()
+            sys.stdout = captured_output
+            
+            class InspArgs:
+                input = zna_path
+            
+            inspect_command(InspArgs())
+            
+            sys.stdout = sys.__stdout__
+            output = captured_output.getvalue()
+            
+            # Verify strand info is displayed
+            assert "Strand Specific:  True" in output
+            assert "R1 Antisense:     True" in output
+            assert "R2 Antisense:     False" in output

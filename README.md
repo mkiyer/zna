@@ -15,6 +15,7 @@
 - **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
 - **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
 - **Flexible**: Single-end, paired-end, and interleaved reads
+- **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Metadata Rich**: Read groups, descriptions, and custom flags
 - **Unix-Friendly**: Pipe-compatible CLI for seamless workflow integration
 - **Streaming**: Memory-efficient block-based processing
@@ -175,8 +176,17 @@ cat interleaved.fastq | zna encode --interleaved -o paired.zzna
 zna encode sample.fastq \
   --read-group "Sample_01" \
   --description "Experiment XYZ" \
-  --strand-specific \
   -o sample.zzna
+
+# Strand-specific library (default: R1 antisense, R2 sense)
+zna encode R1.fastq.gz R2.fastq.gz \
+  --strand-specific \
+  -o stranded.zzna
+
+# Custom strand orientation (e.g., fr-secondstrand protocol)
+zna encode R1.fastq.gz R2.fastq.gz \
+  --strand-specific --read1-sense --read2-antisense \
+  -o stranded.zzna
 
 # Control compression
 zna encode sample.fastq \
@@ -229,6 +239,9 @@ zna decode paired.zzna -o reads#.fasta
 # Split with gzip
 zna decode paired.zzna -o reads#.fasta.gz
 # Creates: reads_1.fasta.gz and reads_2.fasta.gz
+
+# Restore original strand for strand-specific libraries
+zna decode stranded.zzna --restore-strand -o reads.fasta
 ```
 
 #### Piping Examples
@@ -260,11 +273,13 @@ File: sample.zzna
 Total Size: 45.32 MB
 
 --- Header Metadata ---
-Read Group:      Sample_01
-Description:     Experiment XYZ
-Seq Length:      2 bytes (Max: 65535 bp)
-Strand Specific: False
-Compression:     ZSTD (Level 3)
+Read Group:       Sample_01
+Description:      Experiment XYZ
+Seq Length:       2 bytes (Max: 65535 bp)
+Strand Specific:  True
+R1 Antisense:     True
+R2 Antisense:     False
+Compression:      ZSTD (Level 3)
 
 --- Content Statistics ---
 Total Blocks:       356
@@ -298,7 +313,11 @@ Options:
 Metadata:
   --read-group TEXT      Read group ID (default: "Unknown")
   --description TEXT     Description string
-  --strand-specific      Flag library as strand-specific
+  --strand-specific      Flag library as strand-specific (default: R1 antisense, R2 sense)
+  --read1-sense          Read 1 represents sense strand
+  --read1-antisense      Read 1 represents antisense strand (default when --strand-specific)
+  --read2-sense          Read 2 represents sense strand (default when --strand-specific)
+  --read2-antisense      Read 2 represents antisense strand
 
 Format Options:
   -o, --output FILE      Output file (default: stdout)
@@ -325,6 +344,7 @@ Options:
   -o, --output FILE      Output FASTA file. Use '#' for split R1/R2
   -q, --quiet            Suppress progress messages
   --gzip                 Force gzip compression for stdout
+  --restore-strand       Restore original strand orientation for antisense reads
 ```
 
 ### `zna inspect`
@@ -412,6 +432,56 @@ Data is organized in independently compressed blocks:
 - **Reusable compressor**: Amortizes initialization cost
 - **Memoryview parsing**: Zero-copy decompression
 - **Pre-sized buffers**: Eliminates reallocations
+
+---
+
+## Strand-Specific Libraries
+
+ZNA supports strand-specific RNA-seq libraries by normalizing all reads to sense strand orientation during encoding. This enables consistent downstream analysis while preserving the ability to restore original strand information.
+
+### How It Works
+
+1. **Encoding**: Antisense reads are reverse-complemented to sense strand
+2. **Storage**: All reads stored in sense orientation
+3. **Decoding**: Use `--restore-strand` to recover original orientation
+
+### Strand Flags
+
+| Flag | Description |
+|------|-------------|
+| `--strand-specific` | Enable strand-specific mode (default: R1 antisense, R2 sense) |
+| `--read1-sense` | Read 1 represents sense strand |
+| `--read1-antisense` | Read 1 represents antisense strand |
+| `--read2-sense` | Read 2 represents sense strand |
+| `--read2-antisense` | Read 2 represents antisense strand |
+
+### Common Library Protocols
+
+| Protocol | R1 | R2 | ZNA Flags |
+|----------|----|----|-----------|
+| **dUTP / TruSeq Stranded** | antisense | sense | `--strand-specific` (default) |
+| **Illumina Stranded mRNA** | antisense | sense | `--strand-specific` |
+| **fr-firststrand** | antisense | sense | `--strand-specific` |
+| **fr-secondstrand** | sense | antisense | `--strand-specific --read1-sense --read2-antisense` |
+| **Ligation (ScriptSeq)** | sense | antisense | `--strand-specific --read1-sense --read2-antisense` |
+
+### Examples
+
+```bash
+# dUTP/TruSeq protocol (most common - this is the default)
+zna encode R1.fastq.gz R2.fastq.gz --strand-specific -o library.zzna
+
+# fr-secondstrand protocol
+zna encode R1.fastq.gz R2.fastq.gz \
+  --strand-specific --read1-sense --read2-antisense \
+  -o library.zzna
+
+# Decode with sense-normalized sequences (for alignment)
+zna decode library.zzna -o normalized.fasta
+
+# Decode with original strand orientation restored
+zna decode library.zzna --restore-strand -o original.fasta
+```
 
 ---
 

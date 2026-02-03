@@ -51,11 +51,22 @@ COMPRESSION_ZSTD = 1
 # --- FLAGS ---
 class ZnaHeaderFlags(IntFlag):
     STRAND_SPECIFIC = 1
+    READ1_ANTISENSE = 2  # Read1 is antisense (needs reverse complement)
+    READ2_ANTISENSE = 4  # Read2 is antisense (needs reverse complement)
 
 class ZnaRecordFlags(IntFlag):
     IS_READ1 = 1
     IS_READ2 = 2
     IS_PAIRED = 4
+
+
+# --- REVERSE COMPLEMENT ---
+# Complement table: A<->T, C<->G
+_COMPLEMENT_TABLE = str.maketrans('ACGTacgt', 'TGCAtgca')
+
+def reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
+    return seq.translate(_COMPLEMENT_TABLE)[::-1]
 
 
 # --- LOOKUP TABLES ---
@@ -106,6 +117,8 @@ class ZnaHeader:
     description: str = ""
     seq_len_bytes: int = MIN_SEQ_LEN_BYTES
     strand_specific: bool = False
+    read1_antisense: bool = False  # True if read1 is antisense strand
+    read2_antisense: bool = False  # True if read2 is antisense strand
     compression_method: int = COMPRESSION_NONE
     compression_level: int = DEFAULT_ZSTD_LEVEL
 
@@ -164,6 +177,10 @@ class ZnaWriter:
         flags = 0
         if self._header.strand_specific:
             flags |= ZnaHeaderFlags.STRAND_SPECIFIC
+        if self._header.read1_antisense:
+            flags |= ZnaHeaderFlags.READ1_ANTISENSE
+        if self._header.read2_antisense:
+            flags |= ZnaHeaderFlags.READ2_ANTISENSE
         
         header_fixed = struct.pack(
             _FILE_HEADER_FMT,
@@ -182,7 +199,18 @@ class ZnaWriter:
         self._fh.write(desc_bytes)
 
     def write_record(self, seq: str, is_paired: bool, is_read1: bool, is_read2: bool) -> None:
-        """Write a single sequence record to the buffer."""
+        """Write a single sequence record to the buffer.
+        
+        For strand-specific libraries, antisense reads are automatically
+        reverse complemented to normalize all reads to the sense strand.
+        """
+        # Strand normalization: reverse complement antisense reads
+        if self._header.strand_specific:
+            if is_read1 and self._header.read1_antisense:
+                seq = reverse_complement(seq)
+            elif is_read2 and self._header.read2_antisense:
+                seq = reverse_complement(seq)
+        
         seq_len = len(seq)
         if seq_len > self._max_len:
             raise ValueError(
@@ -304,17 +332,28 @@ class ZnaReader:
             description=description,
             seq_len_bytes=len_bytes,
             strand_specific=bool(flags & ZnaHeaderFlags.STRAND_SPECIFIC),
+            read1_antisense=bool(flags & ZnaHeaderFlags.READ1_ANTISENSE),
+            read2_antisense=bool(flags & ZnaHeaderFlags.READ2_ANTISENSE),
             compression_method=compression_method,
             compression_level=compression_level
         )
 
-    def records(self) -> Iterator[Tuple[str, bool, bool, bool]]:
-        """Iterate over all records in the file."""
+    def records(self, restore_strand: bool = False) -> Iterator[Tuple[str, bool, bool, bool]]:
+        """Iterate over all records in the file.
+        
+        Args:
+            restore_strand: If True and library is strand-specific, restore
+                           original strand by reverse complementing antisense reads.
+        """
         read_exact = self._read_exact
         fh_read = self._fh.read
         len_bytes = self._header.seq_len_bytes
         compression_method = self._header.compression_method
         use_accel = _USE_ACCEL
+        
+        # Strand restoration: reverse complement to recover original antisense reads
+        do_restore_r1 = restore_strand and self._header.strand_specific and self._header.read1_antisense
+        do_restore_r2 = restore_strand and self._header.strand_specific and self._header.read2_antisense
 
         if compression_method == COMPRESSION_ZSTD:
             dctx = zstandard.ZstdDecompressor()
@@ -345,8 +384,13 @@ class ZnaReader:
             # 4. Decode records - use C++ extension if available
             if use_accel:
                 # C++ decodes entire block at once
-                for record in _accel_decode_block_records(block_data, len_bytes, count):
-                    yield record
+                for seq, is_paired, is_read1, is_read2 in _accel_decode_block_records(block_data, len_bytes, count):
+                    # Restore original strand if requested
+                    if do_restore_r1 and is_read1:
+                        seq = reverse_complement(seq)
+                    elif do_restore_r2 and is_read2:
+                        seq = reverse_complement(seq)
+                    yield seq, is_paired, is_read1, is_read2
             else:
                 # Pure Python fallback
                 mv = memoryview(block_data)
@@ -369,8 +413,15 @@ class ZnaReader:
                     # Decode: Build list of 4-mers, join once, then trim
                     chunks = [decode_table[b] for b in seq_bytes]
                     full_seq = ''.join(chunks)
+                    seq = full_seq[:seq_len]
                     
-                    yield full_seq[:seq_len], is_paired, is_read1, is_read2
+                    # Restore original strand if requested
+                    if do_restore_r1 and is_read1:
+                        seq = reverse_complement(seq)
+                    elif do_restore_r2 and is_read2:
+                        seq = reverse_complement(seq)
+                    
+                    yield seq, is_paired, is_read1, is_read2
 
 
 def _encode_sequence(seq: str) -> bytes:

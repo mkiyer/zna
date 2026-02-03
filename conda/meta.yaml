@@ -22,13 +22,14 @@ requirements:
     - {{ compiler('cxx') }}
     - cmake >=3.15
     - make  # [unix]
-    - ninja  # [win]
+    - llvm-tools  # [osx]
   host:
     - python
     - pip
     - scikit-build-core >=0.10
     - nanobind >=2.0
     - zstandard
+    - llvm-tools  # [osx]
   run:
     - python
     - zstandard
