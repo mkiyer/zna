@@ -40,17 +40,17 @@ python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_acceler
 
 ```bash
 # Encode FASTQ to compressed ZNA
-zna encode --read1 sample.fastq.gz -o sample.zzna
+zna encode sample.fastq.gz -o sample.zzna
 
 # Decode back to FASTA
-zna decode -i sample.zzna -o sample.fasta
+zna decode sample.zzna -o sample.fasta
 
 # Inspect file statistics
 zna inspect sample.zzna
 
 # Pipe-friendly workflows
 cat reads.fastq | zna encode -o reads.zzna
-zna decode -i reads.zzna | head -n 1000
+zna decode reads.zzna | head -n 1000
 ```
 
 ## Performance Benchmarks
@@ -238,13 +238,13 @@ zna decode paired.zzna -o reads#.fasta.gz
 zna decode large.zzna | head -n 2000000 > subset.fasta
 
 # Count sequences
-zna decode -i sample.zzna | grep -c "^>"
+zna decode sample.zzna | grep -c "^>"
 
 # Convert to gzipped output via pipe
-zna decode -i sample.zzna --gzip > output.fasta.gz
+zna decode sample.zzna --gzip > output.fasta.gz
 
 # Chain operations
-zna decode -i sample.zzna | seqtk seq -r - | gzip > reversed.fasta.gz
+zna decode sample.zzna | seqtk seq -r - | gzip > reversed.fasta.gz
 ```
 
 ### Inspecting Files
