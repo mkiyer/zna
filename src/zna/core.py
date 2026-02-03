@@ -13,6 +13,7 @@ from typing import BinaryIO, Iterable, Iterator, Tuple
 try:
     from zna._accel import encode_sequence as _accel_encode_sequence
     from zna._accel import decode_block_records as _accel_decode_block_records
+    from zna._accel import reverse_complement as _accel_reverse_complement
     _USE_ACCEL = True
 except ImportError:
     _USE_ACCEL = False
@@ -64,9 +65,18 @@ class ZnaRecordFlags(IntFlag):
 # Complement table: A<->T, C<->G
 _COMPLEMENT_TABLE = str.maketrans('ACGTacgt', 'TGCAtgca')
 
-def reverse_complement(seq: str) -> str:
-    """Return the reverse complement of a DNA sequence."""
+def _py_reverse_complement(seq: str) -> str:
+    """Pure Python reverse complement of a DNA sequence."""
     return seq.translate(_COMPLEMENT_TABLE)[::-1]
+
+def reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence.
+    
+    Uses C++ acceleration when available for better performance.
+    """
+    if _USE_ACCEL:
+        return _accel_reverse_complement(seq)
+    return _py_reverse_complement(seq)
 
 
 # --- LOOKUP TABLES ---

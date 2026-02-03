@@ -176,10 +176,110 @@ def is_zna_file(filepath: Optional[str]) -> bool:
         return False
 
 
+# --- INPUT STRATEGIES ---
+# Each strategy is a focused generator for a specific input mode.
+
+def _stream_zna_reencode(filepath: str) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream records from an existing ZNA file for reencoding."""
+    with open(filepath, "rb") as f:
+        reader = ZnaReader(f)
+        for record in reader.records():
+            yield record
+
+
+def _stream_paired_files(f1: BinaryIO, f2: BinaryIO, 
+                         path1: Optional[str], path2: Optional[str],
+                         format_override: Optional[str]) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream paired-end reads from two separate files."""
+    p1 = choose_parser(path1, format_override)(f1)
+    p2 = choose_parser(path2, format_override)(f2)
+    
+    for s1, s2 in zip(p1, p2):
+        yield s1, True, True, False
+        yield s2, True, False, True
+
+
+def _stream_interleaved_fastq(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream interleaved FASTQ with smart paired/single detection based on read names."""
+    parser = parse_fastq_with_names(f)
+    prev_entry = None
+    
+    for curr_name, curr_seq in parser:
+        if prev_entry is None:
+            prev_entry = (curr_name, curr_seq)
+            continue
+        
+        prev_name, prev_seq = prev_entry
+        
+        # Check if consecutive reads belong to the same pair
+        if get_base_name(prev_name) == get_base_name(curr_name):
+            # Found a pair (R1 and R2)
+            n1 = get_read_suffix_number(prev_name)
+            n2 = get_read_suffix_number(curr_name)
+            
+            # Validation warnings
+            if n1 == 2:
+                print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
+            if n2 == 1:
+                print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
+            
+            # Yield as paired reads
+            yield prev_seq, True, True, False   # R1
+            yield curr_seq, True, False, True   # R2
+            prev_entry = None
+        else:
+            # prev_entry was a singleton (single-end read)
+            yield prev_seq, False, False, False
+            prev_entry = (curr_name, curr_seq)
+    
+    # Handle the final remaining entry
+    if prev_entry is not None:
+        yield prev_entry[1], False, False, False
+
+
+def _stream_interleaved_fasta(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream strict interleaved FASTA (alternating R1/R2 pairs)."""
+    parser = parse_fasta(f)
+    while True:
+        try:
+            s1 = next(parser)
+            try:
+                s2 = next(parser)
+            except StopIteration:
+                print("[Warning] Interleaved input ended with orphan read.", file=sys.stderr)
+                break
+            yield s1, True, True, False
+            yield s2, True, False, True
+        except StopIteration:
+            break
+
+
+def _stream_single_end(f: BinaryIO, filepath: Optional[str], 
+                       format_override: Optional[str]) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream single-end reads from a file or stdin."""
+    for s in choose_parser(filepath, format_override)(f):
+        yield s, False, False, False
+
+
+def _infer_format(filepath: Optional[str], format_override: Optional[str]) -> str:
+    """Infer format from filepath or return override."""
+    if format_override:
+        return format_override
+    if filepath and filepath != "-":
+        lower = filepath.lower()
+        if lower.endswith('.gz'):
+            lower = lower[:-3]
+        if lower.endswith(('.fasta', '.fa', '.fna')):
+            return 'fasta'
+        elif lower.endswith(('.fastq', '.fq')):
+            return 'fastq'
+    return 'fastq'  # default
+
+
 def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
     """
     Uniform generator yielding (sequence, is_paired, is_read1, is_read2).
-    Handles Files and Stdin (Single or Interleaved).
+    Dispatches to appropriate strategy based on input configuration.
     
     Input modes:
     - 0 files: read from stdin (single or interleaved)
@@ -197,106 +297,33 @@ def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
     
     # Special case: single ZNA file = reencoding mode
     if len(files) == 1 and is_zna_file(files[0]):
-        with open(files[0], "rb") as f:
-            reader = ZnaReader(f)
-            for record in reader.records():
-                yield record
+        yield from _stream_zna_reencode(files[0])
         return
     
     with ExitStack() as stack:
-        # 1. Two Files = Paired-End
+        # Strategy 1: Two Files = Paired-End
         if len(files) == 2:
             f1 = stack.enter_context(get_input_handle(files[0]))
             f2 = stack.enter_context(get_input_handle(files[1]))
-            p1 = choose_parser(files[0], format_override)(f1)
-            p2 = choose_parser(files[1], format_override)(f2)
-            
-            for s1, s2 in zip(p1, p2):
-                yield s1, True, True, False
-                yield s2, True, False, True
+            yield from _stream_paired_files(f1, f2, files[0], files[1], format_override)
 
-        # 2. One File or Stdin + Interleaved Flag = Interleaved (Mixed Paired/Single-End)
+        # Strategy 2: Interleaved Mode
         elif args.interleaved:
             src = files[0] if len(files) == 1 else None
             f = stack.enter_context(get_input_handle(src))
             
-            # For interleaved mode, we need read names to detect pairing
-            # Currently only support FASTQ with names for smart interleaved mode
-            format_type = format_override
-            if not format_type:
-                # Infer format
-                if src and src != "-":
-                    lower = src.lower()
-                    if lower.endswith('.gz'):
-                        lower = lower[:-3]
-                    if lower.endswith(('.fasta', '.fa', '.fna')):
-                        format_type = 'fasta'
-                    elif lower.endswith(('.fastq', '.fq')):
-                        format_type = 'fastq'
-                    else:
-                        format_type = 'fastq'  # default
-                else:
-                    format_type = 'fastq'  # default for stdin
+            format_type = _infer_format(src, format_override)
             
             if format_type == 'fastq':
-                # Use smart interleaved mode with read name tracking
-                parser = parse_fastq_with_names(f)
-                prev_entry = None
-                
-                for curr_name, curr_seq in parser:
-                    if prev_entry is None:
-                        prev_entry = (curr_name, curr_seq)
-                        continue
-                    
-                    prev_name, prev_seq = prev_entry
-                    
-                    # Check if consecutive reads belong to the same pair
-                    if get_base_name(prev_name) == get_base_name(curr_name):
-                        # Found a pair (R1 and R2)
-                        n1 = get_read_suffix_number(prev_name)
-                        n2 = get_read_suffix_number(curr_name)
-                        
-                        # Validation
-                        if n1 == 2:
-                            print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
-                        if n2 == 1:
-                            print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
-                        
-                        # Yield as paired reads
-                        yield prev_seq, True, True, False   # R1
-                        yield curr_seq, True, False, True   # R2
-                        prev_entry = None
-                    else:
-                        # prev_entry was a singleton (single-end read)
-                        yield prev_seq, False, False, False
-                        prev_entry = (curr_name, curr_seq)
-                
-                # Handle the final remaining entry
-                if prev_entry is not None:
-                    yield prev_entry[1], False, False, False
-            
+                yield from _stream_interleaved_fastq(f)
             else:
-                # FASTA format: fallback to simple interleaved pairing
-                parser = parse_fasta(f)
-                while True:
-                    try:
-                        s1 = next(parser)
-                        try:
-                            s2 = next(parser)
-                        except StopIteration:
-                            print("[Warning] Interleaved input ended with orphan read.", file=sys.stderr)
-                            break
-                        yield s1, True, True, False
-                        yield s2, True, False, True
-                    except StopIteration:
-                        break
+                yield from _stream_interleaved_fasta(f)
 
-        # 3. One File or Stdin = Single-End
+        # Strategy 3: Single-End
         else:
             src = files[0] if len(files) == 1 else None
             f = stack.enter_context(get_input_handle(src))
-            for s in choose_parser(src, format_override)(f):
-                yield s, False, False, False
+            yield from _stream_single_end(f, src, format_override)
 
 
 # --- COMMAND: ENCODE ---

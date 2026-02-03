@@ -4,22 +4,50 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "zna"
-version = "0.1.0"
-description = "Compressed (z) Nucleic (n) Acid (a) binary format"
+version = "0.1.2"
+description = "High-performance compressed binary format for DNA/RNA sequences with 2-bit encoding and Zstd compression"
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "GPLv3"}
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+keywords = ["bioinformatics", "genomics", "compression", "dna", "rna", "fastq", "fasta", "sequencing"]
 
 authors = [
   {name = "Matthew Iyer", email = "mkiyer@umich.edu"}
 ]
+
+maintainers = [
+  {name = "Matthew Iyer", email = "mkiyer@umich.edu"}
+]
+
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: System :: Archiving :: Compression",
 ]
+
 dependencies = [
-    "zstandard"
+    "zstandard>=0.20.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/mkiyer/zna"
+Documentation = "https://github.com/mkiyer/zna#readme"
+Repository = "https://github.com/mkiyer/zna.git"
+Issues = "https://github.com/mkiyer/zna/issues"
+Changelog = "https://github.com/mkiyer/zna/releases"
 
 [project.scripts]
 # This creates the 'zna' command line tool
@@ -38,5 +66,5 @@ testpaths = ["tests"]
 [tool.scikit-build]
 wheel.packages = ["src/zna"]
 build-dir = "build/{wheel_tag}"
-cmake.minimum-version = "3.15"
+cmake.version = ">=3.15"
 cmake.build-type = "Release"

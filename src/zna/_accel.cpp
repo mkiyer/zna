@@ -12,6 +12,7 @@
 #include <nanobind/ndarray.h>
 
 #include <cstdint>
+#include <cstring>  // for memcpy
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,6 +31,9 @@ alignas(64) static uint8_t ENCODE_TABLE[256];
 
 // Lookup table for decoding (2-bit value -> char)
 static constexpr char DECODE_CHARS[4] = {'A', 'C', 'G', 'T'};
+
+// Complement table for reverse complement (A<->T, C<->G)
+static constexpr char COMPLEMENT_TABLE[4] = {'T', 'G', 'C', 'A'};
 
 // Initialize encoding table at module load
 static void init_encode_table() noexcept {
@@ -50,6 +54,20 @@ static void init_encode_table() noexcept {
 static struct TableInitializer {
     TableInitializer() { init_encode_table(); }
 } table_initializer;
+
+
+// --- Helper for unaligned little-endian reads ---
+inline uint16_t read_u16_le(const uint8_t* ptr) {
+    uint16_t val;
+    std::memcpy(&val, ptr, 2);
+    return val;
+}
+
+inline uint32_t read_u32_le(const uint8_t* ptr) {
+    uint32_t val;
+    std::memcpy(&val, ptr, 4);
+    return val;
+}
 
 
 /**
@@ -167,8 +185,9 @@ std::vector<Record> decode_block_records(
     size_t offset = 0;
     
     for (int rec = 0; rec < count; rec++) {
-        if (offset >= data_size) {
-            throw std::runtime_error("Unexpected end of block data");
+        // Safety Check 1: Ensure we have at least 1 byte for flags
+        if (offset + 1 > data_size) {
+            throw std::runtime_error("Block truncated: cannot read flags byte");
         }
         
         // Read flags
@@ -177,25 +196,28 @@ std::vector<Record> decode_block_records(
         bool is_read2 = (flags & 2) != 0;
         bool is_paired = (flags & 4) != 0;
         
-        // Read sequence length (little-endian)
+        // Safety Check 2: Ensure we have length bytes
+        if (offset + static_cast<size_t>(len_bytes) > data_size) {
+            throw std::runtime_error("Block truncated: cannot read length header");
+        }
+        
+        // Read sequence length using optimized unaligned reads
         size_t seq_len = 0;
         if (len_bytes == 1) {
             seq_len = data[offset];
         } else if (len_bytes == 2) {
-            seq_len = data[offset] | (static_cast<size_t>(data[offset + 1]) << 8);
+            seq_len = read_u16_le(data + offset);
         } else {  // len_bytes == 4
-            seq_len = data[offset] |
-                     (static_cast<size_t>(data[offset + 1]) << 8) |
-                     (static_cast<size_t>(data[offset + 2]) << 16) |
-                     (static_cast<size_t>(data[offset + 3]) << 24);
+            seq_len = read_u32_le(data + offset);
         }
         offset += len_bytes;
         
         // Calculate encoded length
         size_t enc_len = (seq_len + 3) / 4;
         
+        // Safety Check 3: Ensure we have sequence data
         if (offset + enc_len > data_size) {
-            throw std::runtime_error("Unexpected end of block data while reading sequence");
+            throw std::runtime_error("Block truncated: cannot read sequence data");
         }
         
         // Decode sequence
@@ -206,6 +228,35 @@ std::vector<Record> decode_block_records(
     }
     
     return results;
+}
+
+
+/**
+ * Compute reverse complement of a DNA sequence.
+ * 
+ * Uses optimized in-place reversal and complementation.
+ * A<->T, C<->G
+ */
+std::string reverse_complement(const std::string& seq) {
+    const size_t len = seq.size();
+    std::string result;
+    result.resize(len);
+    
+    // Work from both ends, complement and reverse in one pass
+    const char* src = seq.data();
+    char* dst = result.data();
+    
+    for (size_t i = 0; i < len; i++) {
+        uint8_t base = ENCODE_TABLE[static_cast<uint8_t>(src[len - 1 - i])];
+        if (base == INVALID) {
+            // For unknown bases, just reverse without complement
+            dst[i] = src[len - 1 - i];
+        } else {
+            dst[i] = COMPLEMENT_TABLE[base];
+        }
+    }
+    
+    return result;
 }
 
 
@@ -224,4 +275,9 @@ NB_MODULE(_accel, m) {
           nb::arg("count"),
           "Decode all records from a block at once.\n\n"
           "Processes entire block in C++ to avoid Python overhead.");
+    
+    m.def("reverse_complement", &reverse_complement,
+          nb::arg("seq"),
+          "Compute reverse complement of a DNA sequence.\n\n"
+          "A<->T, C<->G. Used for strand-specific library normalization.");
 }

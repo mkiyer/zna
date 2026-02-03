@@ -1,0 +1,23 @@
+# Include metadata and documentation
+include README.md
+include LICENSE
+include PUBLISHING.md
+include pyproject.toml
+include CMakeLists.txt
+
+# Include all C++ source files
+recursive-include src *.cpp *.h *.hpp
+
+# Include Python source files
+recursive-include src *.py
+
+# Include tests
+recursive-include tests *.py
+
+# Exclude build artifacts
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude *.dylib
