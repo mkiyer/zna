@@ -17,9 +17,9 @@ _MAGIC = b"ZNA\x1A"
 # Use entire byte for versioning to allow future expansion
 _VERSION = 1
 
-# Struct Format: Magic(4s), Ver(B), Len(B), Flags(B), CompMethod(B), CompLevel(B), 3xStrLen(H)
+# Struct Format: Magic(4s), Ver(B), Len(B), Flags(B), CompMethod(B), CompLevel(B), 2xStrLen(H)
 # < = Little Endian
-_FILE_HEADER_FMT = "<4sBBBBBHHH"
+_FILE_HEADER_FMT = "<4sBBBBBHH"
 _FILE_HEADER_SIZE = struct.calcsize(_FILE_HEADER_FMT)
 
 # Block Header: CompressedSize (I), UncompressedSize (I), RecordCount (I)
@@ -57,12 +57,33 @@ for i,base in enumerate(_BASES):
     _CHAR_TO_2BIT[ord(base)] = i
     _CHAR_TO_2BIT[ord(base.lower())] = i
 
+# Translation table for vectorized encoding (bytes.translate)
+# Maps ASCII bytes to 2-bit integers: A→0, C→1, G→2, T→3
+# Invalid characters map to 255 (will cause error in bit packing)
+_TRANS_TABLE = bytes([255] * 256)
+_trans_array = bytearray(_TRANS_TABLE)
+for i, base in enumerate(_BASES):
+    _trans_array[ord(base)] = i
+    _trans_array[ord(base.lower())] = i
+_TRANS_TABLE = bytes(_trans_array)
+
 # 2. Decode Table: 2-bit int -> 4-mer String (tuple for faster indexing)
 _DECODE_TABLE = tuple(
     _BASES[(val >> 6) & 0b11] + _BASES[(val >> 4) & 0b11] + 
     _BASES[(val >> 2) & 0b11] + _BASES[(val >> 0) & 0b11]
     for val in range(256)
 )
+
+# 3. Bytes-based Decode Table: Flat array of 1024 bytes (256 entries * 4 bytes)
+# Each byte value maps to 4 ASCII bytes representing bases
+_DECODE_TABLE_BYTES = bytearray(1024)
+for val in range(256):
+    offset = val * 4
+    _DECODE_TABLE_BYTES[offset] = ord(_BASES[(val >> 6) & 0b11])
+    _DECODE_TABLE_BYTES[offset + 1] = ord(_BASES[(val >> 4) & 0b11])
+    _DECODE_TABLE_BYTES[offset + 2] = ord(_BASES[(val >> 2) & 0b11])
+    _DECODE_TABLE_BYTES[offset + 3] = ord(_BASES[(val >> 0) & 0b11])
+_DECODE_TABLE_BYTES = bytes(_DECODE_TABLE_BYTES)  # Make immutable
 
 # Pre-compiled struct formats for record length (only powers of 2 supported)
 _SEQ_LEN_STRUCTS = {
@@ -71,7 +92,6 @@ _SEQ_LEN_STRUCTS = {
     4: struct.Struct("<I"),
 }
 _VALID_SEQ_LEN_BYTES = frozenset(_SEQ_LEN_STRUCTS.keys())
-_FLAG_STRUCT = struct.Struct("<B")
 
 # Default compression level for zstd (1-22, lower = faster)
 DEFAULT_ZSTD_LEVEL = 3
@@ -84,7 +104,6 @@ class ZnaHeader:
     """Header metadata for ZNA files."""
     read_group: str
     description: str = ""
-    extra_info: str = ""
     seq_len_bytes: int = MIN_SEQ_LEN_BYTES
     strand_specific: bool = False
     compression_method: int = COMPRESSION_NONE
@@ -97,8 +116,6 @@ class ZnaHeader:
             raise ValueError(f"read_group too long: {len(self.read_group)} > {MAX_METADATA_LENGTH}")
         if len(self.description.encode('utf-8')) > MAX_METADATA_LENGTH:
             raise ValueError(f"description too long: {len(self.description)} > {MAX_METADATA_LENGTH}")
-        if len(self.extra_info.encode('utf-8')) > MAX_METADATA_LENGTH:
-            raise ValueError(f"extra_info too long: {len(self.extra_info)} > {MAX_METADATA_LENGTH}")
         if self.compression_method not in (COMPRESSION_NONE, COMPRESSION_ZSTD):
             raise ValueError(f"compression_method must be 0 or 1, got {self.compression_method}")
         if not (1 <= self.compression_level <= 22):
@@ -142,7 +159,6 @@ class ZnaWriter:
     def _write_header(self) -> None:
         rg_bytes = self._header.read_group.encode("utf-8")
         desc_bytes = self._header.description.encode("utf-8")
-        extra_bytes = self._header.extra_info.encode("utf-8")
         
         if self._header.seq_len_bytes not in _VALID_SEQ_LEN_BYTES:
             raise ValueError(f"seq_len_bytes must be one of {sorted(_VALID_SEQ_LEN_BYTES)}")
@@ -150,8 +166,6 @@ class ZnaWriter:
             raise ValueError(f"read_group length exceeds {MAX_METADATA_LENGTH} bytes")
         if len(desc_bytes) > MAX_METADATA_LENGTH:
             raise ValueError(f"description length exceeds {MAX_METADATA_LENGTH} bytes")
-        if len(extra_bytes) > MAX_METADATA_LENGTH:
-            raise ValueError(f"extra_info length exceeds {MAX_METADATA_LENGTH} bytes")
 
         flags = 0
         if self._header.strand_specific:
@@ -167,14 +181,12 @@ class ZnaWriter:
             self._header.compression_method,
             self._header.compression_level,
             len(rg_bytes),
-            len(desc_bytes),
-            len(extra_bytes)
+            len(desc_bytes)
         )
         
         self._fh.write(header_fixed)
         self._fh.write(rg_bytes)
         self._fh.write(desc_bytes)
-        self._fh.write(extra_bytes)
 
     def write_record(self, seq: str, is_paired: bool, is_read1: bool, is_read2: bool) -> None:
         # ensure sequence length fits in specified bytes
@@ -283,7 +295,7 @@ class ZnaReader:
         # struct.unpack to parse header (clarity)
         fixed_data = self._read_exact(_FILE_HEADER_SIZE)
         fixed_fields = struct.unpack(_FILE_HEADER_FMT, fixed_data)
-        (magic, ver, len_bytes, flags, compression_method, compression_level, rg_len, desc_len, extra_len) = fixed_fields
+        (magic, ver, len_bytes, flags, compression_method, compression_level, rg_len, desc_len) = fixed_fields
         
         if magic != _MAGIC:
             raise ValueError("Not a ZNA file")
@@ -292,12 +304,10 @@ class ZnaReader:
             
         read_group = self._read_exact(rg_len).decode("utf-8")
         description = self._read_exact(desc_len).decode("utf-8")
-        extra_info = self._read_exact(extra_len).decode("utf-8") if extra_len else ""
         
         return ZnaHeader(
             read_group=read_group,
             description=description,
-            extra_info=extra_info,
             seq_len_bytes=len_bytes,
             strand_specific=bool(flags & ZnaHeaderFlags.STRAND_SPECIFIC),
             compression_method=compression_method,
@@ -308,7 +318,7 @@ class ZnaReader:
         read_exact = self._read_exact
         fh_read = self._fh.read
         len_bytes = self._header.seq_len_bytes
-        decode_table = _DECODE_TABLE 
+        decode_table = _DECODE_TABLE  # Use string table
         compression_method = self._header.compression_method
 
         if compression_method == COMPRESSION_ZSTD:
@@ -354,8 +364,9 @@ class ZnaReader:
                 seq_bytes = mv[offset:offset + enc_len]
                 offset += enc_len
                 
-                # Decode sequence
-                full_seq = "".join(decode_table[b] for b in seq_bytes)
+                # Decode sequence - build list first to minimize reallocations
+                chunks = [decode_table[b] for b in seq_bytes]
+                full_seq = ''.join(chunks)
                 
                 yield full_seq[:seq_len], is_paired, is_read1, is_read2
 
@@ -366,14 +377,16 @@ def _encode_sequence(seq: str) -> bytes:
     
     Each base (A, C, G, T) is encoded as 2 bits, packed into bytes.
     Invalid characters raise ValueError.
-    """
-    # ascii encoding is fast and gives us direct byte access
-    bseq = seq.encode('ascii') 
-    length = len(bseq)
     
-    # pre-allocate output buffer
-    out = bytearray((length + 3) // 4)    
-    char_map = _CHAR_TO_2BIT
+    Uses bytes.translate() for vectorized character lookup in C.
+    """
+    # Vectorized character lookup: translate ASCII to 2-bit values in C
+    bseq = seq.encode('ascii')
+    mapped = bseq.translate(_TRANS_TABLE)
+    length = len(mapped)
+    
+    # Pre-allocate output buffer
+    out = bytearray((length + 3) // 4)
     
     i = 0
     idx = 0
@@ -383,10 +396,10 @@ def _encode_sequence(seq: str) -> bytes:
     while idx < full_chunks:
         # (b1 << 6) | (b2 << 4) | (b3 << 2) | b4
         val = (
-            (char_map[bseq[i]] << 6) | 
-            (char_map[bseq[i+1]] << 4) | 
-            (char_map[bseq[i+2]] << 2) | 
-            char_map[bseq[i+3]]
+            (mapped[i] << 6) | 
+            (mapped[i+1] << 4) | 
+            (mapped[i+2] << 2) | 
+            mapped[i+3]
         )
         out[idx] = val
         idx += 1
@@ -397,7 +410,7 @@ def _encode_sequence(seq: str) -> bytes:
         val = 0
         shift = 6
         while i < length:
-            val |= (char_map[bseq[i]] << shift)
+            val |= (mapped[i] << shift)
             i += 1
             shift -= 2
         out[idx] = val

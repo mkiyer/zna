@@ -35,7 +35,6 @@ class TestZnaIO(unittest.TestCase):
         header = ZnaHeader(
             read_group="rg1",
             description="test",
-            extra_info="extra",
             seq_len_bytes=1,
             strand_specific=True,
         )
