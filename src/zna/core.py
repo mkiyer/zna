@@ -49,41 +49,29 @@ class ZnaRecordFlags(IntFlag):
 # --- LOOKUP TABLES ---
 _BASES = ('A', 'C', 'G', 'T')
 
-# 1. Encode Table: Direct Integer Mapping (Char -> 2-bit int)
-# Initialize with a sentinel value (255) to trigger ValueError on invalid chars
-# because (255 << 6) | ... > 255 which fails byte assignment.
-_CHAR_TO_2BIT = [255] * 256
-for i,base in enumerate(_BASES):
-    _CHAR_TO_2BIT[ord(base)] = i
-    _CHAR_TO_2BIT[ord(base.lower())] = i
+def make_dna_encode_table() -> bytes:
+    """
+    Create translation table for bytes.translate() encoding.
+    
+    Maps ASCII bytes to 2-bit integers: A→0, C→1, G→2, T→3
+    Invalid characters map to 255 (triggers error during bit packing).
+    """
+    table = bytearray([255] * 256)
+    for i, base in enumerate(_BASES):
+        table[ord(base)] = i
+        table[ord(base.lower())] = i
+    return bytes(table)
 
-# Translation table for vectorized encoding (bytes.translate)
-# Maps ASCII bytes to 2-bit integers: A→0, C→1, G→2, T→3
-# Invalid characters map to 255 (will cause error in bit packing)
-_TRANS_TABLE = bytes([255] * 256)
-_trans_array = bytearray(_TRANS_TABLE)
-for i, base in enumerate(_BASES):
-    _trans_array[ord(base)] = i
-    _trans_array[ord(base.lower())] = i
-_TRANS_TABLE = bytes(_trans_array)
+# Encode Table: Translation table for vectorized encoding
+_TRANS_TABLE = make_dna_encode_table()
 
-# 2. Decode Table: 2-bit int -> 4-mer String (tuple for faster indexing)
+# Decode Table: Maps byte value to 4-character string
+# Each byte represents 4 bases packed as 2-bit values
 _DECODE_TABLE = tuple(
     _BASES[(val >> 6) & 0b11] + _BASES[(val >> 4) & 0b11] + 
     _BASES[(val >> 2) & 0b11] + _BASES[(val >> 0) & 0b11]
     for val in range(256)
 )
-
-# 3. Bytes-based Decode Table: Flat array of 1024 bytes (256 entries * 4 bytes)
-# Each byte value maps to 4 ASCII bytes representing bases
-_DECODE_TABLE_BYTES = bytearray(1024)
-for val in range(256):
-    offset = val * 4
-    _DECODE_TABLE_BYTES[offset] = ord(_BASES[(val >> 6) & 0b11])
-    _DECODE_TABLE_BYTES[offset + 1] = ord(_BASES[(val >> 4) & 0b11])
-    _DECODE_TABLE_BYTES[offset + 2] = ord(_BASES[(val >> 2) & 0b11])
-    _DECODE_TABLE_BYTES[offset + 3] = ord(_BASES[(val >> 0) & 0b11])
-_DECODE_TABLE_BYTES = bytes(_DECODE_TABLE_BYTES)  # Make immutable
 
 # Pre-compiled struct formats for record length (only powers of 2 supported)
 _SEQ_LEN_STRUCTS = {
@@ -157,21 +145,14 @@ class ZnaWriter:
         self._flush_block()    
 
     def _write_header(self) -> None:
+        """Write file header with metadata."""
         rg_bytes = self._header.read_group.encode("utf-8")
         desc_bytes = self._header.description.encode("utf-8")
         
-        if self._header.seq_len_bytes not in _VALID_SEQ_LEN_BYTES:
-            raise ValueError(f"seq_len_bytes must be one of {sorted(_VALID_SEQ_LEN_BYTES)}")
-        if len(rg_bytes) > MAX_METADATA_LENGTH:
-            raise ValueError(f"read_group length exceeds {MAX_METADATA_LENGTH} bytes")
-        if len(desc_bytes) > MAX_METADATA_LENGTH:
-            raise ValueError(f"description length exceeds {MAX_METADATA_LENGTH} bytes")
-
         flags = 0
         if self._header.strand_specific:
             flags |= ZnaHeaderFlags.STRAND_SPECIFIC
         
-        # pack using struct for clarity
         header_fixed = struct.pack(
             _FILE_HEADER_FMT,
             _MAGIC,
@@ -189,7 +170,7 @@ class ZnaWriter:
         self._fh.write(desc_bytes)
 
     def write_record(self, seq: str, is_paired: bool, is_read1: bool, is_read2: bool) -> None:
-        # ensure sequence length fits in specified bytes
+        """Write a single sequence record to the buffer."""
         seq_len = len(seq)
         if seq_len > self._max_len:
             raise ValueError(
@@ -245,6 +226,7 @@ class ZnaWriter:
             self._flush_block()
             
     def _flush_block(self) -> None:
+        """Compress and write current block to file."""
         if self._buffer_pos == 0:
             return
 
@@ -261,7 +243,7 @@ class ZnaWriter:
             
         compressed_size = len(final_data)
         
-        # Block Header: <CompressedSize (I)> <UncompressedSize (I)> <RecordCount (I)>
+        # Write block header and data
         block_header = struct.pack(_BLOCK_HEADER_FMT, compressed_size, uncompressed_size, count)
         
         self._fh.write(block_header)
@@ -364,7 +346,7 @@ class ZnaReader:
                 seq_bytes = mv[offset:offset + enc_len]
                 offset += enc_len
                 
-                # Decode sequence - build list first to minimize reallocations
+                # Decode: Build list of 4-mers, join once, then trim to exact length
                 chunks = [decode_table[b] for b in seq_bytes]
                 full_seq = ''.join(chunks)
                 
@@ -373,14 +355,21 @@ class ZnaReader:
 
 def _encode_sequence(seq: str) -> bytes:
     """
-    Encodes a DNA sequence into 2-bit packed bytes.
+    Encode DNA sequence to 2-bit packed bytes.
     
-    Each base (A, C, G, T) is encoded as 2 bits, packed into bytes.
-    Invalid characters raise ValueError.
+    Each base (A, C, G, T) is encoded as 2 bits (00, 01, 10, 11).
+    Four bases are packed into each byte.
     
-    Uses bytes.translate() for vectorized character lookup in C.
+    Args:
+        seq: DNA sequence string (A, C, G, T)
+        
+    Returns:
+        Packed bytes with 4 bases per byte
+        
+    Raises:
+        ValueError: If sequence contains invalid characters
     """
-    # Vectorized character lookup: translate ASCII to 2-bit values in C
+    # Vectorized character lookup using C-level bytes.translate()
     bseq = seq.encode('ascii')
     mapped = bseq.translate(_TRANS_TABLE)
     length = len(mapped)
@@ -392,9 +381,8 @@ def _encode_sequence(seq: str) -> bytes:
     idx = 0
     full_chunks = length // 4
     
-    # Main Body: Unrolled loop for 4-byte chunks
+    # Pack full 4-base chunks into bytes
     while idx < full_chunks:
-        # (b1 << 6) | (b2 << 4) | (b3 << 2) | b4
         val = (
             (mapped[i] << 6) | 
             (mapped[i+1] << 4) | 
