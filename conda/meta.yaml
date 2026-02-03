@@ -8,12 +8,13 @@ package:
 
 source:
   url: https://github.com/{{ username }}/{{ name }}/archive/v{{ version }}.tar.gz
-  sha256: 00000000000000000000000000000000000000000000000000000123456789ab  # Update with actual SHA256
+  sha256: 97d99ed82ec9790bba6d08da9a75457f2c0004e78586cc9142e2d6f2ce8a7e60
 
 build:
   number: 0
-  script: {{ PYTHON }} -m pip install . -vv
-  skip: python <3.8
+  skip: true  # [py<310]
+  run_exports:
+    - {{ pin_subpackage(name, max_pin="x.x") }}
 
 requirements:
   build:
@@ -27,6 +28,7 @@ requirements:
     - pip
     - scikit-build-core >=0.10
     - nanobind >=2.0
+    - zstandard
   run:
     - python
     - zstandard
@@ -38,7 +40,7 @@ test:
     - zna.cli
   commands:
     - zna --help
-    - python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_accelerated()}')"
+    - python -c "from zna.core import is_accelerated; print('Accelerated:', is_accelerated())"
   requires:
     - pytest
 
