@@ -66,7 +66,7 @@ cd /path/to/zna
 conda build conda/
 
 # If build succeeds, test the package
-conda create -n test-zna python=3.12
+conda create -n test-zna python=3.14
 conda activate test-zna
 conda install --use-local zna
 

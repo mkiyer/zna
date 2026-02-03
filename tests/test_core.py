@@ -8,7 +8,7 @@ from zna import reverse_complement
 
 
 class TestZnaIO(unittest.TestCase):
-    def roundtrip(self, sequences, header):
+    def roundtrip(self, sequences, header, npolicy=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/sample.zna"
             with open(path, "wb") as out_fh:
@@ -26,7 +26,9 @@ class TestZnaIO(unittest.TestCase):
                     else:
                         records.append((seq, False, False, False))
                         
-                write_zna(out_fh, header, records)
+                with ZnaWriter(out_fh, header, npolicy=npolicy) as writer:
+                    for seq, is_paired, is_r1, is_r2 in records:
+                        writer.write_record(seq, is_paired, is_r1, is_r2)
             with open(path, "rb") as in_fh:
                 read_header, rec_iter = read_zna(in_fh)
                 read_records = list(rec_iter)
@@ -409,6 +411,113 @@ class TestStrandSpecific(unittest.TestCase):
                 
                 records = list(reader.records(restore_strand=True))
                 self.assertEqual(records[0][0], test_seq)
+
+
+class TestNPolicy(unittest.TestCase):
+    """Test N-nucleotide handling policies."""
+    
+    def test_npolicy_replace_with_A(self):
+        """Test that N nucleotides are replaced with A."""
+        header = ZnaHeader(read_group="test", description="")
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/npolicy.zna"
+            
+            # Write sequence with N
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header, npolicy="A") as writer:
+                    writer.write_record("ACNGT", False, False, False)
+                    writer.write_record("NNN", False, False, False)
+            
+            # Read and verify N was replaced with A
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records())
+                self.assertEqual(records[0][0], "ACAGT")  # N -> A
+                self.assertEqual(records[1][0], "AAA")    # NNN -> AAA
+    
+    def test_npolicy_replace_with_other_bases(self):
+        """Test that N can be replaced with C, G, or T."""
+        header = ZnaHeader(read_group="test")
+        
+        for base in ['C', 'G', 'T']:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = f"{tmpdir}/npolicy.zna"
+                
+                with open(path, "wb") as fh:
+                    with ZnaWriter(fh, header, npolicy=base) as writer:
+                        writer.write_record("ACNGT", False, False, False)
+                
+                with open(path, "rb") as fh:
+                    reader = ZnaReader(fh)
+                    records = list(reader.records())
+                    expected = f"AC{base}GT"
+                    self.assertEqual(records[0][0], expected)
+    
+    def test_npolicy_random(self):
+        """Test that N nucleotides are replaced with random bases."""
+        header = ZnaHeader(read_group="test")
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/npolicy.zna"
+            
+            # Write sequence with N
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header, npolicy="random") as writer:
+                    writer.write_record("ACNGT", False, False, False)
+                    writer.write_record("NNNNN", False, False, False)
+            
+            # Read and verify N was replaced with valid bases
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records())
+                
+                # Check first sequence
+                seq1 = records[0][0]
+                self.assertEqual(len(seq1), 5)
+                self.assertEqual(seq1[0:2], "AC")
+                self.assertEqual(seq1[3:], "GT")
+                self.assertIn(seq1[2], "ACGT")  # Random base
+                
+                # Check second sequence
+                seq2 = records[1][0]
+                self.assertEqual(len(seq2), 5)
+                for base in seq2:
+                    self.assertIn(base, "ACGT")
+    
+    def test_npolicy_no_N_unchanged(self):
+        """Test that sequences without N are unchanged regardless of policy."""
+        header = ZnaHeader(read_group="test")
+        test_seq = "ACGTACGT"
+        
+        for policy in ['A', 'C', 'G', 'T', 'random']:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = f"{tmpdir}/npolicy.zna"
+                
+                with open(path, "wb") as fh:
+                    with ZnaWriter(fh, header, npolicy=policy) as writer:
+                        writer.write_record(test_seq, False, False, False)
+                
+                with open(path, "rb") as fh:
+                    reader = ZnaReader(fh)
+                    records = list(reader.records())
+                    self.assertEqual(records[0][0], test_seq)
+    
+    def test_npolicy_case_insensitive(self):
+        """Test that lowercase n is also handled."""
+        header = ZnaHeader(read_group="test")
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/npolicy.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header, npolicy="A") as writer:
+                    writer.write_record("ACnGT", False, False, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records())
+                self.assertEqual(records[0][0], "ACAGT")
 
 
 if __name__ == "__main__":

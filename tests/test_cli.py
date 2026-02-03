@@ -11,7 +11,8 @@ import pytest
 
 from zna.cli import (
     parse_fasta, parse_fastq, choose_parser,
-    stream_inputs, encode_command, decode_command, inspect_command
+    stream_inputs, encode_command, decode_command, inspect_command,
+    get_base_name, get_read_suffix_number, parse_fastq_with_names
 )
 from zna.core import (
     ZnaHeader, ZnaWriter, ZnaReader,
@@ -103,6 +104,15 @@ class TestParsers:
         fh = BytesIO(b"")
         sequences = list(parse_fastq(fh))
         assert len(sequences) == 0
+    
+    def test_parse_fastq_with_names(self):
+        """Test FASTQ parser that returns names and sequences."""
+        fh = BytesIO(FASTQ_DATA)
+        entries = list(parse_fastq_with_names(fh))
+        assert len(entries) == 3
+        assert entries[0] == ("read1", "ACGTACGT")
+        assert entries[1] == ("read2", "TGCATGCA")
+        assert entries[2] == ("read3", "AAAACCCCGGGG")
 
     def test_get_parser_fasta(self):
         """Test parser selection for FASTA files."""
@@ -132,6 +142,40 @@ class TestParsers:
         # Override works with stdin
         assert choose_parser(None, format_override='fasta') == parse_fasta
         assert choose_parser(None, format_override='fastq') == parse_fastq
+
+
+# --- Read Name Helper Tests ---
+
+class TestReadNameHelpers:
+    def test_get_base_name_with_suffix(self):
+        """Test extracting base name from reads with /1 or /2 suffix."""
+        assert get_base_name("read1/1") == "read1"
+        assert get_base_name("read1/2") == "read1"
+        assert get_base_name("INSTRUMENT:123:FLOWCELL:1:1:1234:5678/1") == "INSTRUMENT:123:FLOWCELL:1:1:1234:5678"
+    
+    def test_get_base_name_without_suffix(self):
+        """Test extracting base name from reads without suffix."""
+        assert get_base_name("read1") == "read1"
+        assert get_base_name("single_read") == "single_read"
+    
+    def test_get_base_name_with_comment(self):
+        """Test extracting base name ignores comments."""
+        assert get_base_name("read1/1 comment text") == "read1"
+        assert get_base_name("read1/2 merged") == "read1"
+        assert get_base_name("read1 merged comment") == "read1"
+    
+    def test_get_read_suffix_number(self):
+        """Test extracting read number from suffix."""
+        assert get_read_suffix_number("read1/1") == 1
+        assert get_read_suffix_number("read1/2") == 2
+        assert get_read_suffix_number("read1") == 0
+        assert get_read_suffix_number("single") == 0
+    
+    def test_get_read_suffix_number_with_comment(self):
+        """Test suffix number extraction ignores comments."""
+        assert get_read_suffix_number("read1/1 comment") == 1
+        assert get_read_suffix_number("read1/2 merged") == 2
+        assert get_read_suffix_number("read1 comment") == 0
 
 
 # --- Encode Tests ---
@@ -943,3 +987,355 @@ class TestStrandProtocol:
             assert "Strand Specific:  True" in output
             assert "R1 Antisense:     True" in output
             assert "R2 Antisense:     False" in output
+
+
+# --- N-Policy CLI Tests ---
+
+class TestNPolicyCLI:
+    """Test CLI N-policy functionality."""
+    
+    def test_npolicy_drop(self):
+        """Test that sequences with N are dropped when using --npolicy drop."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create FASTA with some sequences containing N
+            fasta_path = f"{tmpdir}/input.fasta"
+            with open(fasta_path, "w") as f:
+                f.write(">seq1\nACGT\n")
+                f.write(">seq2_with_N\nACNGT\n")
+                f.write(">seq3\nTGCA\n")
+                f.write(">seq4_with_N\nNNNN\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fasta_path]
+                interleaved = False
+                fasta = True
+                fastq = False
+                read_group = "test"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = "drop"
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(Args())
+            
+            # Decode and verify only sequences without N remain
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 2  # Only seq1 and seq3
+                assert records[0][0] == "ACGT"
+                assert records[1][0] == "TGCA"
+    
+    def test_npolicy_replace_A(self):
+        """Test that N nucleotides are replaced with A."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta_path = f"{tmpdir}/input.fasta"
+            with open(fasta_path, "w") as f:
+                f.write(">seq_with_N\nACNGT\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fasta_path]
+                interleaved = False
+                fasta = True
+                fastq = False
+                read_group = "test"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = "A"
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(Args())
+            
+            # Decode and verify N was replaced with A
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 1
+                assert records[0][0] == "ACAGT"  # N -> A
+    
+    def test_npolicy_random(self):
+        """Test that N nucleotides are replaced with random bases."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta_path = f"{tmpdir}/input.fasta"
+            with open(fasta_path, "w") as f:
+                f.write(">seq_with_N\nACNGT\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fasta_path]
+                interleaved = False
+                fasta = True
+                fastq = False
+                read_group = "test"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = "random"
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+            
+            encode_command(Args())
+            
+            # Decode and verify N was replaced with a valid base
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 1
+                seq = records[0][0]
+                assert len(seq) == 5
+                assert seq[0:2] == "AC"
+                assert seq[3:] == "GT"
+                assert seq[2] in "ACGT"  # Random replacement
+
+
+# --- Mixed Interleaved Tests ---
+
+class TestMixedInterleaved:
+    """Tests for interleaved mode with mixed paired-end and single-end reads."""
+    
+    def test_mixed_paired_and_single(self):
+        """Test interleaved mode with both paired and single-end reads."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create test file with mixed reads
+            fastq_path = f"{tmpdir}/mixed.fastq"
+            with open(fastq_path, "w") as f:
+                f.write("@read1/1\nACGTACGT\n+\nIIIIIIII\n")
+                f.write("@read1/2\nTGCATGCA\n+\nIIIIIIII\n")
+                f.write("@single1\nGGGGAAAA\n+\nIIIIIIII\n")
+                f.write("@read2/1\nCCCCTTTT\n+\nIIIIIIII\n")
+                f.write("@read2/2\nAAAACCCC\n+\nIIIIIIII\n")
+                f.write("@single2\nTTTTGGGG\n+\nIIIIIIII\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fastq_path]
+                interleaved = True
+                fasta = False
+                fastq = True
+                read_group = "mixed"
+                description = "test"
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = None
+                output = zna_path
+                seq_len_bytes = 2
+                block_size = 131072
+                compress_flag = False
+                level = 3
+                quiet = True
+            
+            encode_command(Args())
+            
+            # Decode and verify structure
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                # Should have 6 records: 2 pairs + 2 singles
+                assert len(records) == 6
+                
+                # Check first pair
+                assert records[0] == ("ACGTACGT", True, True, False)
+                assert records[1] == ("TGCATGCA", True, False, True)
+                
+                # Check first single
+                assert records[2] == ("GGGGAAAA", False, False, False)
+                
+                # Check second pair
+                assert records[3] == ("CCCCTTTT", True, True, False)
+                assert records[4] == ("AAAACCCC", True, False, True)
+                
+                # Check second single
+                assert records[5] == ("TTTTGGGG", False, False, False)
+    
+    def test_all_paired_reads(self):
+        """Test interleaved mode with only paired reads."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fastq_path = f"{tmpdir}/paired.fastq"
+            with open(fastq_path, "w") as f:
+                f.write("@read1/1\nACGT\n+\nIIII\n")
+                f.write("@read1/2\nTGCA\n+\nIIII\n")
+                f.write("@read2/1\nGGGG\n+\nIIII\n")
+                f.write("@read2/2\nCCCC\n+\nIIII\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fastq_path]
+                interleaved = True
+                fasta = False
+                fastq = True
+                read_group = "paired"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = None
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+                quiet = True
+            
+            encode_command(Args())
+            
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 4
+                assert all(rec[1] for rec in records)  # All paired
+    
+    def test_all_single_reads(self):
+        """Test interleaved mode with only single-end reads."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fastq_path = f"{tmpdir}/singles.fastq"
+            with open(fastq_path, "w") as f:
+                f.write("@single1\nACGT\n+\nIIII\n")
+                f.write("@single2\nTGCA\n+\nIIII\n")
+                f.write("@single3\nGGGG\n+\nIIII\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fastq_path]
+                interleaved = True
+                fasta = False
+                fastq = True
+                read_group = "singles"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = None
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+                quiet = True
+            
+            encode_command(Args())
+            
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 3
+                assert all(not rec[1] for rec in records)  # All single
+    
+    def test_read_name_without_suffix(self):
+        """Test reads without /1 or /2 suffix are treated as single."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fastq_path = f"{tmpdir}/no_suffix.fastq"
+            with open(fastq_path, "w") as f:
+                f.write("@read1\nACGT\n+\nIIII\n")
+                f.write("@read2\nTGCA\n+\nIIII\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fastq_path]
+                interleaved = True
+                fasta = False
+                fastq = True
+                read_group = "nosuffix"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = None
+                output = zna_path
+                seq_len_bytes = 1
+                block_size = 131072
+                compress_flag = False
+                level = 3
+                quiet = True
+            
+            encode_command(Args())
+            
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                assert len(records) == 2
+                assert all(not rec[1] for rec in records)  # All treated as single
+    
+    def test_fastp_merged_format(self):
+        """Test handling of fastp output with merged notation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fastq_path = f"{tmpdir}/fastp.fastq"
+            with open(fastq_path, "w") as f:
+                # Merged read (no suffix)
+                f.write("@read1 merged\nACGTACGT\n+\nIIIIIIII\n")
+                # Unmerged pair
+                f.write("@read2/1\nCCCCTTTT\n+\nIIIIIIII\n")
+                f.write("@read2/2\nAAAACCCC\n+\nIIIIIIII\n")
+                # Another merged
+                f.write("@read3 merged\nGGGGAAAA\n+\nIIIIIIII\n")
+            
+            zna_path = f"{tmpdir}/output.zna"
+            
+            class Args:
+                files = [fastq_path]
+                interleaved = True
+                fasta = False
+                fastq = True
+                read_group = "fastp"
+                description = ""
+                strand_specific = False
+                read1_sense = False
+                read2_antisense = False
+                npolicy = None
+                output = zna_path
+                seq_len_bytes = 2
+                block_size = 131072
+                compress_flag = False
+                level = 3
+                quiet = True
+            
+            encode_command(Args())
+            
+            with open(zna_path, "rb") as f:
+                reader = ZnaReader(f)
+                records = list(reader.records())
+                
+                # Should have 4 records: 2 singles + 1 pair
+                assert len(records) == 4
+                
+                # First merged/single
+                assert records[0][1] == False  # not paired
+                
+                # Unmerged pair
+                assert records[1] == ("CCCCTTTT", True, True, False)
+                assert records[2] == ("AAAACCCC", True, False, True)
+                
+                # Second merged/single
+                assert records[3][1] == False  # not paired

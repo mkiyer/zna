@@ -42,6 +42,33 @@ def open_text_output(filepath: str, compress: bool = False) -> IO[str]:
 
 # --- PARSERS ---
 
+def get_base_name(full_name: str) -> str:
+    """
+    Extracts base read ID for pairing verification.
+    Handles headers like: @ID/1 merged_... or @ID comment
+    Returns 'ID' without /1 or /2 suffix and without comments.
+    """
+    # Split on whitespace to remove comments
+    read_id = full_name.split()[0]
+    # Split on slash to remove /1 or /2 pair indicators
+    if "/" in read_id:
+        return read_id.rsplit("/", 1)[0]
+    return read_id
+
+
+def get_read_suffix_number(full_name: str) -> int:
+    """
+    Returns 1 if name ends in /1, 2 if /2, else 0.
+    Considers only the ID part before whitespace.
+    """
+    read_id = full_name.split()[0]
+    if read_id.endswith("/1"):
+        return 1
+    if read_id.endswith("/2"):
+        return 2
+    return 0
+
+
 def parse_fastq(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTQ stream."""
     while True:
@@ -53,6 +80,20 @@ def parse_fastq(fh: BinaryIO) -> Iterator[str]:
         qual = fh.readline()  # Quality
         if seq:  # Only yield if we got a sequence
             yield seq
+
+
+def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
+    """Yields (read_name, sequence) tuples from FASTQ stream."""
+    while True:
+        header = fh.readline()
+        if not header: break
+        if not header.startswith(b'@'): continue
+        read_name = header[1:].strip().decode('ascii', errors='ignore')
+        seq = fh.readline().strip().decode('ascii', errors='ignore')
+        plus = fh.readline()  # +
+        qual = fh.readline()  # Quality
+        if seq:  # Only yield if we got a sequence
+            yield read_name, seq
 
 def parse_fasta(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTA stream."""
@@ -174,24 +215,81 @@ def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
                 yield s1, True, True, False
                 yield s2, True, False, True
 
-        # 2. One File or Stdin + Interleaved Flag = Interleaved Paired-End
+        # 2. One File or Stdin + Interleaved Flag = Interleaved (Mixed Paired/Single-End)
         elif args.interleaved:
             src = files[0] if len(files) == 1 else None
             f = stack.enter_context(get_input_handle(src))
-            parser = choose_parser(src, format_override)(f)
             
-            while True:
-                try:
-                    s1 = next(parser)
+            # For interleaved mode, we need read names to detect pairing
+            # Currently only support FASTQ with names for smart interleaved mode
+            format_type = format_override
+            if not format_type:
+                # Infer format
+                if src and src != "-":
+                    lower = src.lower()
+                    if lower.endswith('.gz'):
+                        lower = lower[:-3]
+                    if lower.endswith(('.fasta', '.fa', '.fna')):
+                        format_type = 'fasta'
+                    elif lower.endswith(('.fastq', '.fq')):
+                        format_type = 'fastq'
+                    else:
+                        format_type = 'fastq'  # default
+                else:
+                    format_type = 'fastq'  # default for stdin
+            
+            if format_type == 'fastq':
+                # Use smart interleaved mode with read name tracking
+                parser = parse_fastq_with_names(f)
+                prev_entry = None
+                
+                for curr_name, curr_seq in parser:
+                    if prev_entry is None:
+                        prev_entry = (curr_name, curr_seq)
+                        continue
+                    
+                    prev_name, prev_seq = prev_entry
+                    
+                    # Check if consecutive reads belong to the same pair
+                    if get_base_name(prev_name) == get_base_name(curr_name):
+                        # Found a pair (R1 and R2)
+                        n1 = get_read_suffix_number(prev_name)
+                        n2 = get_read_suffix_number(curr_name)
+                        
+                        # Validation
+                        if n1 == 2:
+                            print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
+                        if n2 == 1:
+                            print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
+                        
+                        # Yield as paired reads
+                        yield prev_seq, True, True, False   # R1
+                        yield curr_seq, True, False, True   # R2
+                        prev_entry = None
+                    else:
+                        # prev_entry was a singleton (single-end read)
+                        yield prev_seq, False, False, False
+                        prev_entry = (curr_name, curr_seq)
+                
+                # Handle the final remaining entry
+                if prev_entry is not None:
+                    yield prev_entry[1], False, False, False
+            
+            else:
+                # FASTA format: fallback to simple interleaved pairing
+                parser = parse_fasta(f)
+                while True:
                     try:
-                        s2 = next(parser)
+                        s1 = next(parser)
+                        try:
+                            s2 = next(parser)
+                        except StopIteration:
+                            print("[Warning] Interleaved input ended with orphan read.", file=sys.stderr)
+                            break
+                        yield s1, True, True, False
+                        yield s2, True, False, True
                     except StopIteration:
-                        print("[Warning] Interleaved input ended with orphan read.", file=sys.stderr)
                         break
-                    yield s1, True, True, False
-                    yield s2, True, False, True
-                except StopIteration:
-                    break
 
         # 3. One File or Stdin = Single-End
         else:
@@ -302,11 +400,15 @@ def encode_command(args):
     count = 0
     quiet = hasattr(args, 'quiet') and args.quiet
     # Use ExitStack to safely close output file (or leave stdout open)
+    npolicy = getattr(args, 'npolicy', None)
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
-        writer = stack.enter_context(ZnaWriter(f_out, header, block_size=args.block_size))
+        writer = stack.enter_context(ZnaWriter(f_out, header, block_size=args.block_size, npolicy=npolicy))
         
         for seq, is_paired, is_r1, is_r2 in stream_inputs(args):
+            # Skip sequence if it contains N and policy is 'drop'
+            if npolicy == 'drop' and 'N' in seq.upper():
+                continue
             writer.write_record(seq, is_paired, is_r1, is_r2)
             count += 1
             
@@ -494,6 +596,8 @@ def main():
     meta_group.add_argument("--description", default="", help="Description string")
     meta_group.add_argument("--strand-specific", action="store_true", 
                            help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
+    meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"],
+                           help="Policy for handling 'N' nucleotides: drop (skip sequences), random (replace with random base), or A/C/G/T (replace with specific base)")
     
     # R1 strand orientation (mutually exclusive)
     r1_strand = meta_group.add_mutually_exclusive_group()

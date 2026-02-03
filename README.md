@@ -162,12 +162,39 @@ cat data.txt | zna encode --fastq -o sample.zna
 # Separate R1/R2 files
 zna encode R1.fastq.gz R2.fastq.gz -o paired.zzna
 
-# Interleaved file
+# Interleaved file (strict alternating R1/R2 pairs)
 zna encode interleaved.fastq --interleaved -o paired.zzna
 
 # Interleaved from stdin
 cat interleaved.fastq | zna encode --interleaved -o paired.zzna
 ```
+
+#### Mixed Paired-End and Single-End Reads (Interleaved)
+
+The `--interleaved` mode intelligently detects both paired-end and single-end reads in the same file by analyzing read names. This is useful for output from tools like **fastp** that produce mixed merged (single) and unmerged (paired) reads.
+
+**How it works:**
+- Reads with matching base names (e.g., `read1/1` and `read1/2`) are paired
+- Reads without matching pairs are treated as single-end
+- Read names are used to determine pairing (not just alternating order)
+
+```bash
+# Mixed interleaved input (fastp output with merged + unmerged reads)
+zna encode fastp_output.fastq --interleaved -o mixed.zzna
+
+# Example input structure:
+#   @read1/1         →  paired with next read
+#   @read1/2
+#   @merged1         →  single-end (no pair)
+#   @read2/1         →  paired with next read
+#   @read2/2
+#   @merged2         →  single-end (no pair)
+```
+
+**Read name formats supported:**
+- `/1` and `/2` suffixes: `read1/1`, `read1/2`
+- No suffix: treated as single-end unless next read has matching base name
+- Comments ignored: `read1/1 merged_length:150` extracts `read1/1`
 
 #### Advanced Options
 
@@ -187,6 +214,11 @@ zna encode R1.fastq.gz R2.fastq.gz \
 zna encode R1.fastq.gz R2.fastq.gz \
   --strand-specific --read1-sense --read2-antisense \
   -o stranded.zzna
+
+# Handle sequences with N nucleotides
+zna encode sample.fastq --npolicy drop -o clean.zzna       # Skip sequences with N
+zna encode sample.fastq --npolicy random -o clean.zzna     # Replace N with random base
+zna encode sample.fastq --npolicy A -o clean.zzna          # Replace N with A
 
 # Control compression
 zna encode sample.fastq \
@@ -306,7 +338,7 @@ Positional Arguments:
   FILE1 [FILE2]          Input files (0=stdin, 1=single/interleaved, 2=paired R1 R2)
 
 Options:
-  --interleaved          Treat input as interleaved paired-end
+  --interleaved          Treat input as interleaved (auto-detects mixed paired/single reads)
   --fasta                Force FASTA format (overrides extension detection)
   --fastq                Force FASTQ format (overrides extension detection)
 
@@ -318,6 +350,11 @@ Metadata:
   --read1-antisense      Read 1 represents antisense strand (default when --strand-specific)
   --read2-sense          Read 2 represents sense strand (default when --strand-specific)
   --read2-antisense      Read 2 represents antisense strand
+  --npolicy {drop,random,A,C,G,T}
+                         Policy for handling 'N' nucleotides:
+                         - drop: skip sequences containing N
+                         - random: replace N with random base (A/C/G/T)
+                         - A/C/G/T: replace N with specific base
 
 Format Options:
   -o, --output FILE      Output file (default: stdout)

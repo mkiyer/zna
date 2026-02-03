@@ -57,6 +57,7 @@ static struct TableInitializer {
  * 
  * Each base (A, C, G, T) is encoded as 2 bits (00, 01, 10, 11).
  * Four bases are packed into each byte.
+ * N nucleotides are treated as errors (should be handled before calling this).
  */
 nb::bytes encode_sequence(const std::string& seq) {
     const size_t length = seq.size();

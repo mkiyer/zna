@@ -137,12 +137,13 @@ class ZnaHeader:
 
 class ZnaWriter:
     """Writer for ZNA files, handling block-based compression."""
-    def __init__(self, fh: BinaryIO, header: ZnaHeader, block_size: int = DEFAULT_BLOCK_SIZE):
+    def __init__(self, fh: BinaryIO, header: ZnaHeader, block_size: int = DEFAULT_BLOCK_SIZE, npolicy: str = None):
         self._fh = fh
         self._header = header
         self._seq_len_bytes = header.seq_len_bytes
         self._max_len = (1 << (8 * header.seq_len_bytes)) - 1
         self._block_size = block_size
+        self._npolicy = npolicy
         
         # Pre-size buffer to avoid reallocations
         self._buffer = bytearray(block_size)
@@ -227,7 +228,7 @@ class ZnaWriter:
             flags |= ZnaRecordFlags.IS_PAIRED
         
         try:
-            encoded_seq = _encode_sequence(seq)
+            encoded_seq = _encode_sequence(seq, npolicy=self._npolicy)
         except ValueError as e:
             raise ValueError(f"Invalid characters in sequence (only A,C,G,T allowed). Violation in: {seq[:20]}...") from e
         
@@ -424,7 +425,7 @@ class ZnaReader:
                     yield seq, is_paired, is_read1, is_read2
 
 
-def _encode_sequence(seq: str) -> bytes:
+def _encode_sequence(seq: str, npolicy: str = None) -> bytes:
     """
     Encode DNA sequence to 2-bit packed bytes.
     
@@ -432,7 +433,8 @@ def _encode_sequence(seq: str) -> bytes:
     Four bases are packed into each byte.
     
     Args:
-        seq: DNA sequence string (A, C, G, T)
+        seq: DNA sequence string (A, C, G, T, possibly N)
+        npolicy: Policy for handling N: 'random', 'A', 'C', 'G', 'T', or None
         
     Returns:
         Packed bytes with 4 bases per byte
@@ -440,6 +442,14 @@ def _encode_sequence(seq: str) -> bytes:
     Raises:
         ValueError: If sequence contains invalid characters
     """
+    # Handle N nucleotides if policy is set
+    if npolicy and 'N' in seq.upper():
+        if npolicy == 'random':
+            import random
+            seq = ''.join(random.choice('ACGT') if c.upper() == 'N' else c for c in seq)
+        elif npolicy in ('A', 'C', 'G', 'T'):
+            seq = seq.replace('N', npolicy).replace('n', npolicy.lower())
+    
     # Use C++ implementation if available
     if _USE_ACCEL:
         return _accel_encode_sequence(seq)
