@@ -70,30 +70,64 @@ def get_read_suffix_number(full_name: str) -> int:
 
 
 def parse_fastq(fh: BinaryIO) -> Iterator[str]:
-    """Yields sequence only from FASTQ stream."""
+    """Yields sequence only from FASTQ stream.
+    
+    Optimized for minimal overhead: reads 4 lines at a time and
+    only decodes the sequence line.
+    """
+    readline = fh.readline  # Cache method lookup
     while True:
-        header = fh.readline()
-        if not header: break
-        if not header.startswith(b'@'): continue
-        seq = fh.readline().strip().decode('ascii', errors='ignore')
-        plus = fh.readline()  # +
-        qual = fh.readline()  # Quality
-        if seq:  # Only yield if we got a sequence
-            yield seq
+        header = readline()
+        if not header: 
+            break
+        # Skip non-record lines (shouldn't happen in valid FASTQ)
+        if header[0] != 64:  # ord('@') = 64, faster than startswith
+            continue
+        seq_line = readline()
+        readline()  # + line (discard)
+        readline()  # Quality line (discard)
+        if seq_line:
+            # Strip newline and decode - use slice instead of strip() for speed
+            # Most lines end with \n, some with \r\n
+            end = len(seq_line)
+            if end > 0 and seq_line[-1] == 10:  # \n
+                end -= 1
+            if end > 0 and seq_line[end-1] == 13:  # \r
+                end -= 1
+            yield seq_line[:end].decode('ascii')
 
 
 def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
-    """Yields (read_name, sequence) tuples from FASTQ stream."""
+    """Yields (read_name, sequence) tuples from FASTQ stream.
+    
+    Optimized for minimal overhead.
+    """
+    readline = fh.readline  # Cache method lookup
     while True:
-        header = fh.readline()
-        if not header: break
-        if not header.startswith(b'@'): continue
-        read_name = header[1:].strip().decode('ascii', errors='ignore')
-        seq = fh.readline().strip().decode('ascii', errors='ignore')
-        plus = fh.readline()  # +
-        qual = fh.readline()  # Quality
-        if seq:  # Only yield if we got a sequence
-            yield read_name, seq
+        header = readline()
+        if not header: 
+            break
+        if header[0] != 64:  # ord('@') = 64
+            continue
+        # Extract read name (skip @ and strip)
+        end = len(header)
+        if end > 1 and header[-1] == 10:  # \n
+            end -= 1
+        if end > 1 and header[end-1] == 13:  # \r
+            end -= 1
+        read_name = header[1:end].decode('ascii')
+        
+        seq_line = readline()
+        readline()  # + line
+        readline()  # Quality line
+        
+        if seq_line:
+            end = len(seq_line)
+            if end > 0 and seq_line[-1] == 10:
+                end -= 1
+            if end > 0 and seq_line[end-1] == 13:
+                end -= 1
+            yield read_name, seq_line[:end].decode('ascii')
 
 def parse_fasta(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTA stream."""
@@ -573,8 +607,10 @@ def inspect_command(args):
         while True:
             b_header = f.read(_BLOCK_HEADER_SIZE)
             if not b_header: break
+            if len(b_header) < _BLOCK_HEADER_SIZE: break
             
-            c_size, u_size, n_recs = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+            # Columnar block header: comp_size, uncomp_size, n_recs, flags_size, lengths_size
+            c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(_BLOCK_HEADER_FMT, b_header)
             
             block_count += 1
             total_records += n_recs

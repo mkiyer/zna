@@ -527,5 +527,76 @@ class TestNPolicy(unittest.TestCase):
                 self.assertEqual(records[0][0], "ACAGT")
 
 
+class TestColumnarFormat(unittest.TestCase):
+    """Test columnar block format encoding."""
+    
+    def test_varying_length_sequences(self):
+        """Test that varying length sequences are handled correctly."""
+        header = ZnaHeader(read_group="test", seq_len_bytes=2)
+        sequences = ["A", "AC", "ACG", "ACGT", "ACGTA" * 10, "TGCATGCATGCA"]
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/varlen.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for seq in sequences:
+                        writer.write_record(seq, False, False, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                decoded = [r[0] for r in reader.records()]
+            
+            self.assertEqual(decoded, sequences)
+    
+    def test_mixed_flags(self):
+        """Test that columnar format preserves record flags correctly."""
+        header = ZnaHeader(read_group="test")
+        
+        # Various flag combinations
+        records = [
+            ("ACGT", True, True, False),   # Paired R1
+            ("TGCA", True, False, True),   # Paired R2
+            ("GGGG", False, False, False), # Single
+            ("AAAA", True, True, False),   # Paired R1
+            ("CCCC", True, False, True),   # Paired R2
+        ]
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/flags.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for seq, is_paired, is_r1, is_r2 in records:
+                        writer.write_record(seq, is_paired, is_r1, is_r2)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                decoded = list(reader.records())
+            
+            self.assertEqual(decoded, records)
+    
+    def test_multi_block_roundtrip(self):
+        """Test roundtrip across multiple blocks."""
+        header = ZnaHeader(read_group="test", compression_method=COMPRESSION_NONE)
+        
+        # Enough sequences to span multiple small blocks
+        sequences = ["ACGTACGT" * 2] * 50
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/multiblock.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header, block_size=100) as writer:
+                    for seq in sequences:
+                        writer.write_record(seq, False, False, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                decoded = [r[0] for r in reader.records()]
+            
+            self.assertEqual(decoded, sequences)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ from zna.cli import (
 from zna.core import (
     ZnaHeader, ZnaWriter, ZnaReader,
     COMPRESSION_ZSTD, COMPRESSION_NONE,
-    _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE
+    _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE, _BLOCK_HEADER_SIZE
 )
 
 
@@ -636,11 +636,11 @@ class TestInspect:
                 total_records = 0
                 
                 while True:
-                    b_header = f.read(12)  # Block header size
+                    b_header = f.read(_BLOCK_HEADER_SIZE)  # Block header size (20 bytes)
                     if not b_header:
                         break
                     
-                    c_size, u_size, n_recs = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+                    c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(_BLOCK_HEADER_FMT, b_header)
                     block_count += 1
                     total_records += n_recs
                     f.seek(c_size, 1)  # Skip payload
