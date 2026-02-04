@@ -38,8 +38,10 @@ This single command will:
 7. ✅ **Automatically trigger PyPI publishing** (via GitHub Actions)
 
 GitHub Actions will then:
-- Build wheels for Linux, macOS, Windows
-- Build for Python 3.10, 3.11, 3.12
+- Build manylinux wheels for Linux (x86_64)
+- Build universal wheels for macOS (x86_64 and arm64)
+- Build wheels for Windows (AMD64)
+- Build for Python 3.10, 3.11, 3.12, 3.13, 3.14
 - Publish everything to PyPI
 
 ## Conda/Bioconda Update (Semi-Automated)
