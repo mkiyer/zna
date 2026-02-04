@@ -356,13 +356,10 @@ def encode_command(args):
     is_stdout = (args.output is None or args.output == "-")
 
     # Compression Logic
+    # Default to compression (Zstd level 3) unless explicitly disabled
     should_compress = True 
     if args.compress_flag is not None:
         should_compress = args.compress_flag
-    elif not is_stdout:
-        # Auto-detect from filename if available
-        ext = Path(args.output).suffix.lower()
-        if ext == '.zna': should_compress = False
     
     comp_method = COMPRESSION_ZSTD if should_compress else COMPRESSION_NONE
     comp_level = args.level
@@ -663,7 +660,7 @@ def main():
 
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")
-    insp.add_argument("input", help="Input .zna/.zzna file")
+    insp.add_argument("input", help="Input .zna file")
 
     args = parser.parse_args()
     

@@ -1,9 +1,9 @@
 # Include metadata and documentation
 include README.md
 include LICENSE
-include PUBLISHING.md
 include pyproject.toml
 include CMakeLists.txt
+recursive-include docs *.md
 
 # Include all C++ source files
 recursive-include src *.cpp *.h *.hpp

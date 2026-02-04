@@ -40,18 +40,18 @@ python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_acceler
 ## Quick Start
 
 ```bash
-# Encode FASTQ to compressed ZNA
-zna encode sample.fastq.gz -o sample.zzna
+# Encode FASTQ to compressed ZNA (default: Zstd level 3)
+zna encode sample.fastq.gz -o sample.zna
 
 # Decode back to FASTA
-zna decode sample.zzna -o sample.fasta
+zna decode sample.zna -o sample.fasta
 
 # Inspect file statistics
-zna inspect sample.zzna
+zna inspect sample.zna
 
 # Pipe-friendly workflows
-cat reads.fastq | zna encode -o reads.zzna
-zna decode reads.zzna | head -n 1000
+cat reads.fastq | zna encode -o reads.zna
+zna decode reads.zna | head -n 1000
 ```
 
 ## Performance Benchmarks
@@ -70,7 +70,19 @@ zna decode reads.zzna | head -n 1000
 - Compression ratio remains consistent across workloads
 - C++ acceleration provides 9.5x speedup over pure Python
 
-See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarking.
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
+
+---
+
+## Documentation
+
+Comprehensive documentation is available in the [docs/](docs/) directory:
+
+- **[docs/RELEASING.md](docs/RELEASING.md)** - Quick release guide
+- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Performance benchmarks
+- **[docs/PUBLISHING.md](docs/PUBLISHING.md)** - PyPI publishing guide
+
+See [docs/README.md](docs/README.md) for a complete list.
 
 ---
 
@@ -80,6 +92,8 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarking.
 
 ZNA files use a binary format optimized for nucleic acid sequences:
 
+- **File Extension**: `.zna` (for both compressed and uncompressed files)
+- **Default Compression**: Zstd level 3 (use `--uncompressed` flag to disable)
 - **Magic Number**: `ZNA\x1A` (4 bytes)
 - **Version**: 1 (1 byte)
 - **2-bit Encoding**: A=00, C=01, G=10, T=11
@@ -146,8 +160,11 @@ zna encode sample.fasta -o sample.zna
 # From gzipped input
 zna encode sample.fastq.gz -o sample.zzna
 
-# With compression
-zna encode sample.fastq --zstd --level 5 -o sample.zzna
+# With high compression (default is level 3)
+zna encode sample.fastq --level 5 -o sample.zna
+
+# Uncompressed (rarely needed)
+zna encode sample.fastq --uncompressed -o sample.zna
 
 # From stdin
 cat sample.fastq | zna encode -o sample.zna
@@ -160,10 +177,10 @@ cat data.txt | zna encode --fastq -o sample.zna
 
 ```bash
 # Separate R1/R2 files
-zna encode R1.fastq.gz R2.fastq.gz -o paired.zzna
+zna encode R1.fastq.gz R2.fastq.gz -o paired.zna
 
 # Interleaved file (strict alternating R1/R2 pairs)
-zna encode interleaved.fastq --interleaved -o paired.zzna
+zna encode interleaved.fastq --interleaved -o paired.zna
 
 # Interleaved from stdin
 cat interleaved.fastq | zna encode --interleaved -o paired.zzna
@@ -180,7 +197,7 @@ The `--interleaved` mode intelligently detects both paired-end and single-end re
 
 ```bash
 # Mixed interleaved input (fastp output with merged + unmerged reads)
-zna encode fastp_output.fastq --interleaved -o mixed.zzna
+zna encode fastp_output.fastq --interleaved -o mixed.zna
 
 # Example input structure:
 #   @read1/1         →  paired with next read
@@ -203,33 +220,36 @@ zna encode fastp_output.fastq --interleaved -o mixed.zzna
 zna encode sample.fastq \
   --read-group "Sample_01" \
   --description "Experiment XYZ" \
-  -o sample.zzna
+  -o sample.zna
 
 # Strand-specific library (default: R1 antisense, R2 sense)
 zna encode R1.fastq.gz R2.fastq.gz \
   --strand-specific \
-  -o stranded.zzna
+  -o stranded.zna
 
 # Custom strand orientation (e.g., fr-secondstrand protocol)
 zna encode R1.fastq.gz R2.fastq.gz \
   --strand-specific --read1-sense --read2-antisense \
-  -o stranded.zzna
+  -o stranded.zna
 
 # Handle sequences with N nucleotides
-zna encode sample.fastq --npolicy drop -o clean.zzna       # Skip sequences with N
-zna encode sample.fastq --npolicy random -o clean.zzna     # Replace N with random base
-zna encode sample.fastq --npolicy A -o clean.zzna          # Replace N with A
+zna encode sample.fastq --npolicy drop -o clean.zna       # Skip sequences with N
+zna encode sample.fastq --npolicy random -o clean.zna     # Replace N with random base
+zna encode sample.fastq --npolicy A -o clean.zna          # Replace N with A
 
 # Control compression
 zna encode sample.fastq \
-  --zstd --level 9 \
+  --level 9 \
   --block-size 262144 \
-  -o sample.zzna
+  -o sample.zna
+
+# Uncompressed (rarely needed, for maximum I/O speed)
+zna encode sample.fastq --uncompressed -o sample.zna
 
 # Sequence length encoding (max sequence length)
 zna encode sample.fastq \
   --seq-len-bytes 1 \  # Max 255 bp
-  -o sample.zna
+  -o short_reads.zna
 
 zna encode sample.fastq \
   --seq-len-bytes 2 \  # Max 65,535 bp (default)
@@ -237,7 +257,7 @@ zna encode sample.fastq \
 
 zna encode sample.fastq \
   --seq-len-bytes 4 \  # Max 4.2 billion bp
-  -o sample.zna
+  -o long_reads.zna
 ```
 
 ### Decoding
@@ -246,62 +266,62 @@ zna encode sample.fastq \
 
 ```bash
 # To FASTA file
-zna decode sample.zzna -o output.fasta
+zna decode sample.zna -o output.fasta
 
 # To gzipped FASTA
-zna decode sample.zzna -o output.fasta.gz
+zna decode sample.zna -o output.fasta.gz
 
 # To stdout (pipe-friendly)
-zna decode sample.zzna | head -n 1000
+zna decode sample.zna | head -n 1000
 
 # From stdin
-cat sample.zzna | zna decode -o output.fasta
+cat sample.zna | zna decode -o output.fasta
 ```
 
 #### Paired-End Decoding
 
 ```bash
 # Interleaved output (default)
-zna decode paired.zzna -o interleaved.fasta
+zna decode paired.zna -o interleaved.fasta
 
 # Split to R1/R2 files (use # placeholder)
-zna decode paired.zzna -o reads#.fasta
+zna decode paired.zna -o reads#.fasta
 # Creates: reads_1.fasta and reads_2.fasta
 
 # Split with gzip
-zna decode paired.zzna -o reads#.fasta.gz
+zna decode paired.zna -o reads#.fasta.gz
 # Creates: reads_1.fasta.gz and reads_2.fasta.gz
 
 # Restore original strand for strand-specific libraries
-zna decode stranded.zzna --restore-strand -o reads.fasta
+zna decode stranded.zna --restore-strand -o reads.fasta
 ```
 
 #### Piping Examples
 
 ```bash
 # Extract first 1M reads
-zna decode large.zzna | head -n 2000000 > subset.fasta
+zna decode large.zna | head -n 2000000 > subset.fasta
 
 # Count sequences
-zna decode sample.zzna | grep -c "^>"
+zna decode sample.zna | grep -c "^>"
 
 # Convert to gzipped output via pipe
-zna decode sample.zzna --gzip > output.fasta.gz
+zna decode sample.zna --gzip > output.fasta.gz
 
 # Chain operations
-zna decode sample.zzna | seqtk seq -r - | gzip > reversed.fasta.gz
+zna decode sample.zna | seqtk seq -r - | gzip > reversed.fasta.gz
 ```
 
 ### Inspecting Files
 
 ```bash
 # Show file statistics
-zna inspect sample.zzna
+zna inspect sample.zna
 ```
 
 **Example Output:**
 ```
-File: sample.zzna
+File: sample.zna
 Total Size: 45.32 MB
 
 --- Header Metadata ---
@@ -410,8 +430,8 @@ Typical compression ratios compared to raw FASTQ:
 | FASTQ (uncompressed) | 100% | 1.0x | Baseline |
 | FASTQ.gz (gzip -6) | 25-30% | 3-4x | Standard |
 | ZNA (uncompressed) | 12-15% | 6-8x | 2-bit encoding only |
-| ZZNA (Zstd L3) | 8-10% | 10-12x | Fast compression |
-| ZZNA (Zstd L9) | 6-8% | 12-16x | High compression |
+| ZNA (Zstd L3) | 8-10% | 10-12x | Fast compression (default) |
+| ZNA (Zstd L9) | 6-8% | 12-16x | High compression |
 
 *Results vary based on sequence complexity and redundancy*
 

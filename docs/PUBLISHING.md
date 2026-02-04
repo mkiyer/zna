@@ -1,6 +1,29 @@
 # Publishing ZNA to PyPI
 
-This guide explains how to build and publish the ZNA package to PyPI.
+> **⚡ Quick Start:** For streamlined releases, see [RELEASING.md](./RELEASING.md)
+>
+> This document describes the **manual publishing process**. For most releases, use the automated workflow instead.
+
+## Automated Release (Recommended)
+
+Use the automated release script:
+
+```bash
+./scripts/release.sh 0.2.0
+```
+
+This automatically:
+- Updates version in all files
+- Creates git tag
+- Triggers GitHub Actions to build and publish to PyPI
+
+See [RELEASING.md](./RELEASING.md) for details.
+
+---
+
+## Manual Publishing (Fallback)
+
+This guide explains how to manually build and publish if the automated process is unavailable.
 
 ## Prerequisites
 

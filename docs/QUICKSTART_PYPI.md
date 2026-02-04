@@ -65,6 +65,8 @@ zna --help
 
 Both passed validation and are ready for upload!
 
+**Note on file extensions:** ZNA uses `.zna` for all files (both compressed and uncompressed). Compression is enabled by default (Zstd level 3) and can be verified with `zna inspect`.
+
 ---
 
 **Ready to publish?** Run: `twine upload dist/*`
