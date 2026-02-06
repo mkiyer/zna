@@ -12,12 +12,14 @@ import pytest
 from zna.cli import (
     parse_fasta, parse_fastq, choose_parser,
     stream_inputs, encode_command, decode_command, inspect_command,
-    get_base_name, get_read_suffix_number, parse_fastq_with_names
+    get_base_name, get_read_suffix_number, parse_fastq_with_names,
+    parse_block_size, shuffle_command,
 )
+from zna._shuffle import shuffle_zna
 from zna.core import (
     ZnaHeader, ZnaWriter, ZnaReader,
     COMPRESSION_ZSTD, COMPRESSION_NONE,
-    _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE, _BLOCK_HEADER_SIZE
+    _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE, _BLOCK_HEADER_SIZE,
 )
 
 
@@ -176,6 +178,31 @@ class TestReadNameHelpers:
         assert get_read_suffix_number("read1/1 comment") == 1
         assert get_read_suffix_number("read1/2 merged") == 2
         assert get_read_suffix_number("read1 comment") == 0
+
+
+class TestParseBlockSize:
+    def test_plain_integer(self):
+        assert parse_block_size("524288") == 524288
+
+    def test_kilobytes(self):
+        assert parse_block_size("512K") == 512 * 1024
+        assert parse_block_size("512KB") == 512 * 1024
+        assert parse_block_size("512k") == 512 * 1024
+
+    def test_megabytes(self):
+        assert parse_block_size("4M") == 4 * 1024 * 1024
+        assert parse_block_size("4MB") == 4 * 1024 * 1024
+        assert parse_block_size("4m") == 4 * 1024 * 1024
+
+    def test_whitespace(self):
+        assert parse_block_size("  4M  ") == 4 * 1024 * 1024
+
+    def test_invalid_raises(self):
+        import argparse
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_block_size("abc")
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_block_size("4X")
 
 
 # --- Encode Tests ---
@@ -636,11 +663,13 @@ class TestInspect:
                 total_records = 0
                 
                 while True:
-                    b_header = f.read(_BLOCK_HEADER_SIZE)  # Block header size (20 bytes)
+                    b_header = f.read(_BLOCK_HEADER_SIZE)  # Block header (20 bytes)
                     if not b_header:
                         break
                     
-                    c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+                    c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(
+                        _BLOCK_HEADER_FMT, b_header
+                    )
                     block_count += 1
                     total_records += n_recs
                     f.seek(c_size, 1)  # Skip payload
@@ -1339,3 +1368,322 @@ class TestMixedInterleaved:
                 
                 # Second merged/single
                 assert records[3][1] == False  # not paired
+
+
+# --- SHUFFLE TESTS ---
+
+class TestShuffle:
+    """Tests for the ``zna shuffle`` command."""
+
+    @staticmethod
+    def _make_zna(path, records, compressed=True, strand_specific=False,
+                  read1_antisense=False):
+        """Helper: write a list of (seq, is_paired, is_read1, is_read2) to a ZNA file."""
+        header = ZnaHeader(
+            read_group="test",
+            seq_len_bytes=2,
+            compression_method=COMPRESSION_ZSTD if compressed else COMPRESSION_NONE,
+            compression_level=3,
+            strand_specific=strand_specific,
+            read1_antisense=read1_antisense,
+        )
+        with open(path, "wb") as fh:
+            with ZnaWriter(fh, header) as writer:
+                for seq, is_paired, is_read1, is_read2 in records:
+                    writer.write_record(seq, is_paired, is_read1, is_read2)
+
+    @staticmethod
+    def _read_zna(path):
+        """Helper: read all records from a ZNA file."""
+        with open(path, "rb") as fh:
+            reader = ZnaReader(fh)
+            return list(reader.records())
+
+    @staticmethod
+    def _make_args(**kwargs):
+        """Build a namespace mimicking argparse output for shuffle_command."""
+        defaults = dict(
+            input=None,
+            output=None,
+            seed=42,
+            buffer_size="1M",
+            block_size="4M",
+            tmp_dir=None,
+            quiet=True,
+        )
+        defaults.update(kwargs)
+
+        class Args:
+            pass
+
+        a = Args()
+        for k, v in defaults.items():
+            setattr(a, k, v)
+        return a
+
+    def test_single_end_shuffle(self, tmp_path):
+        """Single-end records are shuffled; all records are preserved."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        # Generate 100 distinct DNA sequences
+        rng = __import__("random").Random(0)
+        bases = "ACGT"
+        seqs = ["".join(rng.choices(bases, k=40)) for _ in range(100)]
+        records = [(s, False, False, False) for s in seqs]
+        self._make_zna(in_path, records)
+
+        args = self._make_args(input=in_path, output=out_path)
+        shuffle_command(args)
+
+        out_records = self._read_zna(out_path)
+        assert len(out_records) == len(records)
+
+        # All sequences should be present (set comparison)
+        in_seqs = sorted(r[0] for r in records)
+        out_seqs = sorted(r[0] for r in out_records)
+        assert in_seqs == out_seqs
+
+        # Order should differ (with 100 records and seed=42, vanishingly unlikely to match)
+        in_order = [r[0] for r in records]
+        out_order = [r[0] for r in out_records]
+        assert in_order != out_order
+
+    def test_paired_end_shuffle_preserves_pairs(self, tmp_path):
+        """Paired-end R1+R2 stay adjacent after shuffling."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        # 50 pairs: R1 and R2 share a common tag to verify pairing
+        rng = __import__("random").Random(1)
+        bases = "ACGT"
+        records = []
+        tags = ["".join(rng.choices(bases, k=20)) for _ in range(50)]
+        for tag in tags:
+            records.append(("AAAA" + tag + "AAAA", True, True, False))   # R1
+            records.append(("TTTT" + tag + "TTTT", True, False, True))   # R2
+        self._make_zna(in_path, records)
+
+        args = self._make_args(input=in_path, output=out_path)
+        shuffle_command(args)
+
+        out_records = self._read_zna(out_path)
+        assert len(out_records) == 100  # 50 pairs × 2 records
+
+        # Verify every R1 is immediately followed by its matching R2
+        for i in range(0, len(out_records), 2):
+            r1_seq, r1_paired, r1_is_r1, r1_is_r2 = out_records[i]
+            r2_seq, r2_paired, r2_is_r1, r2_is_r2 = out_records[i + 1]
+
+            assert r1_paired and r1_is_r1 and not r1_is_r2, f"Record {i} should be R1"
+            assert r2_paired and not r2_is_r1 and r2_is_r2, f"Record {i+1} should be R2"
+
+            # The tag (positions 4:24) must match between R1 and R2
+            r1_tag = r1_seq[4:24]
+            r2_tag = r2_seq[4:24]
+            assert r1_tag == r2_tag, f"Pair broken at {i}: R1 tag={r1_tag}, R2 tag={r2_tag}"
+
+    def test_mixed_paired_and_single(self, tmp_path):
+        """Mix of paired and single-end records: all preserved, pairs intact."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        rng = __import__("random").Random(2)
+        bases = "ACGT"
+        records = []
+        pair_tags = []
+        # 20 pairs
+        for _ in range(20):
+            tag = "".join(rng.choices(bases, k=20))
+            pair_tags.append(tag)
+            records.append(("AA" + tag + "AA", True, True, False))
+            records.append(("TT" + tag + "TT", True, False, True))
+        # 30 singles
+        for _ in range(30):
+            records.append(("CC" + "".join(rng.choices(bases, k=20)) + "CC", False, False, False))
+
+        self._make_zna(in_path, records)
+
+        args = self._make_args(input=in_path, output=out_path)
+        shuffle_command(args)
+
+        out_records = self._read_zna(out_path)
+        assert len(out_records) == 70  # 20*2 + 30
+
+        # Check that all sequences are present
+        in_seqs = sorted(r[0] for r in records)
+        out_seqs = sorted(r[0] for r in out_records)
+        assert in_seqs == out_seqs
+
+        # Check every paired R1 is followed by its R2 with matching tag
+        i = 0
+        while i < len(out_records):
+            seq, is_paired, is_r1, is_r2 = out_records[i]
+            if is_paired and is_r1:
+                r2 = out_records[i + 1]
+                assert r2[1] and r2[3], f"Expected R2 after R1 at position {i}"
+                # Tags at positions 2:22 must match
+                assert seq[2:22] == r2[0][2:22], "Pair tag mismatch"
+                i += 2
+            else:
+                assert not is_paired, f"Unexpected isolated paired record at {i}"
+                i += 1
+
+    def test_deterministic_with_seed(self, tmp_path):
+        """Same seed produces identical output."""
+        in_path = str(tmp_path / "in.zna")
+        out1 = str(tmp_path / "out1.zna")
+        out2 = str(tmp_path / "out2.zna")
+
+        rng = __import__("random").Random(3)
+        bases = "ACGT"
+        records = [("".join(rng.choices(bases, k=30)), False, False, False) for _ in range(200)]
+        self._make_zna(in_path, records)
+
+        args1 = self._make_args(input=in_path, output=out1, seed=12345)
+        shuffle_command(args1)
+
+        args2 = self._make_args(input=in_path, output=out2, seed=12345)
+        shuffle_command(args2)
+
+        recs1 = self._read_zna(out1)
+        recs2 = self._read_zna(out2)
+        assert [r[0] for r in recs1] == [r[0] for r in recs2]
+
+    def test_different_seed_different_order(self, tmp_path):
+        """Different seeds produce different orderings."""
+        in_path = str(tmp_path / "in.zna")
+        out1 = str(tmp_path / "out1.zna")
+        out2 = str(tmp_path / "out2.zna")
+
+        rng = __import__("random").Random(4)
+        bases = "ACGT"
+        records = [("".join(rng.choices(bases, k=30)), False, False, False) for _ in range(200)]
+        self._make_zna(in_path, records)
+
+        args1 = self._make_args(input=in_path, output=out1, seed=1)
+        shuffle_command(args1)
+
+        args2 = self._make_args(input=in_path, output=out2, seed=2)
+        shuffle_command(args2)
+
+        order1 = [r[0] for r in self._read_zna(out1)]
+        order2 = [r[0] for r in self._read_zna(out2)]
+        assert order1 != order2
+
+    def test_header_preserved(self, tmp_path):
+        """Shuffle preserves the ZNA header metadata."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        header = ZnaHeader(
+            read_group="my_sample",
+            description="test description",
+            seq_len_bytes=2,
+            strand_specific=True,
+            read1_antisense=True,
+            compression_method=COMPRESSION_ZSTD,
+            compression_level=3,
+        )
+        records = [("ACGTACGT", False, False, False)] * 10
+        with open(in_path, "wb") as fh:
+            with ZnaWriter(fh, header) as w:
+                for r in records:
+                    w.write_record(*r)
+
+        args = self._make_args(input=in_path, output=out_path)
+        shuffle_command(args)
+
+        with open(out_path, "rb") as fh:
+            reader = ZnaReader(fh)
+            h = reader.header
+            assert h.read_group == "my_sample"
+            assert h.description == "test description"
+            assert h.strand_specific is True
+            assert h.read1_antisense is True
+            assert h.compression_method == COMPRESSION_ZSTD
+
+    def test_multi_bucket_with_small_buffer(self, tmp_path):
+        """A small buffer forces multiple buckets; result is still correct."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        rng = __import__("random").Random(5)
+        bases = "ACGT"
+        # 500 distinct records
+        records = [("".join(rng.choices(bases, k=40)), False, False, False) for _ in range(500)]
+        self._make_zna(in_path, records)
+
+        args = self._make_args(input=in_path, output=out_path, buffer_size="1K")
+        shuffle_command(args)
+
+        out_records = self._read_zna(out_path)
+        assert len(out_records) == 500
+        assert sorted(r[0] for r in records) == sorted(r[0] for r in out_records)
+
+    def test_parse_block_size_gigabytes(self):
+        """parse_block_size handles G/GB suffix."""
+        assert parse_block_size("1G") == 1024 * 1024 * 1024
+        assert parse_block_size("2GB") == 2 * 1024 * 1024 * 1024
+
+    def test_shuffle_zna_directly(self, tmp_path):
+        """shuffle_zna can be called as a library function."""
+        in_path = str(tmp_path / "in.zna")
+        out_path = str(tmp_path / "out.zna")
+
+        rng = __import__("random").Random(6)
+        records = [("" .join(rng.choices("ACGT", k=30)), False, False, False) for _ in range(80)]
+        self._make_zna(in_path, records)
+
+        written, n_records = shuffle_zna(in_path, out_path, seed=99, quiet=True)
+        assert written == 80
+        assert n_records == 80
+
+        out_records = self._read_zna(out_path)
+        assert sorted(r[0] for r in records) == sorted(r[0] for r in out_records)
+
+    def test_encode_with_shuffle(self, tmp_path):
+        """encode --shuffle produces a shuffled ZNA file."""
+        fq_path = str(tmp_path / "input.fastq")
+        out_path = str(tmp_path / "out.zna")
+
+        # Write 100 distinct FASTQ reads
+        rng = __import__("random").Random(7)
+        seqs = ["" .join(rng.choices("ACGT", k=40)) for _ in range(100)]
+        with open(fq_path, "w") as f:
+            for i, s in enumerate(seqs):
+                f.write(f"@read{i}\n{s}\n+\n{'I' * len(s)}\n")
+
+        # Encode with --shuffle
+        class Args:
+            pass
+        a = Args()
+        a.files = [fq_path]
+        a.output = out_path
+        a.interleaved = False
+        a.fasta = False
+        a.fastq = True
+        a.quiet = True
+        a.read_group = "test"
+        a.description = ""
+        a.seq_len_bytes = 2
+        a.strand_specific = False
+        a.read1_sense = False
+        a.read2_antisense = False
+        a.compress_flag = None
+        a.level = 3
+        a.block_size = "4M"
+        a.npolicy = "drop"
+        a.shuffle = True
+        a.seed = 42
+
+        encode_command(a)
+
+        out_records = self._read_zna(out_path)
+        assert len(out_records) == 100
+
+        # All sequences present
+        assert sorted(seqs) == sorted(r[0] for r in out_records)
+
+        # Order should differ from input
+        assert seqs != [r[0] for r in out_records]

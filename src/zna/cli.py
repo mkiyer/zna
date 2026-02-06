@@ -1,6 +1,8 @@
 import sys
 import argparse
 import gzip
+import os
+import tempfile
 import time
 from pathlib import Path
 from contextlib import ExitStack
@@ -11,9 +13,39 @@ import struct
 from .core import (
     ZnaHeader, ZnaWriter, ZnaReader, 
     COMPRESSION_ZSTD, COMPRESSION_NONE, 
-    DEFAULT_ZSTD_LEVEL, _BLOCK_HEADER_SIZE, _BLOCK_HEADER_FMT, _FILE_HEADER_SIZE,
-    ZnaHeaderFlags, reverse_complement
+    DEFAULT_ZSTD_LEVEL, DEFAULT_BLOCK_SIZE,
+    _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
+    _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
+    ZnaHeaderFlags, reverse_complement,
 )
+from ._shuffle import shuffle_zna
+
+
+def parse_block_size(value) -> int:
+    """Parse a human-readable block size string (e.g. '512K', '4M', '8M').
+    
+    Accepts plain integers (bytes) or suffixed values:
+        K/KB = kilobytes, M/MB = megabytes
+    """
+    if isinstance(value, int):
+        return value
+    value = str(value).strip().upper()
+    multipliers = {'K': 1024, 'KB': 1024, 'M': 1024 * 1024, 'MB': 1024 * 1024,
+                   'G': 1024 * 1024 * 1024, 'GB': 1024 * 1024 * 1024}
+    for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
+        if value.endswith(suffix):
+            try:
+                return int(value[:-len(suffix)]) * mult
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid block size: '{value}'. Use integers with optional K/M suffix."
+                )
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid block size: '{value}'. Use integers with optional K/M suffix (e.g. 512K, 4M)."
+        )
 
 # --- I/O HELPERS ---
 
@@ -459,9 +491,10 @@ def encode_command(args):
     quiet = hasattr(args, 'quiet') and args.quiet
     # Use ExitStack to safely close output file (or leave stdout open)
     npolicy = getattr(args, 'npolicy', None)
+    block_size = parse_block_size(args.block_size)
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
-        writer = stack.enter_context(ZnaWriter(f_out, header, block_size=args.block_size, npolicy=npolicy))
+        writer = stack.enter_context(ZnaWriter(f_out, header, block_size=block_size, npolicy=npolicy))
         
         for seq, is_paired, is_r1, is_r2 in stream_inputs(args):
             # Skip sequence if it contains N and policy is 'drop'
@@ -472,6 +505,30 @@ def encode_command(args):
             
             if count % 1_000_000 == 0 and not is_stdout and not quiet:
                 print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+
+    # ── Optional shuffle pass ─────────────────────────────────────────
+    if getattr(args, 'shuffle', False) and not is_stdout:
+        if not quiet:
+            print(f"\n[ZNA] Shuffling ...", file=sys.stderr)
+        # Shuffle in-place via a temp file
+        tmp_fd, tmp_shuffle = tempfile.mkstemp(
+            suffix=".zna", dir=os.path.dirname(args.output) or "."
+        )
+        os.close(tmp_fd)
+        try:
+            shuffle_zna(
+                args.output,
+                tmp_shuffle,
+                seed=getattr(args, 'seed', 42),
+                buffer_bytes=1 << 30,
+                block_size=block_size,
+                quiet=True,
+            )
+            os.replace(tmp_shuffle, args.output)
+        except Exception:
+            if os.path.exists(tmp_shuffle):
+                os.unlink(tmp_shuffle)
+            raise
 
     duration = time.time() - start_time
     if not is_stdout and not quiet:
@@ -609,15 +666,16 @@ def inspect_command(args):
             if not b_header: break
             if len(b_header) < _BLOCK_HEADER_SIZE: break
             
-            # Columnar block header: comp_size, uncomp_size, n_recs, flags_size, lengths_size
-            c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+            c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(
+                _BLOCK_HEADER_FMT, b_header
+            )
             
             block_count += 1
             total_records += n_recs
             compressed_payload += c_size
             uncompressed_payload += u_size
             
-            f.seek(c_size, 1) # Skip payload
+            f.seek(c_size, 1)
 
         print("\n--- Content Statistics ---")
         print(f"Total Blocks:       {block_count}")
@@ -633,10 +691,48 @@ def inspect_command(args):
              print(f"Compression Ratio:  1.00x")
 
 
+def get_zna_version():
+    try:
+        from . import __version__
+        return f"zna {__version__}"
+    except ImportError:
+        return "zna (unknown version)"
+
+
+# --- COMMAND: SHUFFLE ---
+
+def shuffle_command(args):
+    """CLI wrapper for the bucket-shuffle algorithm."""
+    start_time = time.time()
+    buffer_bytes = parse_block_size(args.buffer_size)
+    block_size = parse_block_size(args.block_size)
+
+    try:
+        written, n_records = shuffle_zna(
+            args.input,
+            args.output,
+            seed=args.seed,
+            buffer_bytes=buffer_bytes,
+            block_size=block_size,
+            tmp_dir=args.tmp_dir,
+            quiet=args.quiet,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
+
+    duration = time.time() - start_time
+    if not args.quiet:
+        print(
+            f"\n[ZNA] Done. Shuffled {written:,} units ({n_records:,} records) "
+            f"in {duration:.2f}s.",
+            file=sys.stderr,
+        )
+
 # --- MAIN ---
 
 def main():
     parser = argparse.ArgumentParser(description="zna: ZNA Processing Toolkit")
+    parser.add_argument('--version', action='version', version=get_zna_version(), help="Show zna version and exit")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- ENCODE ---
@@ -645,6 +741,8 @@ def main():
     
     input_group = enc.add_argument_group("Input Options")
     input_group.add_argument("--interleaved", action="store_true", help="Treat input as interleaved paired-end")
+    input_group.add_argument("--shuffle", action="store_true", help="Shuffle records after encoding")
+    input_group.add_argument("--seed", type=int, default=42, help="Random seed for --shuffle (default: 42)")
     input_group.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
     
     format_group = input_group.add_mutually_exclusive_group()
@@ -656,27 +754,32 @@ def main():
     meta_group.add_argument("--description", default="", help="Description string")
     meta_group.add_argument("--strand-specific", action="store_true", 
                            help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
-    meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"],
+    meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"], default="drop",
                            help="Policy for handling 'N' nucleotides: drop (skip sequences), random (replace with random base), or A/C/G/T (replace with specific base)")
     
     # R1 strand orientation (mutually exclusive)
+    # Default: R1 is antisense (dUTP protocol)
     r1_strand = meta_group.add_mutually_exclusive_group()
     r1_strand.add_argument("--read1-sense", dest="read1_sense", action="store_true",
                           help="Read 1 represents sense strand")
     r1_strand.add_argument("--read1-antisense", dest="read1_sense", action="store_false",
                           help="Read 1 represents antisense strand (default for --strand-specific)")
+    enc.set_defaults(read1_sense=False)  # Default: antisense (dUTP)
     
     # R2 strand orientation (mutually exclusive)
+    # Default: R2 is sense (dUTP protocol)
     r2_strand = meta_group.add_mutually_exclusive_group()
     r2_strand.add_argument("--read2-sense", dest="read2_antisense", action="store_false",
                           help="Read 2 represents sense strand (default for --strand-specific)")
     r2_strand.add_argument("--read2-antisense", dest="read2_antisense", action="store_true",
                           help="Read 2 represents antisense strand")
+    enc.set_defaults(read2_antisense=False)  # Default: sense (dUTP)
     
     fmt_group = enc.add_argument_group("Format Options")
     fmt_group.add_argument("-o", "--output", help="Output file. Defaults to stdout (-).")
     fmt_group.add_argument("--seq-len-bytes", type=int, choices=[1, 2, 4], default=2, help="Bytes for seq len")
-    fmt_group.add_argument("--block-size", type=int, default=131072, help="Block size")
+    fmt_group.add_argument("--block-size", type=str, default="4M",
+                           help="Block size (e.g. 512K, 4M, 8M). Larger = better compression. Default: 4M")
     
     comp_group = fmt_group.add_mutually_exclusive_group()
     comp_group.add_argument("--zstd", dest="compress_flag", action="store_true", default=None, help="Force ZSTD")
@@ -698,14 +801,30 @@ def main():
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")
     insp.add_argument("input", help="Input .zna file")
 
+    # --- SHUFFLE ---
+    shuf = subparsers.add_parser("shuffle", help="Shuffle records in a ZNA file")
+    shuf.add_argument("input", help="Input .zna file")
+    shuf.add_argument("-o", "--output", required=True, help="Output .zna file")
+    shuf.add_argument("-s", "--seed", type=int, default=42,
+                      help="Random seed for reproducibility (default: 42)")
+    shuf.add_argument("-b", "--buffer-size", type=str, default="1G",
+                      help="Max memory per bucket (default: 1G). Accepts K/M/G suffixes.")
+    shuf.add_argument("--block-size", type=str, default="4M",
+                      help="Block size for output ZNA (default: 4M).")
+    shuf.add_argument("--tmp-dir", type=str, default=None,
+                      help="Directory for temporary bucket files (default: system temp)")
+    shuf.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
+
     args = parser.parse_args()
-    
     if args.command == "encode":
         encode_command(args)
     elif args.command == "decode":
         decode_command(args)
     elif args.command == "inspect":
         inspect_command(args)
+    elif args.command == "shuffle":
+        shuffle_command(args)
+
 
 if __name__ == "__main__":
     main()

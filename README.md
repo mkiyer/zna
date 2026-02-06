@@ -16,6 +16,7 @@
 - **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
 - **Flexible**: Single-end, paired-end, and interleaved reads
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
+- **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
 - **Metadata Rich**: Read groups, descriptions, and custom flags
 - **Unix-Friendly**: Pipe-compatible CLI for seamless workflow integration
 - **Streaming**: Memory-efficient block-based processing
@@ -42,6 +43,12 @@ python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_acceler
 ```bash
 # Encode FASTQ to compressed ZNA (default: Zstd level 3)
 zna encode sample.fastq.gz -o sample.zna
+
+# Encode with shuffle (for ML training data)
+zna encode sample.fastq.gz --shuffle -o shuffled.zna
+
+# Shuffle an existing ZNA file
+zna shuffle input.zna -o shuffled.zna
 
 # Decode back to FASTA
 zna decode sample.zna -o sample.fasta
@@ -237,6 +244,10 @@ zna encode sample.fastq --npolicy drop -o clean.zna       # Skip sequences with 
 zna encode sample.fastq --npolicy random -o clean.zna     # Replace N with random base
 zna encode sample.fastq --npolicy A -o clean.zna          # Replace N with A
 
+# Shuffle during encoding (for ML training data preparation)
+zna encode sample.fastq --shuffle -o shuffled.zna
+zna encode R1.fastq.gz R2.fastq.gz --shuffle --seed 12345 -o shuffled.zna
+
 # Control compression
 zna encode sample.fastq \
   --level 9 \
@@ -359,6 +370,8 @@ Positional Arguments:
 
 Options:
   --interleaved          Treat input as interleaved (auto-detects mixed paired/single reads)
+  --shuffle              Shuffle records after encoding (for ML training data)
+  --seed N               Random seed for --shuffle (default: 42)
   --fasta                Force FASTA format (overrides extension detection)
   --fastq                Force FASTQ format (overrides extension detection)
 
@@ -413,9 +426,53 @@ Display ZNA file statistics.
 ```
 zna inspect FILE
 
-```
   input FILE             Input ZNA file to inspect
 ```
+
+### `zna shuffle`
+
+Randomly shuffle records in a ZNA file with bounded memory usage. Preserves paired-end read associations.
+
+**Usage:**
+
+```
+zna shuffle INPUT -o OUTPUT [OPTIONS]
+
+Positional Arguments:
+  INPUT                  Input ZNA file to shuffle
+
+Options:
+  -o, --output FILE      Output ZNA file (required)
+  -s, --seed N           Random seed for reproducibility (default: 42)
+  -b, --buffer-size SIZE Maximum memory per bucket (default: 1G)
+                         Accepts K/M/G suffixes (e.g., 512M, 2G)
+  --block-size SIZE      Block size for output ZNA (default: 4M)
+  --tmp-dir DIR          Directory for temporary files (default: system temp)
+  -q, --quiet            Suppress progress messages
+```
+
+**Algorithm**: Uses bucket shuffle with bounded memory:
+1. Randomly distributes records into K temporary bucket files on disk
+2. Shuffles each bucket in memory using Fisher-Yates algorithm
+3. Concatenates shuffled buckets to produce uniform random permutation
+
+**Examples:**
+
+```bash
+# Shuffle with default settings (1GB memory, seed 42)
+zna shuffle input.zna -o shuffled.zna
+
+# Shuffle with custom seed for reproducibility
+zna shuffle input.zna -o shuffled.zna --seed 12345
+
+# Shuffle with limited memory (512MB buffer)
+zna shuffle input.zna -o shuffled.zna --buffer-size 512M
+
+# Shuffle paired-end data (pairs stay together)
+zna shuffle paired.zna -o shuffled_paired.zna
+```
+
+**Note**: Paired-end reads (R1+R2) are kept together as a single shuffle unit.
 
 ---
 
