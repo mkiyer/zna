@@ -41,7 +41,8 @@ test:
     - zna.cli
   commands:
     - zna --help
-    - python -c "from zna.core import is_accelerated; print('Accelerated:', is_accelerated())"
+    - python -c "import zna; print('ZNA version:', zna.__version__)"
+    - python -c "from zna import is_accelerated; print('C++ acceleration:', is_accelerated())"
   requires:
     - pytest
 
