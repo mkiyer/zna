@@ -1,3 +1,6 @@
+__version__ = "0.1.6"
+
+
 from .core import (
     ZnaHeader, ZnaWriter, ZnaReader,
     read_zna, write_zna,
@@ -5,8 +8,6 @@ from .core import (
     reverse_complement,
 )
 from .codec import get_backend, get_backend_name, available_backends
-
-__version__ = "0.1.6"
 
 
 def is_accelerated() -> bool:
