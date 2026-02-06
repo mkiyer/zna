@@ -24,6 +24,8 @@ jobs:
         CIBW_ARCHS_MACOS: "x86_64 arm64"
         CIBW_ARCHS_LINUX: "x86_64"
         CIBW_ARCHS_WINDOWS: "AMD64"
+        # Set minimum macOS version to 10.13 for nanobind compatibility
+        MACOSX_DEPLOYMENT_TARGET: "10.13"
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
