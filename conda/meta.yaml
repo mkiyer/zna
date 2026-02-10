@@ -30,7 +30,6 @@ requirements:
     - scikit-build-core >=0.10
     - nanobind >=2.0
     - zstandard
-    - llvm-tools  # [osx]
   run:
     - python
     - zstandard
