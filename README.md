@@ -83,13 +83,8 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 
 ## Documentation
 
-Comprehensive documentation is available in the [docs/](docs/) directory:
-
-- **[docs/RELEASING.md](docs/RELEASING.md)** - Quick release guide
-- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Performance benchmarks
-- **[docs/PUBLISHING.md](docs/PUBLISHING.md)** - PyPI publishing guide
-
-See [docs/README.md](docs/README.md) for a complete list.
+- **[docs/RELEASING.md](docs/RELEASING.md)** - Publishing to PyPI and Bioconda
+- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Benchmarks and tuning
 
 ---
 
