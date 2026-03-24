@@ -71,12 +71,14 @@ class ZnaHeaderFlags(IntFlag):
     STRAND_SPECIFIC = 1
     READ1_ANTISENSE = 2
     READ2_ANTISENSE = 4
+    STRAND_NORMALIZED = 8
 
 
 class ZnaRecordFlags(IntFlag):
     IS_READ1 = 1
     IS_READ2 = 2
     IS_PAIRED = 4
+    IS_RC = 8
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,7 @@ class ZnaHeader:
     strand_specific: bool = False
     read1_antisense: bool = False
     read2_antisense: bool = False
+    strand_normalized: bool = False
     compression_method: int = COMPRESSION_NONE
     compression_level: int = DEFAULT_ZSTD_LEVEL
 
@@ -142,9 +145,11 @@ class ZnaWriter:
         "_compressor",
         "_do_strand_norm_r1",
         "_do_strand_norm_r2",
+        "_do_random_norm",
         "_batch_seqs",
         "_batch_flags",
         "_size_estimate",
+        "_pending_r1",
     )
 
     def __init__(
@@ -161,12 +166,18 @@ class ZnaWriter:
         self._block_size = block_size
         self._npolicy = npolicy or ""
 
-        self._do_strand_norm_r1 = header.strand_specific and header.read1_antisense
-        self._do_strand_norm_r2 = header.strand_specific and header.read2_antisense
+        self._do_strand_norm_r1 = (
+            header.strand_normalized and header.strand_specific and header.read1_antisense
+        )
+        self._do_strand_norm_r2 = (
+            header.strand_normalized and header.strand_specific and header.read2_antisense
+        )
+        self._do_random_norm = header.strand_normalized and not header.strand_specific
 
         self._batch_seqs: list[str] = []
         self._batch_flags = bytearray()
         self._size_estimate = 0
+        self._pending_r1 = False  # True when last buffered record is a paired R1
 
         if header.compression_method == COMPRESSION_ZSTD:
             self._compressor = zstandard.ZstdCompressor(level=header.compression_level)
@@ -204,8 +215,18 @@ class ZnaWriter:
         self._batch_flags.append(flag)
 
         self._size_estimate += (seq_len // 4) + 1 + self._seq_len_bytes
+        # Defer flush when the last record is a paired R1 to keep pairs together
         if self._size_estimate >= self._block_size:
-            self._flush_block()
+            if is_paired and is_read1 and self._do_random_norm:
+                self._pending_r1 = True
+            else:
+                self._pending_r1 = False
+                self._flush_block()
+        elif self._pending_r1 and not (is_paired and is_read1):
+            # R2 (or SE) arrived after a deferred R1 — safe to flush now
+            self._pending_r1 = False
+            if self._size_estimate >= self._block_size:
+                self._flush_block()
 
     def write_records(
         self, records: Iterable[Tuple[str, bool, bool, bool]]
@@ -239,9 +260,12 @@ class ZnaWriter:
             )
             size_est += (seq_len >> 2) + 1 + seq_len_bytes
             if size_est >= block_size:
-                self._size_estimate = size_est
-                flush()
-                size_est = self._size_estimate  # reset after flush
+                if is_paired and is_read1 and self._do_random_norm:
+                    pass  # defer flush — keep pair together
+                else:
+                    self._size_estimate = size_est
+                    flush()
+                    size_est = self._size_estimate  # reset after flush
 
         self._size_estimate = size_est
 
@@ -258,6 +282,8 @@ class ZnaWriter:
             flags |= ZnaHeaderFlags.READ1_ANTISENSE
         if self._header.read2_antisense:
             flags |= ZnaHeaderFlags.READ2_ANTISENSE
+        if self._header.strand_normalized:
+            flags |= ZnaHeaderFlags.STRAND_NORMALIZED
 
         self._fh.write(
             struct.pack(
@@ -290,6 +316,7 @@ class ZnaWriter:
             self._npolicy,
             self._do_strand_norm_r1,
             self._do_strand_norm_r2,
+            self._do_random_norm,
         )
 
         # 2. Compress
@@ -350,26 +377,16 @@ class ZnaReader:
         Parameters
         ----------
         restore_strand
-            If ``True`` and the library is strand-specific, reverse-complement
-            antisense reads back to their original orientation.
+            If ``True`` and the file was strand-normalized, reverse-complement
+            records that were RC'd during encoding (using the per-record
+            ``IS_RC`` flag) to restore original orientation.
         """
         fh_read = self._fh.read
         read_exact = self._read_exact
         len_bytes = self._header.seq_len_bytes
         compression_method = self._header.compression_method
 
-        do_restore_r1 = (
-            restore_strand
-            and self._header.strand_specific
-            and self._header.read1_antisense
-        )
-        do_restore_r2 = (
-            restore_strand
-            and self._header.strand_specific
-            and self._header.read2_antisense
-        )
-
-        needs_restore = do_restore_r1 or do_restore_r2
+        needs_restore = restore_strand and self._header.strand_normalized
         rc = _codec.reverse_complement
         decode = _codec.decode_block
 
@@ -410,14 +427,13 @@ class ZnaReader:
             )
 
             if needs_restore:
-                for seq, is_paired, is_read1, is_read2 in block_records:
-                    if do_restore_r1 and is_read1:
-                        seq = rc(seq)
-                    elif do_restore_r2 and is_read2:
+                for seq, is_paired, is_read1, is_read2, is_rc in block_records:
+                    if is_rc:
                         seq = rc(seq)
                     yield seq, is_paired, is_read1, is_read2
             else:
-                yield from block_records
+                for seq, is_paired, is_read1, is_read2, _is_rc in block_records:
+                    yield seq, is_paired, is_read1, is_read2
 
     # -- private -------------------------------------------------------------
 
@@ -455,6 +471,7 @@ class ZnaReader:
             strand_specific=bool(flags & ZnaHeaderFlags.STRAND_SPECIFIC),
             read1_antisense=bool(flags & ZnaHeaderFlags.READ1_ANTISENSE),
             read2_antisense=bool(flags & ZnaHeaderFlags.READ2_ANTISENSE),
+            strand_normalized=bool(flags & ZnaHeaderFlags.STRAND_NORMALIZED),
             compression_method=comp_method,
             compression_level=comp_level,
         )

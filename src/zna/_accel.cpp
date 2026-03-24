@@ -162,8 +162,8 @@ std::string decode_sequence(const uint8_t* data, size_t data_len, size_t seq_len
 }
 
 
-// Record tuple type: (sequence, is_paired, is_read1, is_read2)
-using Record = std::tuple<std::string, bool, bool, bool>;
+// Record tuple type: (sequence, is_paired, is_read1, is_read2, is_rc)
+using Record = std::tuple<std::string, bool, bool, bool, bool>;
 
 /**
  * Decode all records from a block at once.
@@ -224,7 +224,7 @@ std::vector<Record> decode_block_records(
         std::string seq = decode_sequence(data + offset, enc_len, seq_len);
         offset += enc_len;
         
-        results.emplace_back(std::move(seq), is_paired, is_read1, is_read2);
+        results.emplace_back(std::move(seq), is_paired, is_read1, is_read2, false);
     }
     
     return results;
@@ -279,16 +279,27 @@ nb::tuple encode_block(
     int len_bytes_fmt,
     const std::string& npolicy,
     bool do_rc_r1,
-    bool do_rc_r2
+    bool do_rc_r2,
+    bool do_random_rc
 ) {
     const size_t count = seqs.size();
     if (count != flags.size()) {
         throw std::invalid_argument("seqs and flags must have the same length");
     }
     
+    // IS_RC flag bit
+    constexpr uint8_t IS_RC_BIT = 0x08;
+    constexpr uint8_t IS_READ1 = 0x01;
+    constexpr uint8_t IS_READ2 = 0x02;
+    constexpr uint8_t IS_PAIRED = 0x04;
+    
     // 1. Prepare output buffers
     std::string flags_out;
     flags_out.resize(count);
+    // Copy flags so we can mutate them
+    for (size_t i = 0; i < count; ++i) {
+        flags_out[i] = static_cast<char>(flags[i]);
+    }
     
     std::string lengths_out;
     lengths_out.resize(count * len_bytes_fmt);
@@ -320,13 +331,52 @@ nb::tuple encode_block(
     // 2. Main loop (entirely in C++)
     for (size_t i = 0; i < count; ++i) {
         // --- A. Flags ---
-        uint8_t flag = flags[i];
-        flags_out[i] = static_cast<char>(flag);
+        uint8_t flag = static_cast<uint8_t>(flags_out[i]);
         
         // Determine if this read needs reverse complement for strand normalization
-        bool is_read1 = (flag & 1) != 0;
-        bool is_read2 = (flag & 2) != 0;
-        bool needs_rc = (do_rc_r1 && is_read1) || (do_rc_r2 && is_read2);
+        bool is_read1 = (flag & IS_READ1) != 0;
+        bool is_read2 = (flag & IS_READ2) != 0;
+        bool is_paired = (flag & IS_PAIRED) != 0;
+        bool needs_rc = false;
+        
+        if (do_random_rc) {
+            // Unstranded random normalization
+            if (is_paired && is_read1 && (i + 1 < count) && (flags[i + 1] & IS_PAIRED)) {
+                // Paired R1+R2: flip a coin to decide which read to RC
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 17;
+                rng_state ^= rng_state << 5;
+                bool coin = rng_state & 1;
+                if (coin) {
+                    // RC R1
+                    needs_rc = true;
+                    flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
+                } else {
+                    // RC R2
+                    flags_out[i + 1] = static_cast<char>(flags[i + 1] | IS_RC_BIT);
+                }
+            } else if (!(is_paired && is_read2)) {
+                // Unpaired/SE or lone R1 (no following R2): random RC
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 17;
+                rng_state ^= rng_state << 5;
+                if (rng_state & 1) {
+                    needs_rc = true;
+                    flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
+                }
+            }
+            // Check if this is an R2 that was already marked for RC by its R1 iteration
+            if (!needs_rc && (static_cast<uint8_t>(flags_out[i]) & IS_RC_BIT)) {
+                needs_rc = true;
+                flag = static_cast<uint8_t>(flags_out[i]);
+            }
+        } else {
+            // Deterministic stranded normalization
+            needs_rc = (do_rc_r1 && is_read1) || (do_rc_r2 && is_read2);
+            if (needs_rc) {
+                flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
+            }
+        }
         
         // Get sequence (possibly reverse complemented)
         const std::string& orig_seq = seqs[i];
@@ -478,7 +528,8 @@ std::vector<Record> decode_block_columnar(
         std::string seq = decode_sequence(seqs_ptr + seq_offset, enc_len, seq_len);
         seq_offset += enc_len;
         
-        results.emplace_back(std::move(seq), is_paired, is_read1, is_read2);
+        results.emplace_back(std::move(seq), is_paired, is_read1, is_read2,
+                             (flag & 0x08) != 0);  // is_rc
     }
     
     return results;
@@ -501,6 +552,7 @@ NB_MODULE(_accel, m) {
           nb::arg("npolicy"),
           nb::arg("do_rc_r1"),
           nb::arg("do_rc_r2"),
+          nb::arg("do_random_rc") = false,
           "Batch encode sequences into columnar streams.\n\n"
           "Takes a list of sequences and flags, builds flags/lengths/sequences\n"
           "streams entirely in C++. Handles N-policy and strand normalization.");

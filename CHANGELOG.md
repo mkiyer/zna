@@ -5,6 +5,28 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-24
+
+### Added
+- **Strand normalization** (`--strand-normalize`) for consistent strand orientation in ZNA files
+  - Unstranded libraries: randomly reverse-complements one read per pair (or SE reads) with per-record `IS_RC` flag
+  - Strand-specific libraries: deterministically RCs antisense reads to sense orientation
+  - Orthogonal to library metadata (`--strand-specific`, `--read1-antisense`, etc.)
+  - `--restore-strand` on decode reverses RC operations using per-record `IS_RC` flags
+- New `IS_RC` record flag (bit 3) tracks which records were reverse-complemented
+- New `STRAND_NORMALIZED` header flag (bit 3) indicates strand normalization was applied
+
+### Fixed
+- C++ accelerator bug: paired R2 reads could receive an unintended second random RC during unstranded normalization
+
+### Changed
+- Bioconda recipe: added `osx-arm64` and `linux-aarch64` to `additional-platforms`
+
+## [0.1.8] - 2026-02-11
+
+### Fixed
+- macOS conda build: removed `llvm-tools` from host dependencies
+
 ## [0.1.7] - 2026-02-06
 
 - **Documentation changes**

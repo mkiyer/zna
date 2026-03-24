@@ -5,10 +5,10 @@ Each backend is a Python module that exposes four functions:
 
     encode_sequence(seq: str) -> bytes
     reverse_complement(seq: str) -> str
-    encode_block(seqs, flags, len_bytes_fmt, npolicy, do_rc_r1, do_rc_r2)
+    encode_block(seqs, flags, len_bytes_fmt, npolicy, do_rc_r1, do_rc_r2, do_random_rc)
         -> (flags_bytes, lengths_bytes, seqs_bytes)
     decode_block(flags_data, lengths_data, seqs_data, len_bytes, count)
-        -> list[(seq, is_paired, is_read1, is_read2)]
+        -> list[(seq, is_paired, is_read1, is_read2, is_rc)]
 
 Available backends
 ------------------

@@ -432,6 +432,7 @@ def encode_command(args):
 
     # Handle strand-specific flags
     strand_specific_flag = args.strand_specific
+    strand_normalize_flag = getattr(args, 'strand_normalize', False)
     
     # Determine R1/R2 antisense settings
     # Default for strand-specific: R1 antisense, R2 sense (dUTP protocol)
@@ -450,6 +451,7 @@ def encode_command(args):
         description = args.description if args.description != "" else input_header.description
         seq_len_bytes = args.seq_len_bytes if args.seq_len_bytes != 2 else input_header.seq_len_bytes
         strand_specific = strand_specific_flag if strand_specific_flag else input_header.strand_specific
+        strand_normalized = strand_normalize_flag if strand_normalize_flag else input_header.strand_normalized
         # Inherit antisense settings from input header if not explicitly overridden
         if not strand_specific_flag:
             read1_antisense = input_header.read1_antisense
@@ -466,6 +468,7 @@ def encode_command(args):
         description = args.description
         seq_len_bytes = args.seq_len_bytes
         strand_specific = strand_specific_flag
+        strand_normalized = strand_normalize_flag
 
     # Header Setup
     header = ZnaHeader(
@@ -475,6 +478,7 @@ def encode_command(args):
         strand_specific=strand_specific,
         read1_antisense=read1_antisense,
         read2_antisense=read2_antisense,
+        strand_normalized=strand_normalized,
         compression_method=comp_method,
         compression_level=comp_level
     )
@@ -646,6 +650,7 @@ def inspect_command(args):
         if h.strand_specific:
             print(f"R1 Antisense:     {h.read1_antisense}")
             print(f"R2 Antisense:     {h.read2_antisense}")
+        print(f"Strand Normalized:{h.strand_normalized}")
         
         method = "None"
         if h.compression_method == COMPRESSION_ZSTD:
@@ -754,6 +759,10 @@ def main():
     meta_group.add_argument("--description", default="", help="Description string")
     meta_group.add_argument("--strand-specific", action="store_true", 
                            help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
+    meta_group.add_argument("--strand-normalize", action="store_true",
+                           help="Enable strand normalization (RC reads to consistent strand). "
+                                "With --strand-specific: deterministic (antisense reads RC'd). "
+                                "Without: random RC (for unstranded data).")
     meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"], default="drop",
                            help="Policy for handling 'N' nucleotides: drop (skip sequences), random (replace with random base), or A/C/G/T (replace with specific base)")
     

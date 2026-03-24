@@ -833,6 +833,7 @@ class TestStrandProtocol:
                 read_group = "dutp_test"
                 description = ""
                 strand_specific = True  # Enable strand-specific
+                strand_normalize = True  # Enable normalization
                 read1_sense = False     # Default: R1 is antisense
                 read2_antisense = False # Default: R2 is sense
                 output = zna_path
@@ -849,6 +850,7 @@ class TestStrandProtocol:
                 assert reader.header.strand_specific == True
                 assert reader.header.read1_antisense == True
                 assert reader.header.read2_antisense == False
+                assert reader.header.strand_normalized == True
     
     def test_decode_restore_strand(self):
         """Test decoding with --restore-strand flag."""
@@ -879,6 +881,7 @@ class TestStrandProtocol:
                 read_group = "dutp_test"
                 description = ""
                 strand_specific = True
+                strand_normalize = True
                 read1_sense = False      # R1 is antisense
                 read2_antisense = False  # R2 is sense
                 output = zna_path
@@ -939,6 +942,7 @@ class TestStrandProtocol:
                 read_group = "dutp_test"
                 description = ""
                 strand_specific = True
+                strand_normalize = True
                 read1_sense = False      # R1 is antisense
                 read2_antisense = False  # R2 is sense
                 output = zna_path
@@ -990,6 +994,7 @@ class TestStrandProtocol:
                 read_group = "inspect_test"
                 description = ""
                 strand_specific = True
+                strand_normalize = True
                 read1_sense = False      # R1 is antisense (default)
                 read2_antisense = False  # R2 is sense (default)
                 output = zna_path

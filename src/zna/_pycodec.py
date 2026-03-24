@@ -98,6 +98,7 @@ def encode_block(
     npolicy: str,
     do_rc_r1: bool,
     do_rc_r2: bool,
+    do_random_rc: bool = False,
 ) -> tuple[bytes, bytes, bytes]:
     """Batch-encode sequences into columnar byte streams.
 
@@ -107,36 +108,89 @@ def encode_block(
     replacement before 2-bit packing.
     """
     import struct as _struct
+    import random as _random
 
     _len_struct = {1: _struct.Struct("<B"), 2: _struct.Struct("<H"), 4: _struct.Struct("<I")}[len_bytes_fmt]
     pack_len = _len_struct.pack
 
-    flags_out = bytes(flags)
+    # Make a mutable copy of flags so we can set IS_RC (bit 3)
+    flags = list(flags)
     lengths_buf = bytearray()
     seqs_buf = bytearray()
 
-    for i, seq in enumerate(seqs):
-        flag = flags[i]
-        is_read1 = bool(flag & 1)
-        is_read2 = bool(flag & 2)
+    IS_RC_BIT = 0x08
+    IS_READ1 = 0x01
+    IS_READ2 = 0x02
+    IS_PAIRED = 0x04
 
-        if do_rc_r1 and is_read1:
-            seq = reverse_complement(seq)
-        elif do_rc_r2 and is_read2:
-            seq = reverse_complement(seq)
+    n = len(seqs)
+    i = 0
+    while i < n:
+        flag = flags[i]
+        is_read1 = bool(flag & IS_READ1)
+        is_read2 = bool(flag & IS_READ2)
+        is_paired = bool(flag & IS_PAIRED)
+        seq = seqs[i]
+
+        if do_random_rc:
+            # Unstranded normalization: random RC
+            if is_paired and is_read1 and (i + 1 < n) and (flags[i + 1] & IS_PAIRED):
+                # Process R1+R2 pair together
+                seq2 = seqs[i + 1]
+                coin = _random.getrandbits(1)
+                if coin:
+                    seq = reverse_complement(seq)
+                    flags[i] |= IS_RC_BIT
+                else:
+                    seq2 = reverse_complement(seq2)
+                    flags[i + 1] |= IS_RC_BIT
+
+                # Encode R1
+                seq = _apply_npolicy(seq, npolicy)
+                lengths_buf.extend(pack_len(len(seq)))
+                seqs_buf.extend(encode_sequence(seq))
+
+                # Encode R2
+                seq2 = _apply_npolicy(seq2, npolicy)
+                lengths_buf.extend(pack_len(len(seq2)))
+                seqs_buf.extend(encode_sequence(seq2))
+
+                i += 2
+                continue
+            else:
+                # Unpaired read: random RC
+                if _random.getrandbits(1):
+                    seq = reverse_complement(seq)
+                    flags[i] |= IS_RC_BIT
+        else:
+            # Stranded (deterministic) normalization
+            if do_rc_r1 and is_read1:
+                seq = reverse_complement(seq)
+                flags[i] |= IS_RC_BIT
+            elif do_rc_r2 and is_read2:
+                seq = reverse_complement(seq)
+                flags[i] |= IS_RC_BIT
 
         # N-policy
-        if npolicy and "N" in seq.upper():
-            if npolicy == "random":
-                import random
-                seq = "".join(random.choice("ACGT") if c.upper() == "N" else c for c in seq)
-            elif npolicy in ("A", "C", "G", "T"):
-                seq = seq.replace("N", npolicy).replace("n", npolicy.lower())
+        seq = _apply_npolicy(seq, npolicy)
 
         lengths_buf.extend(pack_len(len(seq)))
         seqs_buf.extend(encode_sequence(seq))
+        i += 1
 
+    flags_out = bytes(flags)
     return flags_out, bytes(lengths_buf), bytes(seqs_buf)
+
+
+def _apply_npolicy(seq: str, npolicy: str) -> str:
+    """Replace N nucleotides according to *npolicy*."""
+    if npolicy and "N" in seq.upper():
+        if npolicy == "random":
+            import random
+            seq = "".join(random.choice("ACGT") if c.upper() == "N" else c for c in seq)
+        elif npolicy in ("A", "C", "G", "T"):
+            seq = seq.replace("N", npolicy).replace("n", npolicy.lower())
+    return seq
 
 
 def decode_block(
@@ -145,10 +199,10 @@ def decode_block(
     seqs_data: bytes,
     len_bytes: int,
     count: int,
-) -> list[tuple[str, bool, bool, bool]]:
+) -> list[tuple[str, bool, bool, bool, bool]]:
     """Batch-decode columnar byte streams into record tuples.
 
-    Returns a list of ``(sequence, is_paired, is_read1, is_read2)``.
+    Returns a list of ``(sequence, is_paired, is_read1, is_read2, is_rc)``.
     """
     import struct as _struct
 
@@ -164,7 +218,7 @@ def decode_block(
     decode_table = _DECODE_TABLE
     all_decoded = "".join(decode_table[b] for b in seqs_data)
 
-    results: list[tuple[str, bool, bool, bool]] = []
+    results: list[tuple[str, bool, bool, bool, bool]] = []
     char_offset = 0
     for i in range(count):
         seq_len = lengths[i]
@@ -179,6 +233,7 @@ def decode_block(
             bool(flag & 4),  # is_paired
             bool(flag & 1),  # is_read1
             bool(flag & 2),  # is_read2
+            bool(flag & 8),  # is_rc
         ))
 
     return results

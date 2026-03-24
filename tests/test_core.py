@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from zna.core import ZnaHeader, write_zna, read_zna, ZnaWriter, ZnaReader, COMPRESSION_ZSTD, COMPRESSION_NONE
 from zna import reverse_complement
+from zna._pycodec import encode_block, decode_block
 
 
 
@@ -225,6 +226,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=True,
             read2_antisense=False,
+            strand_normalized=True,
         )
         
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,6 +243,7 @@ class TestStrandSpecific(unittest.TestCase):
                 self.assertTrue(reader.header.strand_specific)
                 self.assertTrue(reader.header.read1_antisense)
                 self.assertFalse(reader.header.read2_antisense)
+                self.assertTrue(reader.header.strand_normalized)
     
     def test_r1_antisense_normalization(self):
         """Test that R1 antisense reads are normalized (reverse complemented) during encoding."""
@@ -249,6 +252,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=True,  # R1 is antisense
             read2_antisense=False,
+            strand_normalized=True,
         )
         
         r1_seq = "AAAACCCC"  # Original antisense R1
@@ -277,6 +281,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=False,
             read2_antisense=True,  # R2 is antisense
+            strand_normalized=True,
         )
         
         r2_seq = "AAAACCCC"
@@ -303,6 +308,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=True,  # R1 is antisense
             read2_antisense=False, # R2 is sense
+            strand_normalized=True,
         )
         
         r2_seq = "AAAACCCC"  # R2 is sense, should NOT be modified
@@ -328,6 +334,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=True,
             read2_antisense=False,
+            strand_normalized=True,
         )
         
         r1_original = "AAAACCCC"
@@ -360,6 +367,7 @@ class TestStrandSpecific(unittest.TestCase):
             strand_specific=True,
             read1_antisense=True,  # dUTP: R1 is antisense
             read2_antisense=False, # dUTP: R2 is sense
+            strand_normalized=True,
         )
         
         # Create test sequences
@@ -418,6 +426,239 @@ class TestStrandSpecific(unittest.TestCase):
                 
                 records = list(reader.records(restore_strand=True))
                 self.assertEqual(records[0][0], test_seq)
+
+    def test_strand_specific_without_normalize(self):
+        """Test that strand_specific=True without strand_normalized stores reads as-is."""
+        header = ZnaHeader(
+            read_group="metadata_only",
+            strand_specific=True,
+            read1_antisense=True,
+            read2_antisense=False,
+            strand_normalized=False,  # metadata only, no RC
+        )
+        
+        r1_seq = "AAAACCCC"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/no_norm.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r1_seq, True, True, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                self.assertTrue(reader.header.strand_specific)
+                self.assertTrue(reader.header.read1_antisense)
+                self.assertFalse(reader.header.strand_normalized)
+                
+                records = list(reader.records(restore_strand=False))
+                # Sequence should be unchanged (no RC applied)
+                self.assertEqual(records[0][0], r1_seq)
+
+
+class TestUnstrandedNormalization(unittest.TestCase):
+    """Test unstranded strand normalization (random RC)."""
+
+    def test_paired_normalization_roundtrip(self):
+        """Test that unstranded normalization RC's one read per pair and restores correctly."""
+        header = ZnaHeader(
+            read_group="unstranded_norm",
+            strand_specific=False,
+            strand_normalized=True,
+        )
+        
+        r1_seq = "AAAACCCC"
+        r2_seq = "TTTTGGGG"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/unstranded_norm.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(r1_seq, True, True, False)
+                    writer.write_record(r2_seq, True, False, True)
+            
+            # Read with restore_strand=True — should recover original sequences
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=True))
+                
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[0][0], r1_seq)
+                self.assertEqual(records[1][0], r2_seq)
+
+    def test_paired_one_read_is_rc(self):
+        """Test that exactly one read per pair is RC'd in unstranded normalization."""
+        header = ZnaHeader(
+            read_group="test",
+            strand_specific=False,
+            strand_normalized=True,
+        )
+        
+        r1_seq = "AAAACCCC"
+        r2_seq = "TTTTGGGG"
+        r1_rc = reverse_complement(r1_seq)
+        r2_rc = reverse_complement(r2_seq)
+        
+        # Encode many pairs to statistically verify both choices occur
+        n_pairs = 100
+        r1_was_rc_count = 0
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/test.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for _ in range(n_pairs):
+                        writer.write_record(r1_seq, True, True, False)
+                        writer.write_record(r2_seq, True, False, True)
+            
+            # Read without restore — see what was actually stored
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=False))
+                
+                self.assertEqual(len(records), n_pairs * 2)
+                
+                for i in range(0, len(records), 2):
+                    stored_r1 = records[i][0]
+                    stored_r2 = records[i + 1][0]
+                    
+                    # Exactly one of the two reads should be RC'd
+                    if stored_r1 == r1_rc:
+                        # R1 was RC'd, R2 should be unchanged
+                        self.assertEqual(stored_r2, r2_seq)
+                        r1_was_rc_count += 1
+                    else:
+                        # R1 unchanged, R2 should be RC'd
+                        self.assertEqual(stored_r1, r1_seq)
+                        self.assertEqual(stored_r2, r2_rc)
+        
+        # With 100 pairs and random 50/50, both choices should occur
+        self.assertGreater(r1_was_rc_count, 0, "R1 should be RC'd at least once")
+        self.assertLess(r1_was_rc_count, n_pairs, "R2 should be RC'd at least once")
+
+    def test_single_end_normalization_roundtrip(self):
+        """Test that single-end reads are randomly RC'd and restored correctly."""
+        header = ZnaHeader(
+            read_group="se_norm",
+            strand_specific=False,
+            strand_normalized=True,
+        )
+        
+        seqs = ["AAAACCCC", "TTTTGGGG", "ACGTACGT", "GGGGTTTTT"]
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/se_norm.zna"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for seq in seqs:
+                        writer.write_record(seq, False, False, False)
+            
+            # Restore should give back originals
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=True))
+                
+                self.assertEqual(len(records), len(seqs))
+                for i, seq in enumerate(seqs):
+                    self.assertEqual(records[i][0], seq)
+
+    def test_mixed_se_pe_normalization_roundtrip(self):
+        """Test normalization with mixed single-end and paired-end reads."""
+        header = ZnaHeader(
+            read_group="mixed_norm",
+            strand_specific=False,
+            strand_normalized=True,
+        )
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/mixed.zna"
+            
+            r1a = "AAAACCCC"
+            r2a = "TTTTGGGG"
+            se1 = "ACGTACGT"
+            r1b = "GGGGTTTTT"
+            r2b = "CCCAAAAA"
+            se2 = "TTTTTAAA"
+            
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    # Pair 1
+                    writer.write_record(r1a, True, True, False)
+                    writer.write_record(r2a, True, False, True)
+                    # Single-end
+                    writer.write_record(se1, False, False, False)
+                    # Pair 2
+                    writer.write_record(r1b, True, True, False)
+                    writer.write_record(r2b, True, False, True)
+                    # Single-end
+                    writer.write_record(se2, False, False, False)
+            
+            # Restore should give back originals
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                records = list(reader.records(restore_strand=True))
+                
+                self.assertEqual(len(records), 6)
+                self.assertEqual(records[0][0], r1a)
+                self.assertEqual(records[1][0], r2a)
+                self.assertEqual(records[2][0], se1)
+                self.assertEqual(records[3][0], r1b)
+                self.assertEqual(records[4][0], r2b)
+                self.assertEqual(records[5][0], se2)
+
+    def test_encode_block_is_rc_flag(self):
+        """Test that encode_block sets IS_RC bit (0x08) on RC'd records."""
+        seqs = ["AAAACCCC", "TTTTGGGG"]
+        flags = [0x05, 0x06]  # paired R1, paired R2
+        
+        flags_out, _, _ = encode_block(
+            seqs, flags, 1, "", False, False, do_random_rc=True
+        )
+        
+        # Exactly one of the two should have IS_RC set
+        rc_count = sum(1 for f in flags_out if f & 0x08)
+        self.assertEqual(rc_count, 1)
+
+    def test_decode_block_returns_is_rc(self):
+        """Test that decode_block returns the is_rc field."""
+        seqs = ["AAAA"]
+        flags = [0x0D]  # IS_READ1 | IS_PAIRED | IS_RC = 0x01 | 0x04 | 0x08
+        
+        flags_out, lengths_out, seqs_out = encode_block(
+            seqs, flags, 1, "", False, False, do_random_rc=False
+        )
+        
+        records = decode_block(flags_out, lengths_out, seqs_out, 1, 1)
+        self.assertEqual(len(records), 1)
+        seq, is_paired, is_read1, is_read2, is_rc = records[0]
+        self.assertEqual(seq, "AAAA")
+        self.assertTrue(is_paired)
+        self.assertTrue(is_read1)
+        self.assertFalse(is_read2)
+        self.assertTrue(is_rc)
+
+    def test_strand_normalized_header_roundtrip(self):
+        """Test that strand_normalized flag persists through header serialization."""
+        header = ZnaHeader(
+            read_group="norm_header",
+            strand_specific=False,
+            strand_normalized=True,
+        )
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/norm.zna"
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record("ACGT", False, False, False)
+            
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                self.assertTrue(reader.header.strand_normalized)
+                self.assertFalse(reader.header.strand_specific)
 
 
 class TestNPolicy(unittest.TestCase):

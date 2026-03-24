@@ -113,6 +113,7 @@ def shuffle_zna(
         strand_specific=in_header.strand_specific,
         read1_antisense=in_header.read1_antisense,
         read2_antisense=in_header.read2_antisense,
+        strand_normalized=in_header.strand_normalized,
         compression_method=in_header.compression_method,
         compression_level=in_header.compression_level,
     )
