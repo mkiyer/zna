@@ -7,6 +7,7 @@ from .core import (
     ZnaHeaderFlags, ZnaRecordFlags,
     reverse_complement,
 )
+from .dtypes import LabelDef, LabelDtype, parse_dtype, resolve_missing
 from .codec import get_backend, get_backend_name, available_backends
 
 
@@ -20,6 +21,7 @@ __all__ = [
     "read_zna", "write_zna",
     "ZnaHeaderFlags", "ZnaRecordFlags",
     "reverse_complement",
+    "LabelDef", "LabelDtype", "parse_dtype", "resolve_missing",
     "is_accelerated",
     "get_backend", "get_backend_name", "available_backends",
     "__version__",

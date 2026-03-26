@@ -26,8 +26,8 @@ from typing import List, Tuple
 from .core import ZnaHeader, ZnaWriter, ZnaReader
 
 
-# Type alias for a single record tuple.
-Record = Tuple[str, bool, bool, bool]
+# Type alias for a single record tuple (without or with labels).
+Record = tuple
 
 
 def shuffle_zna(
@@ -77,8 +77,10 @@ def shuffle_zna(
 
         n_units = 0
         n_records = 0
-        for _seq, is_paired, is_read1, _is_read2 in reader.records():
+        for rec in reader.records():
             n_records += 1
+            is_paired = rec[1]
+            is_read1 = rec[2]
             if not (is_paired and not is_read1):
                 n_units += 1
 
@@ -116,7 +118,10 @@ def shuffle_zna(
         strand_normalized=in_header.strand_normalized,
         compression_method=in_header.compression_method,
         compression_level=in_header.compression_level,
+        labels=in_header.labels,
     )
+
+    has_labels = len(in_header.labels) > 0
 
     with tempfile.TemporaryDirectory(dir=tmp_dir, prefix="zna_shuffle_") as tmp_path:
         bucket_paths = [
@@ -133,22 +138,43 @@ def shuffle_zna(
                 distributed = 0
                 _pending_bucket = 0
 
-                for seq, is_paired, is_read1, is_read2 in reader.records():
+                for rec in reader.records():
+                    seq = rec[0]
+                    is_paired = rec[1]
+                    is_read1 = rec[2]
+                    is_read2 = rec[3]
+                    labels = rec[4] if has_labels else None
+
                     if is_paired and is_read1:
                         _pending_bucket = rng.randrange(n_buckets)
-                        bucket_writers[_pending_bucket].write_record(
-                            seq, is_paired, is_read1, is_read2
-                        )
+                        if has_labels:
+                            bucket_writers[_pending_bucket].write_record(
+                                seq, is_paired, is_read1, is_read2, labels=labels
+                            )
+                        else:
+                            bucket_writers[_pending_bucket].write_record(
+                                seq, is_paired, is_read1, is_read2
+                            )
                     elif is_paired and is_read2:
-                        bucket_writers[_pending_bucket].write_record(
-                            seq, is_paired, is_read1, is_read2
-                        )
+                        if has_labels:
+                            bucket_writers[_pending_bucket].write_record(
+                                seq, is_paired, is_read1, is_read2, labels=labels
+                            )
+                        else:
+                            bucket_writers[_pending_bucket].write_record(
+                                seq, is_paired, is_read1, is_read2
+                            )
                         distributed += 1
                     else:
                         bucket_idx = rng.randrange(n_buckets)
-                        bucket_writers[bucket_idx].write_record(
-                            seq, is_paired, is_read1, is_read2
-                        )
+                        if has_labels:
+                            bucket_writers[bucket_idx].write_record(
+                                seq, is_paired, is_read1, is_read2, labels=labels
+                            )
+                        else:
+                            bucket_writers[bucket_idx].write_record(
+                                seq, is_paired, is_read1, is_read2
+                            )
                         distributed += 1
 
                     if (
@@ -189,12 +215,14 @@ def shuffle_zna(
                         breader = ZnaReader(bfh)
                         current_unit: List[Record] = []
                         for rec in breader.records():
-                            _seq, is_paired, is_read1, _is_read2 = rec
+                            is_paired = rec[1]
+                            is_read1 = rec[2]
+                            is_read2 = rec[3]
                             if is_paired and is_read1:
                                 if current_unit:
                                     units.append(current_unit)
                                 current_unit = [rec]
-                            elif is_paired and _is_read2:
+                            elif is_paired and is_read2:
                                 current_unit.append(rec)
                                 units.append(current_unit)
                                 current_unit = []
@@ -209,10 +237,20 @@ def shuffle_zna(
                     rng.shuffle(units)
 
                     for unit in units:
-                        for seq, is_paired, is_read1, is_read2 in unit:
-                            out_writer.write_record(
-                                seq, is_paired, is_read1, is_read2
-                            )
+                        for rec in unit:
+                            seq = rec[0]
+                            is_paired = rec[1]
+                            is_read1 = rec[2]
+                            is_read2 = rec[3]
+                            if has_labels:
+                                labels = rec[4]
+                                out_writer.write_record(
+                                    seq, is_paired, is_read1, is_read2, labels=labels
+                                )
+                            else:
+                                out_writer.write_record(
+                                    seq, is_paired, is_read1, is_read2
+                                )
                     written += len(units)
 
                     if not quiet:

@@ -18,7 +18,15 @@ from .core import (
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
     ZnaHeaderFlags, reverse_complement,
 )
+from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
 from ._shuffle import shuffle_zna
+
+# Try to import the C++ fast label extractor
+_accel_extract = None
+try:
+    from ._accel import extract_labels_fast as _accel_extract
+except (ImportError, AttributeError):
+    pass
 
 
 def parse_block_size(value) -> int:
@@ -161,6 +169,40 @@ def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
                 end -= 1
             yield read_name, seq_line[:end].decode('ascii')
 
+
+def parse_fastq_with_headers(fh: BinaryIO) -> Iterator[Tuple[bytes, str]]:
+    """Yields (raw_header_bytes, sequence) tuples from FASTQ stream.
+
+    The header is the full line after ``@`` (as bytes, without the ``@`` or
+    the trailing newline).  The caller is responsible for parsing SAM tags
+    from the header.
+    """
+    readline = fh.readline
+    while True:
+        header = readline()
+        if not header:
+            break
+        if header[0] != 64:  # ord('@')
+            continue
+        end = len(header)
+        if end > 1 and header[-1] == 10:
+            end -= 1
+        if end > 1 and header[end - 1] == 13:
+            end -= 1
+        raw_header = header[1:end]
+
+        seq_line = readline()
+        readline()  # +
+        readline()  # quality
+
+        if seq_line:
+            end = len(seq_line)
+            if end > 0 and seq_line[-1] == 10:
+                end -= 1
+            if end > 0 and seq_line[end - 1] == 13:
+                end -= 1
+            yield raw_header, seq_line[:end].decode('ascii')
+
 def parse_fasta(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTA stream."""
     seq_parts = []
@@ -224,6 +266,329 @@ def choose_parser(filepath: Optional[str], format_override: Optional[str] = None
     print("[Warning] Reading from stdin without format specified (--fasta or --fastq). "
           "Defaulting to FASTQ.", file=sys.stderr)
     return parse_fastq
+
+
+# --- LABEL HELPERS ---
+
+def parse_label_spec(spec: str) -> Tuple[str, str, Optional[str]]:
+    """Parse a ``--label NAME:TYPE`` or ``--label NAME:TYPE:TAG`` spec string.
+
+    Returns ``(name, dtype_code_or_name, tag_or_none)``.
+
+    Examples::
+
+        "NH:C"      -> ("NH", "C", None)
+        "AS:i"      -> ("AS", "i", None)
+        "edits:C:NM" -> ("edits", "C", "NM")
+    """
+    if ':' not in spec:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --label spec {spec!r}: expected NAME:TYPE or NAME:TYPE:TAG (e.g. NH:C)"
+        )
+    parts = spec.split(':')
+    if len(parts) == 2:
+        name, type_str = parts
+        tag: Optional[str] = None
+    elif len(parts) == 3:
+        name, type_str, tag = parts
+        if not tag:
+            raise argparse.ArgumentTypeError(f"Empty tag in --label {spec!r}")
+    else:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --label spec {spec!r}: expected NAME:TYPE or NAME:TYPE:TAG"
+        )
+    if not name:
+        raise argparse.ArgumentTypeError(f"Empty label name in --label {spec!r}")
+
+    # Validate dtype
+    try:
+        parse_dtype(type_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Unknown dtype {type_str!r} in --label {spec!r}")
+
+    return name, type_str, tag
+
+
+def build_label_defs(
+    label_specs: list[str],
+    label_descs: list[str],
+) -> tuple[LabelDef, ...]:
+    """Build a tuple of :class:`LabelDef` from CLI ``--label`` and ``--label-desc`` args.
+
+    *label_specs* are ``"NAME:TYPE"`` or ``"NAME:TYPE:TAG"`` strings.
+    *label_descs* are ``"NAME:Description text"`` strings (optional,
+    may be shorter than *label_specs*).
+    """
+    # Index descriptions by label name
+    desc_map: dict[str, str] = {}
+    for desc_spec in label_descs:
+        if ':' in desc_spec:
+            name, desc = desc_spec.split(':', 1)
+            desc_map[name] = desc
+
+    defs: list[LabelDef] = []
+    for i, spec in enumerate(label_specs):
+        name, type_str, tag = parse_label_spec(spec)
+        dtype = parse_dtype(type_str)
+        description = desc_map.get(name, "")
+        defs.append(LabelDef(
+            label_id=i, name=name, description=description,
+            dtype=dtype, tag=tag,
+        ))
+    return tuple(defs)
+
+
+def load_label_file(path: str) -> tuple[LabelDef, ...]:
+    """Load label definitions from a YAML file.
+
+    Each entry in the top-level ``labels`` list must have at least ``name``
+    and ``type``.  Optional keys: ``description``, ``missing``.
+
+    Example YAML::
+
+        labels:
+          - name: NM
+            type: C
+            description: Edit distance
+          - name: AS
+            type: i
+            description: Alignment score
+            missing: -1
+
+    Returns a tuple of :class:`LabelDef` objects.  Raises
+    ``SystemExit`` with a user-friendly message on errors.
+    """
+    try:
+        import yaml
+    except ImportError:
+        sys.exit(
+            "Error: PyYAML is required for --label-defs.\n"
+            "Install it with:  pip install pyyaml"
+        )
+
+    try:
+        with open(path) as fh:
+            data = yaml.safe_load(fh)
+    except FileNotFoundError:
+        sys.exit(f"Error: label file not found: {path}")
+    except yaml.YAMLError as e:
+        sys.exit(f"Error: invalid YAML in {path}: {e}")
+
+    if not isinstance(data, dict) or "labels" not in data:
+        sys.exit(
+            f"Error: {path} must contain a top-level 'labels' key "
+            f"with a list of label definitions."
+        )
+
+    entries = data["labels"]
+    if not isinstance(entries, list):
+        sys.exit(f"Error: 'labels' in {path} must be a list.")
+
+    defs: list[LabelDef] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            sys.exit(f"Error: label entry {i} in {path} must be a mapping.")
+
+        name = entry.get("name")
+        if not name:
+            sys.exit(f"Error: label entry {i} in {path} is missing 'name'.")
+
+        type_str = entry.get("type")
+        if not type_str:
+            sys.exit(f"Error: label '{name}' in {path} is missing 'type'.")
+
+        type_str = str(type_str)
+        try:
+            dtype = parse_dtype(type_str)
+        except ValueError:
+            sys.exit(
+                f"Error: unknown dtype {type_str!r} for label '{name}' in {path}.\n"
+                f"Valid types: A, c, C, s, S, i, I, f, d, q, Q"
+            )
+
+        description = str(entry.get("description", ""))
+        missing_raw = entry.get("missing")
+        missing: int | float | None = None
+        if missing_raw is not None:
+            if isinstance(missing_raw, str) and len(missing_raw) == 1:
+                # Single character → ord (for type A)
+                missing = ord(missing_raw)
+            else:
+                try:
+                    missing = int(missing_raw) if dtype.code not in ('f', 'd') else float(missing_raw)
+                except (ValueError, TypeError):
+                    sys.exit(
+                        f"Error: invalid missing value {missing_raw!r} "
+                        f"for label '{name}' in {path}."
+                    )
+
+        tag_str = entry.get("tag")
+        if tag_str is not None:
+            tag_str = str(tag_str)
+
+        defs.append(LabelDef(
+            label_id=i, name=name, description=description,
+            dtype=dtype, missing=missing, tag=tag_str,
+        ))
+
+    return tuple(defs)
+
+
+def merge_label_defs(
+    yaml_defs: tuple[LabelDef, ...],
+    cli_specs: list[str],
+    cli_descs: list[str],
+) -> tuple[LabelDef, ...]:
+    """Merge CLI ``--label`` / ``--label-desc`` overrides onto YAML base defs.
+
+    CLI flags override YAML values by tag name.  Any CLI ``--label`` that
+    does not appear in the YAML file is appended at the end.
+    """
+    # Build override maps from CLI (keyed by label name)
+    cli_type_map: dict[str, str] = {}
+    cli_tag_map: dict[str, Optional[str]] = {}
+    for spec in cli_specs:
+        name, type_str, tag = parse_label_spec(spec)
+        cli_type_map[name] = type_str
+        cli_tag_map[name] = tag
+
+    cli_desc_map: dict[str, str] = {}
+    for desc_spec in cli_descs:
+        if ':' in desc_spec:
+            name, desc = desc_spec.split(':', 1)
+            cli_desc_map[name] = desc
+
+    # Pass 1: update existing YAML defs with CLI overrides
+    seen_names: set[str] = set()
+    merged: list[LabelDef] = []
+    for ldef in yaml_defs:
+        name = ldef.name
+        seen_names.add(name)
+
+        dtype = ldef.dtype
+        if name in cli_type_map:
+            dtype = parse_dtype(cli_type_map[name])
+
+        desc = ldef.description
+        if name in cli_desc_map:
+            desc = cli_desc_map[name]
+
+        tag = ldef.tag
+        if name in cli_tag_map and cli_tag_map[name] is not None:
+            tag = cli_tag_map[name]
+
+        merged.append(LabelDef(
+            label_id=len(merged), name=name, description=desc,
+            dtype=dtype, missing=ldef.missing, tag=tag,
+        ))
+
+    # Pass 2: append CLI-only labels not in YAML
+    for spec in cli_specs:
+        name, type_str, tag = parse_label_spec(spec)
+        if name not in seen_names:
+            dtype = parse_dtype(type_str)
+            desc = cli_desc_map.get(name, "")
+            merged.append(LabelDef(
+                label_id=len(merged), name=name, description=desc,
+                dtype=dtype, tag=tag,
+            ))
+            seen_names.add(name)
+
+    return tuple(merged)
+
+
+# Conversion type codes for tag_map (avoids closure/lambda dispatch)
+_CONV_INT = 0
+_CONV_FLOAT = 1
+_CONV_ORD = 2
+
+
+def build_tag_extractor(label_defs: tuple[LabelDef, ...]) -> dict[bytes, Tuple[int, int, LabelDef]]:
+    """Build a lookup dict for fast SAM tag extraction from FASTQ headers.
+
+    Returns ``{b'NH': (label_index, conv_code, ldef), ...}`` where
+    *conv_code* is one of ``_CONV_INT``, ``_CONV_FLOAT``, ``_CONV_ORD``.
+    """
+    tag_map: dict[bytes, Tuple[int, int, LabelDef]] = {}
+    for i, ldef in enumerate(label_defs):
+        tag_bytes = ldef.effective_tag.encode('ascii')
+        if ldef.dtype.code == 'A':
+            conv_code = _CONV_ORD
+        elif ldef.dtype.code in ('f', 'd'):
+            conv_code = _CONV_FLOAT
+        else:
+            conv_code = _CONV_INT
+        tag_map[tag_bytes] = (i, conv_code, ldef)
+
+    return tag_map
+
+
+def extract_labels_from_header(
+    raw_header: bytes,
+    tag_map: dict[bytes, Tuple[int, int, object]],
+    num_labels: int,
+    label_defs: tuple[LabelDef, ...] | None = None,
+) -> tuple:
+    """Extract label values from a FASTQ header with key-value tags.
+
+    The header format is::
+
+        READNAME<ws>KEY:TYPE:VALUE<ws>KEY:TYPE:VALUE...
+
+    Keys can be any length (e.g. standard 2-char SAM tags like ``NM``
+    or longer custom keys like ``edit_distance``).  TYPE is a single
+    character (ignored by the parser — the dtype from the label
+    definition is used).
+
+    Fields are split on **any whitespace** (tabs and spaces) so that
+    tools like fastp that append space-separated tokens (e.g.
+    ``merged_150_87``) do not corrupt the last tag value.
+
+    Missing tags are filled with the label's ``missing`` value (from
+    :func:`resolve_missing`).  If *label_defs* is not provided, a
+    ``ValueError`` is raised for any absent tag.
+    """
+    from .dtypes import resolve_missing as _resolve_missing
+
+    fields = raw_header.split()  # split on any whitespace
+    values: list = [None] * num_labels
+    remaining = num_labels
+
+    for field in fields[1:]:  # skip read name
+        # KEY:TYPE:VALUE — find first colon to extract key
+        colon1 = field.find(b':')
+        if colon1 < 1:
+            continue
+        # TYPE char after first colon, second colon separates value
+        if len(field) < colon1 + 3 or field[colon1 + 2:colon1 + 3] != b':':
+            continue
+        tag = field[:colon1]
+        entry = tag_map.get(tag)
+        if entry is not None:
+            idx, conv_code, _ldef = entry
+            raw_val = field[colon1 + 3:]
+            if conv_code == _CONV_INT:
+                values[idx] = int(raw_val)
+            elif conv_code == _CONV_FLOAT:
+                values[idx] = float(raw_val)
+            else:  # _CONV_ORD
+                values[idx] = raw_val[0] if len(raw_val) == 1 else int(raw_val)
+            remaining -= 1
+            if remaining == 0:
+                return tuple(values)
+
+    # Fill in missing values from label definitions
+    for i in range(num_labels):
+        if values[i] is None:
+            if label_defs is not None:
+                values[i] = _resolve_missing(label_defs[i])
+            else:
+                raise ValueError(
+                    f"Missing SAM tag for label index {i} in header: "
+                    f"{raw_header[:80].decode('ascii', errors='replace')!r}"
+                )
+
+    return tuple(values)
 
 
 # --- INPUT STRATEGY ---
@@ -392,6 +757,53 @@ def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
             yield from _stream_single_end(f, src, format_override)
 
 
+def stream_inputs_labeled(
+    args, label_defs: tuple[LabelDef, ...], tag_map: dict
+) -> Iterator[Tuple[str, bool, bool, bool, tuple]]:
+    """Yield ``(seq, is_paired, is_read1, is_read2, labels)`` for labeled encoding.
+
+    Only supports single-end FASTQ from a single file or stdin (the common case
+    for ``samtools fastq -T`` output).  Interleaved and paired-file modes are
+    not yet supported for labeled encoding.
+
+    Uses the C++ fast label extractor when available.
+    """
+    from .dtypes import resolve_missing as _resolve_missing
+
+    files = args.files if args.files else []
+    num_labels = len(label_defs)
+
+    # Build C++ fast tag specs if available
+    use_fast = _accel_extract is not None
+    if use_fast:
+        tag_specs = []
+        for ldef in label_defs:
+            tag_bytes = ldef.effective_tag.encode('ascii')
+            if ldef.dtype.code == 'A':
+                conv_code = _CONV_ORD
+            elif ldef.dtype.code in ('f', 'd'):
+                conv_code = _CONV_FLOAT
+            else:
+                conv_code = _CONV_INT
+            tag_specs.append((tag_bytes, conv_code))
+        missing_values = tuple(_resolve_missing(ld) for ld in label_defs)
+        _extract = _accel_extract
+    else:
+        _extract = None
+
+    src = files[0] if len(files) == 1 else None
+    with ExitStack() as stack:
+        f = stack.enter_context(get_input_handle(src))
+        if use_fast:
+            for raw_header, seq in parse_fastq_with_headers(f):
+                labels = _extract(raw_header, tag_specs, num_labels, missing_values)
+                yield seq, False, False, False, labels
+        else:
+            for raw_header, seq in parse_fastq_with_headers(f):
+                labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=label_defs)
+                yield seq, False, False, False, labels
+
+
 # --- COMMAND: ENCODE ---
 
 def encode_command(args):
@@ -470,6 +882,23 @@ def encode_command(args):
         strand_specific = strand_specific_flag
         strand_normalized = strand_normalize_flag
 
+    # Build label definitions (if any)
+    label_defs: tuple[LabelDef, ...] = ()
+    tag_map: dict = {}
+    label_defs_path = getattr(args, 'label_defs', None)
+    label_specs = getattr(args, 'label', None) or []
+    label_descs = getattr(args, 'label_desc', None) or []
+    if label_defs_path:
+        yaml_defs = load_label_file(label_defs_path)
+        if label_specs or label_descs:
+            label_defs = merge_label_defs(yaml_defs, label_specs, label_descs)
+        else:
+            label_defs = yaml_defs
+        tag_map = build_tag_extractor(label_defs)
+    elif label_specs:
+        label_defs = build_label_defs(label_specs, label_descs)
+        tag_map = build_tag_extractor(label_defs)
+
     # Header Setup
     header = ZnaHeader(
         read_group=read_group,
@@ -480,7 +909,8 @@ def encode_command(args):
         read2_antisense=read2_antisense,
         strand_normalized=strand_normalized,
         compression_method=comp_method,
-        compression_level=comp_level
+        compression_level=comp_level,
+        labels=label_defs,
     )
 
     if not is_stdout:
@@ -500,15 +930,22 @@ def encode_command(args):
         f_out = stack.enter_context(get_output_handle(args.output))
         writer = stack.enter_context(ZnaWriter(f_out, header, block_size=block_size, npolicy=npolicy))
         
-        for seq, is_paired, is_r1, is_r2 in stream_inputs(args):
-            # Skip sequence if it contains N and policy is 'drop'
-            if npolicy == 'drop' and 'N' in seq.upper():
-                continue
-            writer.write_record(seq, is_paired, is_r1, is_r2)
-            count += 1
-            
-            if count % 1_000_000 == 0 and not is_stdout and not quiet:
-                print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+        if label_defs:
+            for seq, is_paired, is_r1, is_r2, labels in stream_inputs_labeled(args, label_defs, tag_map):
+                if npolicy == 'drop' and 'N' in seq.upper():
+                    continue
+                writer.write_record(seq, is_paired, is_r1, is_r2, labels=labels)
+                count += 1
+                if count % 1_000_000 == 0 and not is_stdout and not quiet:
+                    print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+        else:
+            for seq, is_paired, is_r1, is_r2 in stream_inputs(args):
+                if npolicy == 'drop' and 'N' in seq.upper():
+                    continue
+                writer.write_record(seq, is_paired, is_r1, is_r2)
+                count += 1
+                if count % 1_000_000 == 0 and not is_stdout and not quiet:
+                    print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
 
     # ── Optional shuffle pass ─────────────────────────────────────────
     if getattr(args, 'shuffle', False) and not is_stdout:
@@ -591,31 +1028,57 @@ def decode_command(args):
             # --- Decode Loop ---
             counter = 0
             restore_strand = getattr(args, 'restore_strand', False)
+            show_labels = getattr(args, 'labels', False)
+            has_labels = len(reader.header.labels) > 0
 
-            for seq, is_paired, is_r1, is_r2 in reader.records(restore_strand=restore_strand):
-                
-                # --- Strict ID Logic ---
-                # Requirement: Read 1 (or Unpaired) always precedes Read 2.
-                # Increment ID only on new template start.
-                if is_r1 or (not is_paired):
-                    counter += 1
-                
-                # --- Formatting ---
-                suffix = ""
-                if is_r1: suffix = "/1"
-                elif is_r2: suffix = "/2"
-                
-                header_str = f">{rg}:{counter}{suffix}"
-                
-                if mode == "split":
-                    if is_r2:
-                        outs[1].write(f"{header_str}\n{seq}\n")
+            if has_labels and show_labels:
+                for rec in reader.records(restore_strand=restore_strand):
+                    seq, is_paired, is_r1, is_r2, labels = rec
+                    if is_r1 or (not is_paired):
+                        counter += 1
+                    suffix = ""
+                    if is_r1: suffix = "/1"
+                    elif is_r2: suffix = "/2"
+
+                    # Build SAM-style tag string
+                    tag_parts = []
+                    for ldef, val in zip(reader.header.labels, labels):
+                        if ldef.dtype.code in ('f', 'd'):
+                            tag_parts.append(f"{ldef.name}:f:{val}")
+                        elif ldef.dtype.code == 'A':
+                            tag_parts.append(f"{ldef.name}:A:{chr(val)}")
+                        else:
+                            tag_parts.append(f"{ldef.name}:i:{val}")
+                    tag_str = "\t".join(tag_parts)
+                    header_str = f">{rg}:{counter}{suffix}\t{tag_str}"
+
+                    if mode == "split":
+                        if is_r2:
+                            outs[1].write(f"{header_str}\n{seq}\n")
+                        else:
+                            outs[0].write(f"{header_str}\n{seq}\n")
                     else:
-                        # R1 or Unpaired goes to File 1
                         outs[0].write(f"{header_str}\n{seq}\n")
-                else:
-                    # Interleaved (File or Stdout)
-                    outs[0].write(f"{header_str}\n{seq}\n")
+            else:
+                for rec in reader.records(restore_strand=restore_strand):
+                    if has_labels:
+                        seq, is_paired, is_r1, is_r2, _labels = rec
+                    else:
+                        seq, is_paired, is_r1, is_r2 = rec
+                    if is_r1 or (not is_paired):
+                        counter += 1
+                    suffix = ""
+                    if is_r1: suffix = "/1"
+                    elif is_r2: suffix = "/2"
+                    header_str = f">{rg}:{counter}{suffix}"
+
+                    if mode == "split":
+                        if is_r2:
+                            outs[1].write(f"{header_str}\n{seq}\n")
+                        else:
+                            outs[0].write(f"{header_str}\n{seq}\n")
+                    else:
+                        outs[0].write(f"{header_str}\n{seq}\n")
 
     except BrokenPipeError:
         sys.stderr.close()
@@ -657,6 +1120,15 @@ def inspect_command(args):
             method = f"ZSTD (Level {h.compression_level})"
         print(f"Compression:      {method}")
 
+        # Label schema
+        if h.labels:
+            print(f"\nLabels: {len(h.labels)}")
+            for ldef in h.labels:
+                type_info = f"{ldef.dtype.name:<8} ({ldef.dtype.code})"
+                desc_str = f'  "{ldef.description}"' if ldef.description else ""
+                miss_str = f"  [missing={ldef.missing}]" if ldef.missing is not None else ""
+                print(f"  [{ldef.label_id}] {ldef.name:<4}{type_info}{desc_str}{miss_str}")
+
         # Scan Blocks
         block_count = 0
         total_records = 0
@@ -664,7 +1136,8 @@ def inspect_command(args):
         uncompressed_payload = 0
         
         # Seek past header
-        f.seek(_FILE_HEADER_SIZE + len(h.read_group) + len(h.description))
+        label_bytes = len(h.labels) * 89  # 89 bytes per label def
+        f.seek(_FILE_HEADER_SIZE + len(h.read_group) + len(h.description) + label_bytes)
         
         while True:
             b_header = f.read(_BLOCK_HEADER_SIZE)
@@ -795,6 +1268,16 @@ def main():
     comp_group.add_argument("--uncompressed", dest="compress_flag", action="store_false", help="Force uncompressed")
     fmt_group.add_argument("--level", type=int, default=DEFAULT_ZSTD_LEVEL, help="ZSTD level")
 
+    label_group = enc.add_argument_group("Labels")
+    label_group.add_argument("--label-defs", metavar="FILE",
+                             help="Load label definitions from a YAML file")
+    label_group.add_argument("--label", action="append", metavar="NAME:TYPE[:TAG]",
+                             help="Define a label column (repeatable). NAME is stored in ZNA, "
+                                  "TYPE is the dtype (A, c, C, s, S, i, I, f, d, q, Q). "
+                                  "Optional TAG is the SAM tag to parse from input (defaults to NAME).")
+    label_group.add_argument("--label-desc", action="append", metavar="TAG:TEXT",
+                             help="Optional description for label TAG (max 64 chars)")
+
     # --- DECODE ---
     dec = subparsers.add_parser("decode", help="Convert ZNA to FASTA")
     dec.add_argument("input", nargs="?", help="Input .zna file (default: stdin)")
@@ -805,6 +1288,8 @@ def main():
     dec.add_argument("--gzip", action="store_true", help="Force gzip compression (useful for stdout)")
     dec.add_argument("--restore-strand", action="store_true", 
                     help="Restore original strand orientation for antisense reads (reverse complement)")
+    dec.add_argument("--labels", action="store_true",
+                    help="Include label values in output as SAM-style tags")
 
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")

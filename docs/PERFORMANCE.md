@@ -1,61 +1,81 @@
 # ZNA Performance
 
-Benchmarks on Apple Silicon, Python 3.14, February 2026.
-Test dataset: 1M paired-end Illumina reads (150 bp) from chr22 transcriptome simulation, 645.8 MB uncompressed FASTQ.
+Benchmarks on Apple Silicon (M-series), Python 3.12, March 2026.
+
+Test dataset: 25.4M paired-end Illumina reads (150 bp), interleaved FASTQ
+from a simulated HeLa transcriptome (minimap2 aligned), 10.76 GB uncompressed.
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| **Encode** | 165 MB/s |
-| **Decode** | 241 MB/s |
-| **Compression** | 9.10x (default) / 9.44x (512 KB blocks) |
+| **Encode** | 135 MB/s (312 K rec/s) |
+| **Decode** | 626 MB/s (1.44 M rec/s) |
+| **Compression** | 16.5× (default) |
 
 ## Compression Comparison
 
-| Format | File Size | Ratio |
-|--------|-----------|-------|
-| FASTQ (uncompressed) | 645.8 MB | 1.0x |
-| FASTQ.gz | 175 MB | 3.7x |
-| **ZNA (128 KB blocks)** | **71.0 MB** | **9.10x** |
-| **ZNA (512 KB blocks)** | **68.4 MB** | **9.44x** |
-| BAM (typical) | 60–80 MB | 8–10x |
+| Format | Size | Ratio |
+|--------|------|-------|
+| FASTQ (uncompressed) | 10.76 GB | 1.0× |
+| FASTQ.gz | 1.15 GB | 9.4× |
+| ZNA (uncompressed) | 1.05 GB | 10.2× |
+| **ZNA (ZSTD L9, 4 MB blocks)** | **666.8 MB** | **16.5×** |
+| ZNA (ZSTD L9 + 10 labels) | 718.7 MB | 15.3× |
 
 ## Compression Level Tuning
 
-| Level | Encode (MB/s) | Decode (MB/s) | Ratio | Notes |
-|-------|---------------|---------------|-------|-------|
-| 1 | 166 | 242 | 9.09x | Fastest encode |
-| **3** | **165** | **242** | **9.10x** | **Default** |
-| 5 | 159 | 241 | 9.13x | |
-| 9 | 159 | 243 | 9.16x | |
-| 15 | 124 | 237 | 9.29x | Best compression |
+| Level | Encode (MB/s) | Decode (MB/s) | Size | Ratio | Notes |
+|-------|---------------|---------------|------|-------|-------|
+| 1 | 150 | 651 | 716.0 MB | 15.4× | Fastest encode |
+| 3 | 146 | 683 | 696.4 MB | 15.8× | |
+| 5 | 142 | 662 | 674.0 MB | 16.4× | |
+| **9** | **137** | **635** | **666.8 MB** | **16.5×** | **Default** |
+| 15 | 97 | 635 | 664.1 MB | 16.6× | Best compression |
 
-Recommendation: level 3 is the sweet spot; level 15 gains only 2% compression at 25% slower encode.
+Level 9 is the default.  Level 15 gains < 1% compression at 30% slower
+encode.  Level 1 is 10% faster to encode with 7% larger files.
 
 ## Block Size Tuning
 
-| Block Size | Encode (MB/s) | Decode (MB/s) | Ratio |
-|------------|---------------|---------------|-------|
-| 32 KB | 168 | 243 | 9.07x |
-| **128 KB** | **165** | **240** | **9.10x** |
-| **512 KB** | **162** | **243** | **9.44x** |
+| Block Size | Encode (MB/s) | Decode (MB/s) | Size | Ratio |
+|------------|---------------|---------------|------|-------|
+| 512 KB | 136 | 644 | 680.7 MB | 16.2× |
+| 1 MB | 135 | 667 | 675.7 MB | 16.3× |
+| **4 MB** | **137** | **614** | **666.8 MB** | **16.5×** |
+| 8 MB | 133 | 576 | 664.6 MB | 16.6× |
 
-Recommendation: 128 KB for streaming, 512 KB for archival (+3.7% compression, negligible speed cost).
+4 MB blocks (default) balance compression and decode throughput.
+Smaller blocks decode slightly faster but compress less.
+
+## Labeled Encode/Decode (10 SAM tags)
+
+When storing per-sequence labels (NM, ms, AS, nn, tp, cm, s1, s2, de, rl):
+
+| Metric | Plain | Labeled (10 tags) | Overhead |
+|--------|-------|-------------------|----------|
+| Encode | 135 MB/s (312 K rec/s) | 134 MB/s (309 K rec/s) | ~1% |
+| Decode | 626 MB/s (1.44 M rec/s) | 159 MB/s (367 K rec/s) | Labels emitted as text |
+| Size | 666.8 MB | 718.7 MB | +7.8% |
+
+Label encode overhead is negligible thanks to C++ acceleration.  Decode is
+slower when `--labels` is used because SAM-style tag strings are formatted
+and written to the output; decode without `--labels` runs at full speed.
 
 ## Why It's Fast
 
-The columnar format groups homogeneous data streams together, giving ZSTD much better pattern matching:
-- **Flags stream**: paired/single-end patterns compress 500–1000x
-- **Lengths stream**: uniform 150 bp reads compress ~1000x
-- **Sequences stream**: 2-bit DNA data compresses 3–5x
+The columnar format groups homogeneous data streams together, giving ZSTD
+much better pattern matching:
+- **Flags stream**: paired/single-end patterns compress 500–1000×
+- **Lengths stream**: uniform 150 bp reads compress ~1000×
+- **Sequences stream**: 2-bit DNA data compresses 3–5×
+- **Label columns**: contiguous numeric arrays compress efficiently
 
-Remaining hot-path bottleneck is input I/O (~75% of encode time is reading gzipped FASTQ).
+Remaining hot-path bottleneck is input I/O (~75% of encode time is
+reading gzipped FASTQ).
 
 ## Reproducing Benchmarks
 
 ```bash
-python scripts/benchmark_columnar.py --all          # Full suite (~5 min)
-python scripts/benchmark_columnar.py --compression-levels
-python scripts/benchmark_columnar.py --block-sizes
+python scripts/benchmark_perf.py
 ```

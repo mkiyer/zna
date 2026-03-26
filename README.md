@@ -374,6 +374,9 @@ Metadata:
   --read-group TEXT      Read group ID (default: "Unknown")
   --description TEXT     Description string
   --strand-specific      Flag library as strand-specific (default: R1 antisense, R2 sense)
+  --strand-normalize     Enable strand normalization (RC reads to consistent strand).
+                         With --strand-specific: deterministic (antisense reads RC'd).
+                         Without: random RC (for unstranded data).
   --read1-sense          Read 1 represents sense strand
   --read1-antisense      Read 1 represents antisense strand (default when --strand-specific)
   --read2-sense          Read 2 represents sense strand (default when --strand-specific)
@@ -554,6 +557,30 @@ ZNA supports strand-specific RNA-seq libraries by normalizing all reads to sense
 2. **Storage**: All reads stored in sense orientation
 3. **Decoding**: Use `--restore-strand` to recover original orientation
 
+### Strand Normalization
+
+The `--strand-normalize` flag controls whether reads are reverse-complemented
+to a consistent strand during encoding:
+
+- **With `--strand-specific`**: Deterministic normalization — antisense reads
+  are reverse-complemented to sense orientation based on the library protocol.
+  Each read's IS_RC flag records whether it was flipped.
+- **Without `--strand-specific`**: Random reverse-complementing for unstranded
+  data.  Useful for data augmentation in ML training.
+- **Without `--strand-normalize`**: Reads are stored in their original
+  orientation (no reverse-complementing).
+
+```bash
+# Strand-normalized encoding (most common for stranded RNA-seq)
+zna encode R1.fq.gz R2.fq.gz --strand-specific --strand-normalize -o lib.zna
+
+# Decode with original strand orientation restored
+zna decode lib.zna --restore-strand -o original.fasta
+
+# Decode with sense-normalized sequences (for alignment)
+zna decode lib.zna -o normalized.fasta
+```
+
 ### Strand Flags
 
 | Flag | Description |
@@ -590,6 +617,110 @@ zna decode library.zzna -o normalized.fasta
 
 # Decode with original strand orientation restored
 zna decode library.zzna --restore-strand -o original.fasta
+```
+
+---
+
+## Per-Sequence Labels
+
+ZNA can store numeric metadata as compact columnar label columns alongside
+each sequence.  Labels are parsed from key-value tags in FASTQ headers
+(e.g. output from `samtools fastq -T`), but the tag format is not limited
+to SAM — any `KEY:TYPE:VALUE` field in the header will work, and keys
+can be any length.
+
+### Defining Labels on the CLI
+
+```bash
+# Two labels with descriptions
+zna encode reads.fq.gz -o reads.zna \
+  --label NH:C --label AS:i \
+  --label-desc NH:"Number of hits" --label-desc AS:"Alignment score"
+```
+
+The `--label` format is `NAME:TYPE` where TYPE is one of:
+`A`, `c`, `C`, `s`, `S`, `i`, `I`, `f`, `d`, `q`, `Q`.
+Use the smallest type that fits your data to minimize file size.
+
+#### Decoupled Name and Tag
+
+By default, the label **name** (stored in the ZNA header) is also used as
+the **tag** to parse from input.  You can decouple these with the
+3-part format `NAME:TYPE:TAG`:
+
+```bash
+# Store as "edit_dist" in ZNA, but parse "NM" tag from input headers
+zna encode reads.fq.gz -o reads.zna \
+  --label edit_dist:C:NM --label aln_score:i:AS
+
+# Custom long-form tags (not SAM) work too
+zna encode reads.fq.gz -o reads.zna \
+  --label score:i:alignment_score --label edits:C:edit_distance
+```
+
+The `tag` is only used at encode time and is **not stored** in the ZNA file.
+When decoding, the label `name` is used in the output.
+
+### Defining Labels with a YAML File
+
+For many labels, define them in a YAML file instead of many CLI flags:
+
+```bash
+zna encode reads.fq.gz -o reads.zna --label-defs labels.yaml
+```
+
+```yaml
+# labels.yaml
+labels:
+  - name: NM
+    type: C
+    description: Edit distance
+    missing: 255
+  - name: aln_score
+    type: i
+    tag: AS                    # parse "AS" from input, store as "aln_score"
+    description: Alignment score
+    missing: -1
+```
+
+CLI flags `--label` and `--label-desc` **override** values from the YAML
+file, so you can keep a YAML base and tweak individual labels per run.
+
+See [`examples/labels.yaml`](examples/labels.yaml) for a fully-commented
+template.
+
+### Decoding Labeled Files
+
+```bash
+# Include labels as SAM-style tags in the output
+zna decode reads.zna --labels > output.fq
+
+# Inspect to see label definitions
+zna inspect reads.zna
+```
+
+### Python API with Labels
+
+```python
+from zna.core import ZnaHeader, ZnaWriter, ZnaReader
+from zna.dtypes import LabelDef, parse_dtype
+
+defs = (
+    LabelDef(0, "NM", "Edit distance", parse_dtype("C"), missing=255),
+    LabelDef(1, "AS", "Alignment score", parse_dtype("i"), missing=-1),
+)
+header = ZnaHeader(read_group="sample", labels=defs)
+
+with open("out.zna", "wb") as f:
+    with ZnaWriter(f, header) as w:
+        w.write_record("ACGT", is_paired=False,
+                        is_read1=False, is_read2=False,
+                        label_values=(3, 280))
+
+with open("out.zna", "rb") as f:
+    reader = ZnaReader(f)
+    for seq, is_paired, is_r1, is_r2, labels in reader.records_with_labels():
+        print(seq, labels)  # ACGT (3, 280)
 ```
 
 ---

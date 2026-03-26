@@ -5,6 +5,58 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-03-25
+
+### Added
+- **Per-sequence label columns** for storing SAM-tag metadata (alignment scores,
+  edit distances, etc.) alongside compressed sequences
+  - Labels defined via `--label NAME:TYPE` on the CLI (repeatable)
+  - 11 numeric dtypes: `A`, `c`/`C`, `s`/`S`, `i`/`I`, `f`, `d`, `q`/`Q`
+  - Per-label `missing` value for reads where a tag is absent
+  - Columnar storage: each label column packed contiguously per block
+- **Decoupled label name and tag** — label `name` (stored in ZNA, up to 16
+  chars) can differ from the SAM `tag` parsed at encode time
+  - CLI 3-part format: `--label edit_dist:C:NM` (name:type:tag)
+  - YAML: optional `tag` field per label definition
+  - Tag is encode-time only; not stored in the ZNA file
+  - If only name or tag is given, the other defaults to the same value
+- **YAML label specification files** (`--label-defs labels.yaml`)
+  - Define labels, descriptions, dtypes, and missing values in a single file
+  - CLI `--label` / `--label-desc` flags override YAML definitions
+  - Sample template: `examples/labels.yaml`
+- **C++ accelerated label encode/decode** — labeled files now use the C++
+  backend for both encoding and decoding, eliminating the Python fallback
+  - `encode_block_labeled`: encodes sequences + pre-packed label columns in C++
+  - `decode_block_labeled`: decodes sequences and unpacks label columns by dtype
+  - `extract_labels_fast`: zero-allocation C++ SAM-tag extraction from headers
+- **Optimized Python header parsing** (fallback path)
+  - Eliminated `bytes.decode()` calls — `int()`/`float()` accept bytes directly
+  - Replaced lambda dispatch with integer conv-codes
+  - Early-exit when all labels found
+
+### Performance
+- **Labeled encode**: 336K rec/s (was 80K rec/s) — **4.2× faster**
+- **Labeled decode**: 2.23M rec/s (was 610K rec/s) — **3.7× faster**
+- Label overhead reduced from ~39% to within typical I/O variance
+
+### Changed
+- Binary format: label definition on-disk size is now 89 bytes
+  (16 name + 64 desc + 1 dtype_code + 8 missing)
+- `LabelDef.param` replaced by `LabelDef.missing` (explicit missing sentinel)
+- Header field splitting uses any whitespace (tabs and spaces) so fastp
+  `merged_XX_YY` suffixes no longer corrupt trailing tag values
+- Label tag parsing now supports variable-length keys in `KEY:TYPE:VALUE`
+  header fields (not limited to 2-character SAM tags)
+  - Python fallback parser and C++ `extract_labels_fast` use dynamic key parsing
+  - Supports mixed key lengths in the same header (e.g. `NM` + `edit_distance`)
+- Dropped fixstr (`Z`) label type — all labels are numeric
+
+### Documentation
+- Expanded README strand guidance to explicitly document
+  `--strand-normalize` behavior and its interaction with `--strand-specific`
+- Updated label docs and `examples/labels.yaml` to show `name` + `tag`
+  decoupling and custom non-SAM, variable-length header keys
+
 ## [0.2.0] - 2026-03-24
 
 ### Added

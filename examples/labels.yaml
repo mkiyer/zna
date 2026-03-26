@@ -1,0 +1,177 @@
+# =============================================================================
+# ZNA Label Definition File
+# =============================================================================
+#
+# This YAML file defines per-sequence labels that ZNA extracts from
+# key-value tags in FASTQ headers and stores as compact binary columns
+# alongside the sequences.  Tags can be standard 2-character SAM
+# auxiliary tags (from `samtools fastq -T`) or arbitrary custom keys.
+#
+# Usage:
+#
+#   zna encode --label-defs labels.yaml -o output.zna input.fastq
+#
+# CLI flags (--label, --label-desc) can override values from this file.
+# For example, to change just one label's type:
+#
+#   zna encode --label-defs labels.yaml --label AS:s -o output.zna input.fastq
+#
+# =============================================================================
+#
+# SUPPORTED DATA TYPES
+# --------------------
+#
+#   Code  Description                Bytes  Range / Notes
+#   ----  -------------------------  -----  ---------------------------
+#    A    Single character (ASCII)     1    Stored as unsigned byte
+#    c    Signed 8-bit integer         1    -128 .. 127
+#    C    Unsigned 8-bit integer       1    0 .. 255
+#    s    Signed 16-bit integer        2    -32,768 .. 32,767
+#    S    Unsigned 16-bit integer      2    0 .. 65,535
+#    i    Signed 32-bit integer        4    -2^31 .. 2^31-1
+#    I    Unsigned 32-bit integer      4    0 .. 2^32-1
+#    q    Signed 64-bit integer        8    -2^63 .. 2^63-1
+#    Q    Unsigned 64-bit integer      8    0 .. 2^64-1
+#    f    IEEE 754 float (32-bit)      4    ~7 significant digits
+#    d    IEEE 754 double (64-bit)     8    ~15 significant digits
+#
+# CHOOSING A TYPE
+# ---------------
+# Use the smallest type that fits your data to minimize file size.
+# For example, mapping quality (0-255) fits in C (1 byte) rather than i
+# (4 bytes), saving 3 bytes per read.
+#
+# MISSING VALUES
+# --------------
+# When a SAM tag is absent from a read, ZNA writes a sentinel "missing"
+# value.  If you omit the 'missing' key, the default is 0 for integers
+# and 0.0 for floats.  Choose a value outside your data's valid range.
+#
+# For type A (character), specify a single character:
+#   missing: "?"
+#
+# For integer types, specify an integer:
+#   missing: -1
+#   missing: 255      # good for unsigned types when 255 is not a valid value
+#
+# For float/double, specify a number:
+#   missing: -999.0
+#   missing: NaN       # not recommended (NaN != NaN complicates comparisons)
+#
+# NAME vs TAG
+# -----------
+# By default, the label 'name' is also used as the tag to parse from
+# input headers.  You can decouple these by specifying an optional 'tag':
+#
+#   - name: edit_distance            # stored in ZNA header (up to 16 chars)
+#     type: C
+#     tag: NM                        # key to find in input headers
+#
+# Tags can be any length — standard 2-char SAM tags (NM, AS, MQ) or
+# longer custom keys (edit_distance, alignment_score, etc.).
+#
+# If 'tag' is omitted, it defaults to 'name'.  Note: 'tag' is NOT
+# stored in the ZNA file; decoded output uses 'name', not 'tag'.
+#
+# =============================================================================
+
+labels:
+
+  # ---------------------------------------------------------------------------
+  # Alignment quality and scoring
+  # ---------------------------------------------------------------------------
+
+  - name: MQ                        # SAM tag name (2 characters)
+    type: C                         # Unsigned 8-bit (0-255)
+    description: Mapping quality    # Up to 64 characters (optional)
+    missing: 255                    # Sentinel for unmapped reads (optional)
+
+  - name: AS
+    type: s                         # Signed 16-bit
+    description: Alignment score
+    missing: -1
+
+  - name: XS
+    type: s
+    description: Suboptimal alignment score
+    missing: -1
+
+  # ---------------------------------------------------------------------------
+  # Edit distance and mismatches
+  # ---------------------------------------------------------------------------
+
+  - name: NM
+    type: C                         # Usually small; C saves 3 bytes vs i
+    description: Edit distance
+    missing: 255
+
+  - name: nM
+    type: C
+    description: Mismatches per mate
+    missing: 255
+
+  # ---------------------------------------------------------------------------
+  # Mate and pair information
+  # ---------------------------------------------------------------------------
+
+  - name: MC
+    type: C
+    description: Mate CIGAR string length
+    missing: 0
+
+  - name: ms
+    type: s
+    description: Mate alignment score
+    missing: -1
+
+  # ---------------------------------------------------------------------------
+  # Aligner-specific tags (minimap2)
+  # ---------------------------------------------------------------------------
+
+  - name: de
+    type: f                         # 32-bit float
+    description: Per-base divergence from reference
+    missing: -1.0
+
+  - name: tp
+    type: A                         # Single character: P(rimary), S, I
+    description: Alignment type
+    missing: "?"
+
+  - name: cm
+    type: i                         # Signed 32-bit
+    description: Number of minimizer/seed hits
+    missing: -1
+
+  # ---------------------------------------------------------------------------
+  # Name/tag decoupling examples
+  # ---------------------------------------------------------------------------
+  # Give labels descriptive names in ZNA while parsing SAM tags from input.
+
+  - name: edit_distance              # stored as "edit_distance" in ZNA
+    type: C
+    tag: NM                          # parses "NM:i:3" from input headers
+    description: Number of edits to reference
+    missing: 255
+
+  - name: aln_score                  # stored as "aln_score" in ZNA
+    type: i
+    tag: AS                          # parses "AS:i:280" from input headers
+    description: Primary alignment score
+    missing: -1
+
+  # ---------------------------------------------------------------------------
+  # Custom (non-SAM) tag examples
+  # ---------------------------------------------------------------------------
+  # Tags don't have to be 2-char SAM codes.  Any key:type:value field in
+  # the FASTQ header works.
+
+  # - name: gc_content
+  #   type: f
+  #   tag: gc_content                # parses "gc_content:f:0.45" from input
+  #   description: GC fraction of the read
+
+  # - name: batch_id
+  #   type: S
+  #   tag: batch                     # parses "batch:i:7" from input
+  #   description: Processing batch number

@@ -99,10 +99,16 @@ def encode_block(
     do_rc_r1: bool,
     do_rc_r2: bool,
     do_random_rc: bool = False,
-) -> tuple[bytes, bytes, bytes]:
+    label_values: list[list] | None = None,
+    label_defs: list | None = None,
+) -> tuple[bytes, ...]:
     """Batch-encode sequences into columnar byte streams.
 
-    Returns ``(flags_bytes, lengths_bytes, sequences_bytes)``.
+    When *label_values* and *label_defs* are provided, returns a 4-tuple:
+    ``(flags_bytes, labels_bytes, lengths_bytes, sequences_bytes)``.
+
+    Otherwise returns a 3-tuple (backwards-compatible):
+    ``(flags_bytes, lengths_bytes, sequences_bytes)``.
 
     Handles strand normalisation (reverse-complement) and N-policy
     replacement before 2-bit packing.
@@ -179,6 +185,14 @@ def encode_block(
         i += 1
 
     flags_out = bytes(flags)
+
+    if label_values is not None and label_defs is not None:
+        labels_buf = bytearray()
+        for col_values, ldef in zip(label_values, label_defs):
+            fmt = f"<{len(col_values)}{ldef.dtype.struct_ch}"
+            labels_buf.extend(_struct.pack(fmt, *col_values))
+        return flags_out, bytes(labels_buf), bytes(lengths_buf), bytes(seqs_buf)
+
     return flags_out, bytes(lengths_buf), bytes(seqs_buf)
 
 
@@ -199,10 +213,16 @@ def decode_block(
     seqs_data: bytes,
     len_bytes: int,
     count: int,
-) -> list[tuple[str, bool, bool, bool, bool]]:
+    label_columns: list[bytes] | None = None,
+    label_defs: list | None = None,
+) -> list[tuple]:
     """Batch-decode columnar byte streams into record tuples.
 
-    Returns a list of ``(sequence, is_paired, is_read1, is_read2, is_rc)``.
+    When *label_columns* and *label_defs* are provided, returns a list of
+    ``(sequence, is_paired, is_read1, is_read2, is_rc, labels)`` tuples.
+
+    Otherwise returns a list of
+    ``(sequence, is_paired, is_read1, is_read2, is_rc)`` tuples.
     """
     import struct as _struct
 
@@ -218,7 +238,21 @@ def decode_block(
     decode_table = _DECODE_TABLE
     all_decoded = "".join(decode_table[b] for b in seqs_data)
 
-    results: list[tuple[str, bool, bool, bool, bool]] = []
+    # Batch-unpack label columns if present
+    has_labels = label_columns is not None and label_defs is not None
+    decoded_labels: list[tuple | list] | None = None
+    if has_labels:
+        # Unpack each column into a list of values
+        col_values_list: list[tuple | list] = []
+        for col_data, ldef in zip(label_columns, label_defs):
+            fmt = f"<{count}{ldef.dtype.struct_ch}"
+            col_values_list.append(_struct.unpack(fmt, col_data[:count * ldef.dtype.size]))
+        # Transpose: per-column lists → per-record tuples
+        decoded_labels = [
+            tuple(col[i] for col in col_values_list) for i in range(count)
+        ]
+
+    results: list[tuple] = []
     char_offset = 0
     for i in range(count):
         seq_len = lengths[i]
@@ -228,12 +262,22 @@ def decode_block(
         char_offset = char_end
 
         flag = flags_data[i]
-        results.append((
-            seq,
-            bool(flag & 4),  # is_paired
-            bool(flag & 1),  # is_read1
-            bool(flag & 2),  # is_read2
-            bool(flag & 8),  # is_rc
-        ))
+        if has_labels:
+            results.append((
+                seq,
+                bool(flag & 4),  # is_paired
+                bool(flag & 1),  # is_read1
+                bool(flag & 2),  # is_read2
+                bool(flag & 8),  # is_rc
+                decoded_labels[i],
+            ))
+        else:
+            results.append((
+                seq,
+                bool(flag & 4),  # is_paired
+                bool(flag & 1),  # is_read1
+                bool(flag & 2),  # is_read2
+                bool(flag & 8),  # is_rc
+            ))
 
     return results
