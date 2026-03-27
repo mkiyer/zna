@@ -33,6 +33,7 @@ requirements:
   run:
     - python
     - zstandard
+    - pyyaml
 
 test:
   imports:

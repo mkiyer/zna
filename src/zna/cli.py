@@ -1221,16 +1221,20 @@ def main():
     input_group.add_argument("--interleaved", action="store_true", help="Treat input as interleaved paired-end")
     input_group.add_argument("--shuffle", action="store_true", help="Shuffle records after encoding")
     input_group.add_argument("--seed", type=int, default=42, help="Random seed for --shuffle (default: 42)")
+    input_group.add_argument(
+        "--shuffle-buffer-size",
+        type=str,
+        default="1G",
+        help="Max memory per bucket for encode --shuffle (default: 1G). Accepts K/M/G suffixes.",
+    )
     input_group.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
     
-    format_group = input_group.add_mutually_exclusive_group()
-    format_group.add_argument("--fasta", action="store_true", help="Force FASTA format (overrides extension detection)")
-    format_group.add_argument("--fastq", action="store_true", help="Force FASTQ format (overrides extension detection)")
+            shuffle_buffer_bytes = parse_block_size(getattr(args, 'shuffle_buffer_size', '1G'))
     
     meta_group = enc.add_argument_group("Metadata")
     meta_group.add_argument("--read-group", default="Unknown", help="Read Group ID")
     meta_group.add_argument("--description", default="", help="Description string")
-    meta_group.add_argument("--strand-specific", action="store_true", 
+                buffer_bytes=shuffle_buffer_bytes,
                            help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
     meta_group.add_argument("--strand-normalize", action="store_true",
                            help="Enable strand normalization (RC reads to consistent strand). "

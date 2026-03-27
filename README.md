@@ -47,6 +47,9 @@ zna encode sample.fastq.gz -o sample.zna
 # Encode with shuffle (for ML training data)
 zna encode sample.fastq.gz --shuffle -o shuffled.zna
 
+# Encode with shuffle and explicit memory cap per bucket
+zna encode sample.fastq.gz --shuffle --shuffle-buffer-size 512M -o shuffled.zna
+
 # Shuffle an existing ZNA file
 zna shuffle input.zna -o shuffled.zna
 
@@ -367,6 +370,9 @@ Options:
   --interleaved          Treat input as interleaved (auto-detects mixed paired/single reads)
   --shuffle              Shuffle records after encoding (for ML training data)
   --seed N               Random seed for --shuffle (default: 42)
+  --shuffle-buffer-size N
+                         Max memory per bucket for encode --shuffle (default: 1G).
+                         Accepts K/M/G suffixes.
   --fasta                Force FASTA format (overrides extension detection)
   --fastq                Force FASTQ format (overrides extension detection)
 

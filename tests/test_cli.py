@@ -1681,6 +1681,7 @@ class TestShuffle:
         a.npolicy = "drop"
         a.shuffle = True
         a.seed = 42
+        a.shuffle_buffer_size = "1G"
 
         encode_command(a)
 
