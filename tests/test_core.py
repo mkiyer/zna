@@ -661,9 +661,227 @@ class TestUnstrandedNormalization(unittest.TestCase):
                 self.assertFalse(reader.header.strand_specific)
 
 
+class TestStrandSpecificSingleEnd(unittest.TestCase):
+    """Strand-specific normalization of single-end / merged reads.
+
+    A single/merged read carries neither the read1 nor read2 flag. Because a
+    merged read is built in read1's orientation (R1 + revcomp(R2)-tail), it must
+    be normalized with the read1 rule under ``--strand-specific``.
+    """
+
+    def test_single_end_strand_specific_rc(self):
+        """A single/merged read must be RC'd as read1 under strand-specific norm."""
+        header = ZnaHeader(
+            read_group="se_ss",
+            strand_specific=True,
+            read1_antisense=True,   # dUTP: R1 antisense, R2 sense
+            read2_antisense=False,
+            strand_normalized=True,
+        )
+        se = "ACGTACGTACGTACGTAAAA"
+        se_rc = reverse_complement(se)   # "TTTTACGTACGTACGTACGT"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/se_ss.zna"
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(se, False, False, False)   # single
+
+            # Stored orientation (no restore): must be RC'd to sense.
+            with open(path, "rb") as fh:
+                stored = list(ZnaReader(fh).records(restore_strand=False))
+            self.assertEqual(stored[0][0], se_rc)
+
+            # Restore must recover the original.
+            with open(path, "rb") as fh:
+                restored = list(ZnaReader(fh).records(restore_strand=True))
+            self.assertEqual(restored[0][0], se)
+
+    def test_single_end_read1_sense_not_rc(self):
+        """read1-sense protocol: single read is already sense, must be left as-is."""
+        header = ZnaHeader(
+            read_group="se_r1sense",
+            strand_specific=True,
+            read1_antisense=False,   # read1 is sense
+            read2_antisense=True,
+            strand_normalized=True,
+        )
+        se = "ACGTACGTACGTACGTAAAA"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/se_r1sense.zna"
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(se, False, False, False)
+            with open(path, "rb") as fh:
+                stored = list(ZnaReader(fh).records(restore_strand=False))
+            self.assertEqual(stored[0][0], se)   # unchanged
+
+    def test_mixed_se_pe_strand_specific(self):
+        """Merged singles and paired R1 must be normalized to the same (sense) strand."""
+        header = ZnaHeader(
+            read_group="mixed_ss",
+            strand_specific=True,
+            read1_antisense=True,
+            read2_antisense=False,
+            strand_normalized=True,
+        )
+        merged = "ACGTACGTACGTACGTAAAA"
+        r1     = "GGGGCCCCGGGGCCCCAAAA"
+        r2     = "TTTTGGGGTTTTGGGGCCCC"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/mixed_ss.zna"
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    writer.write_record(merged, False, False, False)  # single (read1-like)
+                    writer.write_record(r1, True, True, False)        # pair R1 (antisense)
+                    writer.write_record(r2, True, False, True)        # pair R2 (sense)
+            with open(path, "rb") as fh:
+                stored = list(ZnaReader(fh).records(restore_strand=False))
+            self.assertEqual(stored[0][0], reverse_complement(merged))  # RC'd like R1
+            self.assertEqual(stored[1][0], reverse_complement(r1))      # RC'd
+            self.assertEqual(stored[2][0], r2)                          # kept
+            # round-trip
+            with open(path, "rb") as fh:
+                restored = list(ZnaReader(fh).records(restore_strand=True))
+            self.assertEqual([r[0] for r in restored], [merged, r1, r2])
+
+    def test_encode_block_single_is_rc_strand_specific(self):
+        """encode_block must set IS_RC (0x08) on a single read under do_rc_r1."""
+        flags_out, _, _ = encode_block(
+            ["ACGTACGT"], [0x00], 1, "",   # flag 0x00 = single (no R1/R2/paired bits)
+            True,    # do_rc_r1
+            False,   # do_rc_r2
+            do_random_rc=False,
+        )
+        self.assertTrue(flags_out[0] & 0x08)
+
+    def test_encode_block_single_not_touched_by_read2_rule(self):
+        """A single read must never follow the read2 rule."""
+        flags_out, _, _ = encode_block(
+            ["ACGTACGT"], [0x00], 1, "",
+            False,   # do_rc_r1
+            True,    # do_rc_r2
+            do_random_rc=False,
+        )
+        self.assertFalse(flags_out[0] & 0x08)
+
+    def test_cross_backend_equivalence(self):
+        """Python and C++ backends must produce identical (flags, sequences).
+
+        The stranded single-read rule lives in both _pycodec and _accel; this
+        guards against the two implementations silently drifting.
+        """
+        try:
+            from zna import _accel as accel
+        except ImportError:
+            self.skipTest("C++ accel backend not available")
+        if not hasattr(accel, "encode_block"):
+            self.skipTest("accel.encode_block not available")
+
+        # Deterministic (stranded) branch only — the random-RC branch uses a
+        # different PRNG in each backend and is not expected to match byte-for-byte.
+        seqs = ["ACGTACGTACGTACGTAAAA", "GGGGCCCCGGGGCCCCAAAA", "TTTTGGGGTTTTGGGGCCCC"]
+        flags = [0x00, 0x05, 0x06]  # single, paired R1, paired R2
+        for do_r1, do_r2 in [(True, False), (False, True), (False, False)]:
+            py = encode_block(list(seqs), list(flags), 1, "", do_r1, do_r2, do_random_rc=False)
+            cc = accel.encode_block(list(seqs), list(flags), 1, "", do_r1, do_r2, False)
+            self.assertEqual(bytes(py[0]), bytes(cc[0]),
+                             f"flags differ (do_r1={do_r1}, do_r2={do_r2})")
+            self.assertEqual(bytes(py[-1]), bytes(cc[-1]),
+                             f"sequences differ (do_r1={do_r1}, do_r2={do_r2})")
+
+
+class TestBackendLockstep(unittest.TestCase):
+    """The Python (_pycodec) and C++ (_accel) encoders duplicate non-trivial
+    logic (strand rules, N-policy, 2-bit packing). These tests feed a battery of
+    flag / strand / npolicy / length combinations through both backends and
+    assert byte-identical output, so the two can never silently drift.
+
+    The random-RC branch (``do_random_rc=True`` or ``npolicy='random'``) is
+    excluded: each backend uses a different PRNG, so its output is not expected
+    to match byte-for-byte.
+    """
+
+    def setUp(self):
+        try:
+            from zna import _accel as accel
+        except ImportError:
+            self.skipTest("C++ accel backend not available")
+        if not hasattr(accel, "encode_block"):
+            self.skipTest("accel.encode_block not available")
+        self.accel = accel
+
+    def test_encode_block_battery(self):
+        import itertools
+
+        # Mixed stream: single, paired R1, paired R2, single, and an R1 with no
+        # following R2 — plus varied lengths.
+        clean_seqs = [
+            "ACGTACGTACGTACGTAAAA",  # single
+            "GGGGCCCCGGGGCCCCAAAA",  # paired R1
+            "TTTTGGGGTTTTGGGGCCCC",  # paired R2
+            "ACGT",                  # single (short)
+            "TTTTTTTTTTTTTTTTTTTTTTTTT",  # single (odd length)
+        ]
+        n_seqs = [
+            "ACGTNNNNACGTACGTAAAA",
+            "GGGGCCCCNGGGCCCCAAAA",
+            "NNNNGGGGTTTTGGGGCCCC",
+            "ACNT",
+            "NTTTTTTTTTTTTTTTTTTTTTTTN",
+        ]
+        flags = [0x00, 0x05, 0x06, 0x00, 0x05]  # single, R1, R2, single, lone R1
+
+        strand_rules = [(False, False), (True, False), (False, True), (True, True)]
+        len_bytes_opts = [1, 2, 4]
+        npolicy_opts = ["", "A", "C", "G", "T"]
+
+        for npolicy, len_bytes, (do_r1, do_r2) in itertools.product(
+            npolicy_opts, len_bytes_opts, strand_rules
+        ):
+            seqs = clean_seqs if npolicy == "" else n_seqs
+            py = encode_block(list(seqs), list(flags), len_bytes, npolicy,
+                              do_r1, do_r2, do_random_rc=False)
+            cc = self.accel.encode_block(list(seqs), list(flags), len_bytes, npolicy,
+                                         do_r1, do_r2, False)
+            ctx = f"npolicy={npolicy!r} len_bytes={len_bytes} do_r1={do_r1} do_r2={do_r2}"
+            self.assertEqual(bytes(py[0]), bytes(cc[0]), f"flags differ ({ctx})")
+            self.assertEqual(bytes(py[1]), bytes(cc[1]), f"lengths differ ({ctx})")
+            self.assertEqual(bytes(py[2]), bytes(cc[2]), f"sequences differ ({ctx})")
+
+    def test_labeled_matches_unlabeled_strand_rules(self):
+        """accel.encode_block_labeled must apply the same strand rules as
+        accel.encode_block (both contain a copy of the stranded branch)."""
+        import struct as _struct
+
+        if not hasattr(self.accel, "encode_block_labeled"):
+            self.skipTest("accel.encode_block_labeled not available")
+
+        seqs = ["ACGTACGTACGTACGTAAAA", "GGGGCCCCGGGGCCCCAAAA", "TTTTGGGGTTTTGGGGCCCC"]
+        flags = [0x00, 0x05, 0x06]  # single, paired R1, paired R2
+        n = len(seqs)
+        # One uint8 ('C') label column, all zeros.
+        label_col_data = [_struct.pack(f"<{n}B", *([0] * n))]
+        label_col_sizes = [1]
+
+        for do_r1, do_r2 in [(True, False), (False, True), (False, False)]:
+            unlabeled = self.accel.encode_block(
+                list(seqs), list(flags), 1, "", do_r1, do_r2, False
+            )
+            labeled = self.accel.encode_block_labeled(
+                list(seqs), list(flags), 1, "", do_r1, do_r2, False,
+                label_col_data, label_col_sizes,
+            )
+            # unlabeled: (flags, lengths, seqs); labeled: (flags, labels, lengths, seqs)
+            self.assertEqual(bytes(unlabeled[0]), bytes(labeled[0]),
+                             f"flags differ (do_r1={do_r1}, do_r2={do_r2})")
+            self.assertEqual(bytes(unlabeled[-1]), bytes(labeled[-1]),
+                             f"sequences differ (do_r1={do_r1}, do_r2={do_r2})")
+
+
 class TestNPolicy(unittest.TestCase):
     """Test N-nucleotide handling policies."""
-    
+
     def test_npolicy_replace_with_A(self):
         """Test that N nucleotides are replaced with A."""
         header = ZnaHeader(read_group="test", description="")

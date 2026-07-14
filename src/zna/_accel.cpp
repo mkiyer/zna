@@ -373,13 +373,16 @@ nb::tuple encode_block(
                 flag = static_cast<uint8_t>(flags_out[i]);
             }
         } else {
-            // Deterministic stranded normalization
-            needs_rc = (do_rc_r1 && is_read1) || (do_rc_r2 && is_read2);
+            // Deterministic stranded normalization.
+            // A single/merged read (neither R1 nor R2) is R1-oriented:
+            // normalize it with the read1 rule.
+            bool is_single = !is_read1 && !is_read2;
+            needs_rc = (do_rc_r1 && (is_read1 || is_single)) || (do_rc_r2 && is_read2);
             if (needs_rc) {
                 flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
             }
         }
-        
+
         // Get sequence (possibly reverse complemented)
         const std::string& orig_seq = seqs[i];
         std::string rc_seq;
@@ -638,7 +641,10 @@ nb::tuple encode_block_labeled(
                 flag = static_cast<uint8_t>(flags_out[i]);
             }
         } else {
-            needs_rc = (do_rc_r1 && is_read1) || (do_rc_r2 && is_read2);
+            // A single/merged read (neither R1 nor R2) is R1-oriented:
+            // normalize it with the read1 rule.
+            bool is_single = !is_read1 && !is_read2;
+            needs_rc = (do_rc_r1 && (is_read1 || is_single)) || (do_rc_r2 && is_read2);
             if (needs_rc) {
                 flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
             }

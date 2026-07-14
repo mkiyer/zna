@@ -169,8 +169,12 @@ def encode_block(
                     seq = reverse_complement(seq)
                     flags[i] |= IS_RC_BIT
         else:
-            # Stranded (deterministic) normalization
-            if do_rc_r1 and is_read1:
+            # Stranded (deterministic) normalization.
+            # A single/merged read carries neither read1 nor read2. It is
+            # read1-oriented (a merged read is R1 + revcomp(R2)-tail), so
+            # normalize it with the read1 rule.
+            is_single = not is_read1 and not is_read2
+            if do_rc_r1 and (is_read1 or is_single):
                 seq = reverse_complement(seq)
                 flags[i] |= IS_RC_BIT
             elif do_rc_r2 and is_read2:

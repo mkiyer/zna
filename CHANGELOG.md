@@ -5,6 +5,30 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-13
+
+### Fixed
+- Strand normalization now treats single-end / merged reads as **read1** under
+  `--strand-specific`. Previously such reads were never reverse-complemented, leaving
+  merged reads (e.g. from fastp's mixed interleaved output) on the opposite strand from
+  the normalized paired read1 records. Decoding and already-encoded files are unaffected;
+  only new strand-specific encodes of single reads change.
+
+### Added
+- `zna inspect --counts` reports per-flag record counts (paired R1, paired R2,
+  single/merged, and reverse-complemented). Useful for validating mixed
+  paired-end + single-end interleaved streams. The default header-only scan is
+  unchanged; `--counts` reads block payloads (decoding only the flags column).
+- Encode-time warning when `--strand-normalize` is combined with
+  `--strand-specific` but neither read1 nor read2 is antisense — a configuration
+  in which no read would ever be reverse-complemented (suppressed by `-q`).
+
+### Internal
+- Added a cross-backend lockstep test suite asserting the Python (`_pycodec`)
+  and C++ (`_accel`) encoders produce byte-identical output across a battery of
+  flag / strand / N-policy / length combinations, guarding against drift in the
+  duplicated encode logic.
+
 ## [0.3.0] - 2026-03-25
 
 ### Added

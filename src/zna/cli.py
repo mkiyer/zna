@@ -913,6 +913,22 @@ def encode_command(args):
         labels=label_defs,
     )
 
+    # Warn on a strand-normalization config that would normalize nothing:
+    # strand-specific + normalize but neither read1 nor read2 flagged antisense
+    # means do_rc_r1, do_rc_r2 (and the single/read1 rule) are all off, so no
+    # read is ever reverse-complemented. Usually a misconfigured protocol.
+    quiet = hasattr(args, 'quiet') and args.quiet
+    if (header.strand_normalized and header.strand_specific
+            and not header.read1_antisense and not header.read2_antisense
+            and not quiet):
+        print(
+            "[Warning] --strand-normalize with --strand-specific but neither read1 "
+            "nor read2 is antisense: no reads will be reverse-complemented. "
+            "Did you mean to keep the default --read1-antisense (dUTP), or to drop "
+            "--strand-specific for unstranded random normalization?",
+            file=sys.stderr,
+        )
+
     if not is_stdout:
         c_str = f"ZSTD (L{comp_level})" if should_compress else "None"
         if not is_reencoding:
@@ -922,7 +938,6 @@ def encode_command(args):
 
     # Encode Loop
     count = 0
-    quiet = hasattr(args, 'quiet') and args.quiet
     # Use ExitStack to safely close output file (or leave stdout open)
     npolicy = getattr(args, 'npolicy', None)
     block_size = parse_block_size(args.block_size)
@@ -1134,31 +1149,66 @@ def inspect_command(args):
         total_records = 0
         compressed_payload = 0
         uncompressed_payload = 0
-        
+
+        # Optionally tally per-flag record counts. This requires reading and
+        # (partially) decompressing block payloads — the flags column is stored
+        # first, so only its bytes need to be decoded per block.
+        count_flags = getattr(args, 'counts', False)
+        n_paired_r1 = n_paired_r2 = n_single = n_rc = 0
+        dctx = None
+        if count_flags and h.compression_method == COMPRESSION_ZSTD:
+            import zstandard
+            dctx = zstandard.ZstdDecompressor()
+
         # Seek past header
         label_bytes = len(h.labels) * 89  # 89 bytes per label def
         f.seek(_FILE_HEADER_SIZE + len(h.read_group) + len(h.description) + label_bytes)
-        
+
         while True:
             b_header = f.read(_BLOCK_HEADER_SIZE)
             if not b_header: break
             if len(b_header) < _BLOCK_HEADER_SIZE: break
-            
+
             c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(
                 _BLOCK_HEADER_FMT, b_header
             )
-            
+
             block_count += 1
             total_records += n_recs
             compressed_payload += c_size
             uncompressed_payload += u_size
-            
-            f.seek(c_size, 1)
+
+            if count_flags:
+                # Flags are the first column in the payload; decode just those.
+                if dctx is not None:
+                    comp = f.read(c_size)
+                    reader = dctx.stream_reader(comp)
+                    flags_bytes = reader.read(flags_size)
+                else:
+                    flags_bytes = f.read(flags_size)
+                    f.seek(c_size - flags_size, 1)
+                for fl in flags_bytes:
+                    if fl & 8:  # IS_RC
+                        n_rc += 1
+                    if fl & 1:  # IS_READ1
+                        n_paired_r1 += 1
+                    elif fl & 2:  # IS_READ2
+                        n_paired_r2 += 1
+                    else:
+                        n_single += 1
+            else:
+                f.seek(c_size, 1)
 
         print("\n--- Content Statistics ---")
         print(f"Total Blocks:       {block_count}")
         print(f"Total Records:      {total_records}")
-        
+
+        if count_flags:
+            print(f"  Paired R1:        {n_paired_r1}")
+            print(f"  Paired R2:        {n_paired_r2}")
+            print(f"  Single/merged:    {n_single}")
+            print(f"  Reverse-comp'd:   {n_rc}")
+
         if compressed_payload > 0:
              print(f"Compressed Payload: {compressed_payload / (1024*1024):.2f} MB")
              print(f"Uncompressed Data:  {uncompressed_payload / (1024*1024):.2f} MB")
@@ -1229,12 +1279,10 @@ def main():
     )
     input_group.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
     
-            shuffle_buffer_bytes = parse_block_size(getattr(args, 'shuffle_buffer_size', '1G'))
-    
     meta_group = enc.add_argument_group("Metadata")
     meta_group.add_argument("--read-group", default="Unknown", help="Read Group ID")
     meta_group.add_argument("--description", default="", help="Description string")
-                buffer_bytes=shuffle_buffer_bytes,
+    meta_group.add_argument("--strand-specific", action="store_true",
                            help="Flag library as strand-specific (default: R1 antisense, R2 sense)")
     meta_group.add_argument("--strand-normalize", action="store_true",
                            help="Enable strand normalization (RC reads to consistent strand). "
@@ -1298,6 +1346,10 @@ def main():
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")
     insp.add_argument("input", help="Input .zna file")
+    insp.add_argument("--counts", action="store_true",
+                      help="Report per-flag record counts (paired R1/R2, single/merged, "
+                           "reverse-complemented). Reads block payloads, so slower than the "
+                           "default header-only scan.")
 
     # --- SHUFFLE ---
     shuf = subparsers.add_parser("shuffle", help="Shuffle records in a ZNA file")

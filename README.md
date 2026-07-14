@@ -218,6 +218,11 @@ zna encode fastp_output.fastq --interleaved -o mixed.zna
 - No suffix: treated as single-end unless next read has matching base name
 - Comments ignored: `read1/1 merged_length:150` extracts `read1/1`
 
+**Strand normalization of merged/single reads:** single-end reads (including merged
+reads with no mate) are treated as **read1** for strand normalization. Under
+`--strand-specific`, a single read is reverse-complemented exactly when read1 is
+antisense, so merged reads end up on the same strand as normalized paired R1 reads.
+
 #### Advanced Options
 
 ```bash
@@ -428,9 +433,12 @@ Display ZNA file statistics.
 **Usage:**
 
 ```
-zna inspect FILE
+zna inspect FILE [--counts]
 
   input FILE             Input ZNA file to inspect
+  --counts               Also report per-flag record counts (paired R1, paired R2,
+                         single/merged, reverse-complemented). Reads block payloads,
+                         so slower than the default header-only scan.
 ```
 
 ### `zna shuffle`
