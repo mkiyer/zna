@@ -137,7 +137,10 @@ ZNA files use a binary format optimized for nucleic acid sequences:
 ### Record Format
 
 Each record in a block contains:
-- **Flags** (1 byte): IS_READ1, IS_READ2, IS_PAIRED
+- **Flags** (1 byte): IS_READ1 (bit 0), IS_READ2 (bit 1), IS_PAIRED (bit 2),
+  IS_RC (bit 3 — set when strand normalization reverse-complemented this record),
+  IS_FULL_FRAGMENT (bit 4 — the record spans its whole fragment, so *both* edges
+  are true fragment boundaries). Bits 5-7 are reserved.
 - **Length** (1-4 bytes): Sequence length (configurable)
 - **Sequence** (variable): 2-bit encoded bases
 
@@ -595,6 +598,99 @@ zna decode lib.zna --restore-strand -o original.fasta
 zna decode lib.zna -o normalized.fasta
 ```
 
+### Unstranded Normalization and Fragment Geometry
+
+Unstranded normalization does more than augment the data: it carries information
+about the molecule that cannot be reconstructed afterwards.
+
+A fastp-style FR pair covers the two ends of one fragment, pointing inward:
+
+```
+    fragment, length L
+    |------------------------------------------------|
+    |>>>>>>>>>>>|                        |<<<<<<<<<<<<|
+     R1 as sequenced                      R2 as sequenced
+     = F[0:l1]                            = revcomp(F[L-l2:L])
+```
+
+As sequenced the mates are in *opposite* frames.  Normalization
+reverse-complements **exactly one** of them so both land in one common frame,
+and records which one in that record's `IS_RC` flag:
+
+```
+    common frame after normalization
+    |------------------------------------------------|
+    |<<<<<<<<<<<|                        |<<<<<<<<<<<<|
+     not RC'd                             RC'd
+     LEFT edge  = real fragment boundary  RIGHT edge = real fragment boundary
+     right edge = read-length cutoff      left edge  = read-length cutoff
+```
+
+**The invariant:** whichever mate was reverse-complemented ends up at the right
+of the common frame, so its **right** edge is the real fragment boundary and its
+left edge is a read-length cutoff.  For the other mate it is the mirror image.
+
+`IS_RC` is the only thing that distinguishes the two cases, and **it cannot be
+recovered from the sequence**.  Reverse-complementing the right-hand mate
+reproduces the fragment-frame sequence exactly, because that mate was stored
+reverse-complemented to begin with — there is no residue in the bases to test.
+The coin is also independent of the mate number, so `is_read1` is not a
+substitute for it.
+
+**Reading the geometry.** Use `records(with_ends=True)`, which answers the
+question directly instead of making you re-derive it:
+
+```python
+with open("lib.zna", "rb") as f:
+    reader = ZnaReader(f)
+    for seq, is_paired, is_read1, is_read2, has_start, has_end in \
+            reader.records(with_ends=True):
+        # has_start: the LEFT edge of seq is a true fragment boundary
+        # has_end:   the RIGHT edge is
+        ...
+```
+
+`records(with_rc=True)` exposes the raw `IS_RC` flag instead, if you want the
+orientation itself rather than the boundary geometry.
+
+**A record can have two real ends.** When the insert is at or below the read
+length — every overlap-merged read, and any pair after adapter trimming — the
+record spans the *whole* fragment and both edges are true boundaries. `IS_RC`
+names only one edge, so that case is carried by a separate flag,
+`IS_FULL_FRAGMENT`, which `with_ends` folds in for you. Full-overlap **pairs**
+are detected automatically at encode time (mates covering the same interval are
+exact reverse complements); for **unpaired** records the encoder cannot tell a
+merged read from a genuine single-end read, so declare it:
+
+```bash
+# reads from an overlap merger: unpaired records span their whole fragment
+zna encode --interleaved --treat-unpaired-as-merged -o out.zna merged.fq.gz
+```
+
+Without the flag an unpaired record is assumed to have one real edge, which is
+the safe reading — a tool marking fragment ends will under-label rather than
+place a marker at an interior position.
+
+`restore_strand=True` is not a substitute: it *consumes* the flag to undo the
+reverse-complement and hand back original-orientation reads.  A caller that
+wants the normalized frame *and* the boundary geometry needs `with_rc`, and the
+two options are mutually exclusive.
+
+**Normalization happens once, at encode time, and is not idempotent.** Applying
+it a second time returns the data to an un-normalized state while the header
+still reports `strand_normalized`.  So anything that copies records between ZNA
+files — `zna encode` on a `.zna` input, `zna shuffle` — copies the existing
+orientation rather than re-deriving it.  In the Python API that is
+`ZnaWriter(..., preserve_normalization=True)` fed from `records(with_rc=True)`:
+
+```python
+# A lossless ZNA -> ZNA copy.
+with open("in.zna", "rb") as fin, open("out.zna", "wb") as fout:
+    reader = ZnaReader(fin)
+    with ZnaWriter(fout, reader.header, preserve_normalization=True) as writer:
+        writer.write_records(reader.records(with_ends=True))
+```
+
 ### Strand Flags
 
 | Flag | Description |
@@ -729,13 +825,18 @@ with open("out.zna", "wb") as f:
     with ZnaWriter(f, header) as w:
         w.write_record("ACGT", is_paired=False,
                         is_read1=False, is_read2=False,
-                        label_values=(3, 280))
+                        labels=(3, 280))
 
 with open("out.zna", "rb") as f:
     reader = ZnaReader(f)
-    for seq, is_paired, is_r1, is_r2, labels in reader.records_with_labels():
+    for seq, is_paired, is_r1, is_r2, labels in reader.records():
         print(seq, labels)  # ACGT (3, 280)
 ```
+
+Labeled files yield a 5-tuple ending in `labels`.  With `with_rc=True` the
+`is_rc` flag is inserted *before* it — `(seq, is_paired, is_read1, is_read2,
+is_rc, labels)` — so that the unlabeled and labeled tuples agree on where
+`is_rc` lives.
 
 ---
 
@@ -801,6 +902,21 @@ with open("output.zzna", "rb") as f:
     for seq, is_paired, is_read1, is_read2 in reader.records():
         print(seq)
 ```
+
+`records()` yields a 4-tuple, or a 5-tuple ending in `labels` for labeled files.
+Two options change what it yields:
+
+| Option | Yields | Purpose |
+|--------|--------|---------|
+| *(default)* | `(seq, is_paired, is_read1, is_read2)` | stored orientation |
+| `restore_strand=True` | same 4-tuple | undoes strand normalization, returning original-orientation reads |
+| `with_rc=True` | `(seq, is_paired, is_read1, is_read2, is_rc)` | stored orientation plus the per-record `IS_RC` flag |
+| `with_ends=True` | `(seq, is_paired, is_read1, is_read2, has_start, has_end)` | which edges are true fragment boundaries; also the lossless form for copying |
+
+The options are mutually exclusive: `restore_strand` consumes the orientation,
+`with_rc` returns it raw, and `with_ends` returns what it means.  See
+[Unstranded Normalization and Fragment Geometry](#unstranded-normalization-and-fragment-geometry)
+for what `is_rc` means and why it cannot be derived from the sequence.
 
 ---
 

@@ -1,3 +1,5 @@
+import contextlib
+import random
 import sys
 import tempfile
 import unittest
@@ -5,6 +7,8 @@ from pathlib import Path
 from zna.core import ZnaHeader, write_zna, read_zna, ZnaWriter, ZnaReader, COMPRESSION_ZSTD, COMPRESSION_NONE
 from zna import reverse_complement
 from zna._pycodec import encode_block, decode_block
+from zna._shuffle import shuffle_zna
+from zna.dtypes import LabelDef, DTYPE_BY_CODE
 
 
 
@@ -789,6 +793,480 @@ class TestStrandSpecificSingleEnd(unittest.TestCase):
                              f"flags differ (do_r1={do_r1}, do_r2={do_r2})")
             self.assertEqual(bytes(py[-1]), bytes(cc[-1]),
                              f"sequences differ (do_r1={do_r1}, do_r2={do_r2})")
+
+
+class TestRcFlagAndReencode(unittest.TestCase):
+    """The unstranded fragment-boundary contract, and the pass-through writer.
+
+    Unstranded normalization reverse-complements exactly one mate of an FR pair
+    so both land in a common frame, and records which one in ``IS_RC``.  That
+    flag is the only record of which edge of a mate is a real fragment boundary:
+    it cannot be recovered from the sequence, because reverse-complementing the
+    right-hand mate reproduces the fragment-frame sequence exactly.
+
+    These tests pin both halves — that readers can see the flag, and that
+    re-encoding a normalized file *copies* orientation instead of applying it a
+    second time.  Orientation is not idempotent.
+    """
+
+    FRAG_LEN = 300
+    READ_LEN = 100
+    N_PAIRS = 200
+
+    def setUp(self):
+        rng = random.Random(20260811)
+        self.frags = [
+            "".join(rng.choice("ACGT") for _ in range(self.FRAG_LEN))
+            for _ in range(self.N_PAIRS)
+        ]
+
+    # -- helpers -------------------------------------------------------------
+
+    def _as_sequenced(self):
+        """An FR pair as it comes off the sequencer: the mates point inward, so
+        they are in *opposite* frames until normalization puts them in one."""
+        L, R = self.FRAG_LEN, self.READ_LEN
+        records = []
+        for f in self.frags:
+            records.append((f[:R], True, True, False))
+            records.append((reverse_complement(f[L - R:]), True, False, True))
+        return records
+
+    def _unstranded_header(self, rg="unstranded"):
+        return ZnaHeader(read_group=rg, strand_specific=False, strand_normalized=True)
+
+    def _write(self, tmpdir, name, records, header, preserve=False):
+        path = f"{tmpdir}/{name}"
+        with open(path, "wb") as fh:
+            with ZnaWriter(fh, header, preserve_normalization=preserve) as writer:
+                for rec in records:
+                    writer.write_record(
+                        rec[0], rec[1], rec[2], rec[3],
+                        is_rc=(rec[4] if preserve and len(rec) > 4 else False),
+                    )
+        return path
+
+    def _read(self, path, **kwargs):
+        with open(path, "rb") as fh:
+            return list(ZnaReader(fh).records(**kwargs))
+
+    def _co_oriented(self, records):
+        """Count pairs whose mates sit in the same frame — what normalization
+        achieves, and what a second normalization pass destroys."""
+        L, R = self.FRAG_LEN, self.READ_LEN
+        n = 0
+        for i, f in enumerate(self.frags):
+            a, b = records[2 * i][0], records[2 * i + 1][0]
+            if (a == f[:R]) == (b == f[L - R:]):
+                n += 1
+        return n
+
+    @contextlib.contextmanager
+    def _force_backend(self, name):
+        """Force the codec backend.
+
+        ``zna.core`` resolves its backend at *import* time, so patching
+        ``zna.codec`` afterwards has no effect — the module globals are what
+        must be swapped.
+        """
+        import zna.core as core
+        from zna.codec import get_backend
+        saved_codec, saved_accel = core._codec, core._accel_mod
+        try:
+            core._codec = get_backend(name)
+            core._accel_mod = saved_accel if name == "accel" else None
+            yield
+        finally:
+            core._codec, core._accel_mod = saved_codec, saved_accel
+
+    def _require_accel(self):
+        from zna.codec import available_backends
+        if "accel" not in available_backends():
+            self.skipTest("C++ accel backend not available")
+
+    # -- defect B: re-encoding must not normalize twice ----------------------
+
+    def test_reencode_preserves_co_orientation(self):
+        """Regression test for the re-encode bug.
+
+        Before the pass-through writer, every re-encode reverse-complemented one
+        mate of each pair *again*, toggling co-orientation on each pass while the
+        header still claimed the file was normalized and every record still
+        carried an IS_RC bit.  Nothing downstream could detect it.
+        """
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p1 = self._write(tmpdir, "p1.zna", self._as_sequenced(), header)
+            r1 = self._read(p1, with_rc=True)
+            self.assertEqual(self._co_oriented(r1), self.N_PAIRS, "encode")
+
+            p2 = self._write(tmpdir, "p2.zna", r1, header, preserve=True)
+            r2 = self._read(p2, with_rc=True)
+            self.assertEqual(self._co_oriented(r2), self.N_PAIRS, "re-encode")
+
+            p3 = self._write(tmpdir, "p3.zna", r2, header, preserve=True)
+            r3 = self._read(p3, with_rc=True)
+            self.assertEqual(self._co_oriented(r3), self.N_PAIRS, "re-encode twice")
+
+    def test_reencode_is_record_identical(self):
+        """A re-encode is a faithful copy: same sequences, same IS_RC flags.
+
+        Compression framing may differ, so this compares decoded records rather
+        than file bytes.
+        """
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p1 = self._write(tmpdir, "p1.zna", self._as_sequenced(), header)
+            r1 = self._read(p1, with_rc=True)
+            p2 = self._write(tmpdir, "p2.zna", r1, header, preserve=True)
+            r2 = self._read(p2, with_rc=True)
+            p3 = self._write(tmpdir, "p3.zna", r2, header, preserve=True)
+            r3 = self._read(p3, with_rc=True)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r2, r3)
+
+    def test_write_records_pass_through(self):
+        """``records(with_rc=True)`` feeds ``write_records`` directly, which is
+        what makes a lossless ZNA to ZNA copy expressible at all."""
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._write(tmpdir, "src.zna", self._as_sequenced(), header)
+            original = self._read(src, with_rc=True)
+            dst = f"{tmpdir}/dst.zna"
+            with open(dst, "wb") as fh:
+                write_zna(fh, header, original, preserve_normalization=True)
+            self.assertEqual(self._read(dst, with_rc=True), original)
+
+    def test_write_records_rejects_records_without_rc(self):
+        """Feeding a normalized copy from plain ``records()`` must not silently
+        clear every IS_RC bit — the orientation would be lost with no error."""
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._write(tmpdir, "src.zna", self._as_sequenced(), header)
+            plain = self._read(src)                      # 4-tuples: no is_rc
+            with open(f"{tmpdir}/dst.zna", "wb") as fh:
+                with self.assertRaises(ValueError):
+                    write_zna(fh, header, plain, preserve_normalization=True)
+
+            # An un-normalized output has no orientation to carry, so the plain
+            # 4-tuple form stays valid there.
+            plain_header = ZnaHeader(read_group="plain")
+            with open(f"{tmpdir}/plain.zna", "wb") as fh:
+                write_zna(fh, plain_header, plain, preserve_normalization=True)
+            self.assertEqual(
+                [rec[0] for rec in self._read(f"{tmpdir}/plain.zna")],
+                [rec[0] for rec in plain],
+            )
+
+    def test_is_rc_requires_preserve_normalization(self):
+        """Supplying IS_RC to a deriving writer would double-normalize."""
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}/x.zna", "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    with self.assertRaises(ValueError):
+                        writer.write_record("ACGTACGT", True, True, False, is_rc=True)
+
+    def test_stranded_reencode_is_stable(self):
+        """The deterministic mirror of the unstranded bug.
+
+        Under ``--strand-specific`` the writer reverse-complements read1 (dUTP
+        default).  Doing that a second time returns read1 to its original
+        orientation, silently *un*-normalizing a strand-specific file.
+        """
+        def header():
+            return ZnaHeader(
+                read_group="ss",
+                strand_specific=True,
+                read1_antisense=True,    # dUTP: R1 antisense, R2 sense
+                read2_antisense=False,
+                strand_normalized=True,
+            )
+
+        r1, r2 = "ACGTACGTACGTACGTAAAA", "TTTTGGGGTTTTGGGGCCCC"
+        records = [(r1, True, True, False), (r2, True, False, True)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p1 = self._write(tmpdir, "ss1.zna", records, header())
+            first = self._read(p1, with_rc=True)
+            self.assertEqual(first[0][0], reverse_complement(r1))   # R1 flipped to sense
+            self.assertTrue(first[0][4])
+            self.assertEqual(first[1][0], r2)                       # R2 already sense
+            self.assertFalse(first[1][4])
+
+            p2 = self._write(tmpdir, "ss2.zna", first, header(), preserve=True)
+            self.assertEqual(self._read(p2, with_rc=True), first)
+
+            # ...and the round-trip back to original orientation still works.
+            self.assertEqual([r[0] for r in self._read(p2, restore_strand=True)], [r1, r2])
+
+    def test_shuffle_preserves_rc_geometry(self):
+        """A shuffle is a permutation, so orientation must survive it untouched.
+
+        ``shuffle_zna`` writes through two ZnaWriters (buckets, then output).
+        When those re-derived orientation they applied two further random
+        reverse-complements: co-orientation survived by parity, so the file
+        looked fine, but IS_RC ended up uncorrelated with the fragment boundary.
+        """
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._write(tmpdir, "src.zna", self._as_sequenced(), header)
+            before = {rec[0]: rec[4] for rec in self._read(src, with_rc=True)}
+            out = f"{tmpdir}/shuffled.zna"
+            # A small buffer forces many buckets, which is where re-deriving
+            # orientation diverged even on the accel backend.
+            shuffle_zna(src, out, seed=3, buffer_bytes=1024, quiet=True)
+            after = self._read(out, with_rc=True)
+
+        self.assertEqual(len(after), 2 * self.N_PAIRS)
+        self.assertEqual({rec[0] for rec in after}, set(before))
+        for rec in after:
+            self.assertEqual(rec[4], before[rec[0]], "IS_RC must survive a shuffle")
+
+    def test_shuffle_preserves_rc_and_labels(self):
+        """The labeled shuffle path is a separate set of write sites.
+
+        ``_shuffle`` has one write call per (paired/single x labeled/unlabeled)
+        combination, and the labeled ones are exactly where ``labels`` moved
+        from tuple index 4 to index 5. Without this test, dropping ``is_rc``
+        from the labeled sites passes the whole suite.
+        """
+        labels = (
+            LabelDef(label_id=0, name="score", description="",
+                     dtype=DTYPE_BY_CODE['i'], missing=0),
+            LabelDef(label_id=1, name="qual", description="",
+                     dtype=DTYPE_BY_CODE['C'], missing=0),
+        )
+        header = ZnaHeader(read_group="labshuf", strand_specific=False,
+                           strand_normalized=True, labels=labels)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.zna"
+            with open(src, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for i, rec in enumerate(self._as_sequenced()):
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                            labels=(i, i % 251))
+            before = {rec[0]: (rec[4], rec[5]) for rec in self._read(src, with_rc=True)}
+
+            out = f"{tmpdir}/shuffled.zna"
+            shuffle_zna(src, out, seed=11, buffer_bytes=1024, quiet=True)
+            after = self._read(out, with_rc=True)
+
+        self.assertEqual(len(after), 2 * self.N_PAIRS)
+        self.assertEqual({rec[0] for rec in after}, set(before))
+        for rec in after:
+            is_rc, labs = before[rec[0]]
+            self.assertEqual(rec[4], is_rc, "IS_RC must survive a labeled shuffle")
+            self.assertEqual(rec[5], labs, "labels must stay with their sequence")
+        # The flag must still be doing real work, not uniformly False.
+        self.assertEqual(sum(rec[4] for rec in after), self.N_PAIRS)
+
+    def test_full_fragment_survives_reencode_and_shuffle(self):
+        """IS_FULL_FRAGMENT must ride through every copy path.
+
+        Silently clearing it would downgrade full-fragment records to one-ended
+        ones — lost supervision rather than corruption, and invisible.
+        """
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.zna"
+            with open(src, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for i, rec in enumerate(self._as_sequenced()):
+                        # mark every 3rd record as spanning its whole fragment
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                            is_full_fragment=(i % 3 == 0))
+            before = {r[0]: (r[4], r[5]) for r in self._read(src, with_ends=True)}
+            n_full = sum(1 for v in before.values() if v == (True, True))
+            self.assertGreater(n_full, 0)
+
+            # 1. re-encode through the pass-through writer
+            copied = f"{tmpdir}/copy.zna"
+            with open(copied, "wb") as fh:
+                write_zna(fh, header, self._read(src, with_ends=True),
+                          preserve_normalization=True)
+            self.assertEqual(self._read(copied, with_ends=True),
+                             self._read(src, with_ends=True))
+
+            # 2. shuffle
+            out = f"{tmpdir}/shuf.zna"
+            shuffle_zna(src, out, seed=5, buffer_bytes=1024, quiet=True)
+            after = self._read(out, with_ends=True)
+
+        self.assertEqual({r[0] for r in after}, set(before))
+        for rec in after:
+            self.assertEqual((rec[4], rec[5]), before[rec[0]],
+                             "fragment-span flag must survive a shuffle")
+        self.assertEqual(sum(1 for r in after if r[4] and r[5]), n_full)
+
+    # -- defect A: the flag must reach the caller ----------------------------
+
+    def test_records_with_rc_exposes_the_flag(self):
+        """Exactly one mate of each unstranded pair is marked IS_RC."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write(tmpdir, "rc.zna", self._as_sequenced(), self._unstranded_header())
+            records = self._read(path, with_rc=True)
+
+        self.assertEqual(len(records), 2 * self.N_PAIRS)
+        n_r1_rc = 0
+        for i in range(self.N_PAIRS):
+            a, b = records[2 * i], records[2 * i + 1]
+            self.assertEqual(len(a), 5)
+            self.assertNotEqual(a[4], b[4], f"pair {i}: exactly one mate must be RC'd")
+            n_r1_rc += a[4]
+        # The coin is independent of the mate number — which is precisely why a
+        # consumer cannot guess the flag from is_read1.
+        self.assertGreater(n_r1_rc, 0)
+        self.assertLess(n_r1_rc, self.N_PAIRS)
+
+    def test_rc_flag_identifies_the_boundary_edge(self):
+        """The claim consumers actually rely on, as a contract rather than folklore.
+
+        In the normalized common frame the RC'd mate's RIGHT edge is the real
+        fragment boundary and its left edge is a read-length truncation; for the
+        other mate it is the mirror image.  A consumer placing end-of-sequence
+        supervision writes ``has_eos = is_rc`` and ``has_sos = not is_rc``.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write(tmpdir, "geom.zna", self._as_sequenced(), self._unstranded_header())
+            records = self._read(path, with_rc=True)
+
+        for i, frag in enumerate(self.frags):
+            m1, m2 = records[2 * i], records[2 * i + 1]
+            rc_mate, keep_mate = (m1, m2) if m1[4] else (m2, m1)
+
+            # The common frame is whichever of F / revcomp(F) the mates landed in.
+            frame = frag if frag.startswith(keep_mate[0]) else reverse_complement(frag)
+            self.assertEqual(len(frame), self.FRAG_LEN)
+
+            # Not RC'd: its LEFT edge is the real fragment boundary.
+            self.assertTrue(frame.startswith(keep_mate[0]), f"pair {i}: SOS edge")
+            # RC'd: its RIGHT edge is the real fragment boundary.
+            self.assertTrue(frame.endswith(rc_mate[0]), f"pair {i}: EOS edge")
+
+            # The opposite edges are read-length cutoffs, not boundaries: the
+            # molecule demonstrably continues past them.
+            self.assertFalse(frame.endswith(keep_mate[0]), f"pair {i}")
+            self.assertFalse(frame.startswith(rc_mate[0]), f"pair {i}")
+
+    def test_records_default_width_unchanged(self):
+        """The default tuple width is a compatibility promise: 4, or 5 labeled.
+
+        ``with_rc`` is opt-in and inserts ``is_rc`` at index 4, before labels.
+        """
+        labels = (LabelDef(label_id=0, name="score", description="",
+                           dtype=DTYPE_BY_CODE['i'], missing=0),)
+        plain = self._unstranded_header()
+        labeled = ZnaHeader(read_group="lab", strand_specific=False,
+                            strand_normalized=True, labels=labels)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_plain = f"{tmpdir}/plain.zna"
+            with open(p_plain, "wb") as fh:
+                with ZnaWriter(fh, plain) as writer:
+                    writer.write_record("ACGTACGT", True, True, False)
+                    writer.write_record("TTTTGGGG", True, False, True)
+
+            p_lab = f"{tmpdir}/labeled.zna"
+            with open(p_lab, "wb") as fh:
+                with ZnaWriter(fh, labeled) as writer:
+                    writer.write_record("ACGTACGT", True, True, False, labels=(7,))
+                    writer.write_record("TTTTGGGG", True, False, True, labels=(9,))
+
+            for rec in self._read(p_plain):
+                self.assertEqual(len(rec), 4)
+            for rec in self._read(p_plain, restore_strand=True):
+                self.assertEqual(len(rec), 4)
+            for rec in self._read(p_lab):
+                self.assertEqual(len(rec), 5)
+                self.assertIsInstance(rec[4], tuple)          # labels, not is_rc
+
+            for rec in self._read(p_plain, with_rc=True):
+                # with_rc hands the backend's own tuples straight through, so
+                # pin the type as well as the width.
+                self.assertIsInstance(rec, tuple)
+                self.assertEqual(len(rec), 5)
+                self.assertIsInstance(rec[4], bool)
+            for rec in self._read(p_lab, with_rc=True):
+                self.assertIsInstance(rec, tuple)
+                self.assertEqual(len(rec), 6)
+                self.assertIsInstance(rec[4], bool)           # is_rc before labels
+                self.assertIsInstance(rec[5], tuple)
+            self.assertEqual(
+                [rec[5] for rec in self._read(p_lab, with_rc=True)], [(7,), (9,)]
+            )
+
+    def test_with_rc_and_restore_strand_conflict(self):
+        """restore_strand consumes the flag; with_rc returns it. Asking for both
+        means the caller is confused about one of them."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write(tmpdir, "x.zna", self._as_sequenced()[:2],
+                               self._unstranded_header())
+            with open(path, "rb") as fh:
+                reader = ZnaReader(fh)
+                # Raised eagerly at call time. Wrapped in list() anyway so the
+                # test still holds if records() is ever re-inlined as a plain
+                # generator, where the raise would move to the first next().
+                with self.assertRaises(ValueError):
+                    list(reader.records(restore_strand=True, with_rc=True))
+
+    # -- the two backends must agree ----------------------------------------
+
+    def test_cross_backend_is_rc_identical(self):
+        """One file, decoded through each backend, must report identical IS_RC."""
+        self._require_accel()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._write(tmpdir, "xb.zna", self._as_sequenced(),
+                               self._unstranded_header())
+            with self._force_backend("python"):
+                py_records = self._read(path, with_rc=True)
+            with self._force_backend("accel"):
+                cc_records = self._read(path, with_rc=True)
+
+        self.assertEqual([r[4] for r in py_records], [r[4] for r in cc_records])
+        self.assertEqual(py_records, cc_records)
+
+    def test_cross_backend_labeled_is_rc_identical(self):
+        """Same, for the labeled decode path, which is a separate implementation."""
+        self._require_accel()
+        labels = (LabelDef(label_id=0, name="score", description="",
+                           dtype=DTYPE_BY_CODE['i'], missing=0),)
+        header = ZnaHeader(read_group="lab", strand_specific=False,
+                           strand_normalized=True, labels=labels)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/lab.zna"
+            with open(path, "wb") as fh:
+                with ZnaWriter(fh, header) as writer:
+                    for i, rec in enumerate(self._as_sequenced()[:40]):
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3], labels=(i,))
+            with self._force_backend("python"):
+                py_records = self._read(path, with_rc=True)
+            with self._force_backend("accel"):
+                cc_records = self._read(path, with_rc=True)
+
+        self.assertEqual(len(py_records), 40)
+        for rec in py_records:
+            self.assertEqual(len(rec), 6)
+        self.assertEqual(py_records, cc_records)
+
+    def test_pass_through_encode_is_backend_identical(self):
+        """With orientation supplied rather than derived, encoding is fully
+        deterministic — so both backends must produce byte-identical files.
+
+        The *deriving* unstranded path cannot be compared this way: each backend
+        uses a different PRNG for the coin.
+        """
+        self._require_accel()
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = self._write(tmpdir, "src.zna", self._as_sequenced(), header)
+            oriented = self._read(src, with_rc=True)
+
+            with self._force_backend("python"):
+                py_path = self._write(tmpdir, "py.zna", oriented, header, preserve=True)
+            with self._force_backend("accel"):
+                cc_path = self._write(tmpdir, "cc.zna", oriented, header, preserve=True)
+
+            self.assertEqual(Path(py_path).read_bytes(), Path(cc_path).read_bytes())
 
 
 class TestBackendLockstep(unittest.TestCase):

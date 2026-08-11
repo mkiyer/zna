@@ -16,7 +16,8 @@ from .core import (
     DEFAULT_ZSTD_LEVEL, DEFAULT_BLOCK_SIZE,
     _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
-    ZnaHeaderFlags, reverse_complement,
+    ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
+    _flags_from_ends,
 )
 from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
 from ._shuffle import shuffle_zna
@@ -610,11 +611,18 @@ def is_zna_file(filepath: Optional[str]) -> bool:
 # --- INPUT STRATEGIES ---
 # Each strategy is a focused generator for a specific input mode.
 
-def _stream_zna_reencode(filepath: str) -> Iterator[Tuple[str, bool, bool, bool]]:
-    """Stream records from an existing ZNA file for reencoding."""
+def _stream_zna_reencode(
+    filepath: str, with_ends: bool = False
+) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream records from an existing ZNA file for reencoding.
+
+    With *with_ends*, each record carries ``has_start, has_end`` — the lossless
+    form of ``IS_RC`` plus ``IS_FULL_FRAGMENT`` — so the writer can copy the
+    existing orientation and fragment-span verbatim instead of re-deriving them.
+    """
     with open(filepath, "rb") as f:
         reader = ZnaReader(f)
-        for record in reader.records():
+        for record in reader.records(with_ends=with_ends):
             yield record
 
 
@@ -630,42 +638,55 @@ def _stream_paired_files(f1: BinaryIO, f2: BinaryIO,
         yield s2, True, False, True
 
 
-def _stream_interleaved_fastq(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
-    """Stream interleaved FASTQ with smart paired/single detection based on read names."""
-    parser = parse_fastq_with_names(f)
-    prev_entry = None
-    
-    for curr_name, curr_seq in parser:
-        if prev_entry is None:
-            prev_entry = (curr_name, curr_seq)
+def _pair_interleaved(records) -> Iterator[Tuple[object, bool, bool, bool]]:
+    """Assign pairing flags to an interleaved stream of ``(read_name, payload)``.
+
+    Consecutive records whose base names match are emitted as an R1/R2 pair;
+    a record whose neighbour has a different base name is a single (e.g. a
+    merged read, whose ``/1``,``/2`` suffix was stripped by the merger).
+
+    Yields ``(payload, is_paired, is_read1, is_read2)``.  *payload* is opaque —
+    the sequence for unlabeled input, or ``(sequence, labels)`` for labeled —
+    so that labeled and unlabeled encoding share one implementation of the
+    pairing rule instead of drifting apart.
+    """
+    prev = None
+    for name, payload in records:
+        if prev is None:
+            prev = (name, payload)
             continue
-        
-        prev_name, prev_seq = prev_entry
-        
-        # Check if consecutive reads belong to the same pair
-        if get_base_name(prev_name) == get_base_name(curr_name):
-            # Found a pair (R1 and R2)
+
+        prev_name, prev_payload = prev
+
+        if get_base_name(prev_name) == get_base_name(name):
             n1 = get_read_suffix_number(prev_name)
-            n2 = get_read_suffix_number(curr_name)
-            
-            # Validation warnings
+            n2 = get_read_suffix_number(name)
+
             if n1 == 2:
-                print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
+                print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {name}", file=sys.stderr)
             if n2 == 1:
-                print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {curr_name}", file=sys.stderr)
-            
-            # Yield as paired reads
-            yield prev_seq, True, True, False   # R1
-            yield curr_seq, True, False, True   # R2
-            prev_entry = None
+                print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {name}", file=sys.stderr)
+
+            yield prev_payload, True, True, False   # R1
+            yield payload, True, False, True        # R2
+            prev = None
         else:
-            # prev_entry was a singleton (single-end read)
-            yield prev_seq, False, False, False
-            prev_entry = (curr_name, curr_seq)
-    
-    # Handle the final remaining entry
-    if prev_entry is not None:
-        yield prev_entry[1], False, False, False
+            # prev was a singleton (single-end or merged read)
+            yield prev_payload, False, False, False
+            prev = (name, payload)
+
+    if prev is not None:
+        yield prev[1], False, False, False
+
+
+def _stream_interleaved_fastq(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
+    """Stream interleaved FASTQ with smart paired/single detection based on read names.
+
+    Returns the pairing generator directly rather than re-yielding through it: for
+    unlabeled input the payload *is* the sequence, so the shapes already match and
+    a wrapper layer would cost a generator resume per record.
+    """
+    return _pair_interleaved(parse_fastq_with_names(f))
 
 
 def _stream_interleaved_fasta(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
@@ -707,15 +728,20 @@ def _infer_format(filepath: Optional[str], format_override: Optional[str]) -> st
     return 'fastq'  # default
 
 
-def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
+def stream_inputs(args, with_ends: bool = False) -> Iterator[Tuple[str, bool, bool, bool]]:
     """
     Uniform generator yielding (sequence, is_paired, is_read1, is_read2).
     Dispatches to appropriate strategy based on input configuration.
-    
+
     Input modes:
     - 0 files: read from stdin (single or interleaved)
     - 1 file: read from file (single or interleaved, or ZNA for reencoding)
     - 2 files: paired-end (read1, read2)
+
+    *with_ends* applies to the ZNA re-encode mode only, where it appends each
+    record's boundary geometry: ``(seq, is_paired, is_read1, is_read2,
+    has_start, has_end)``.  Every other input mode is producing fresh records
+    that have no orientation history, so they are unaffected.
     """
     # Determine format override from command line flags
     format_override = None
@@ -728,7 +754,7 @@ def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
     
     # Special case: single ZNA file = reencoding mode
     if len(files) == 1 and is_zna_file(files[0]):
-        yield from _stream_zna_reencode(files[0])
+        yield from _stream_zna_reencode(files[0], with_ends=with_ends)
         return
     
     with ExitStack() as stack:
@@ -757,25 +783,71 @@ def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
             yield from _stream_single_end(f, src, format_override)
 
 
-def stream_inputs_labeled(
-    args, label_defs: tuple[LabelDef, ...], tag_map: dict
-) -> Iterator[Tuple[str, bool, bool, bool, tuple]]:
-    """Yield ``(seq, is_paired, is_read1, is_read2, labels)`` for labeled encoding.
+_COMPLEMENT_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
+_COMPLEMENT_CHAR = {"A": "T", "C": "G", "G": "C", "T": "A",
+                    "a": "t", "c": "g", "g": "c", "t": "a"}
 
-    Only supports single-end FASTQ from a single file or stdin (the common case
-    for ``samtools fastq -T`` output).  Interleaved and paired-file modes are
-    not yet supported for labeled encoding.
 
-    Uses the C++ fast label extractor when available.
+def _is_reverse_complement(a: str, b: str) -> bool:
+    """True when *b* is the reverse complement of *a*.
+
+    Two mates of a pair whose insert was at or below the read length span the
+    identical fragment interval, so they are exact reverse complements — that is
+    how a full-fragment pair is recognised without knowing the insert size.
+
+    The end probes reject ~15/16 of ordinary pairs in two character
+    comparisons, so the O(n) translate only runs on genuine candidates.
     """
+    n = len(a)
+    if n == 0 or n != len(b):
+        return False
+    if _COMPLEMENT_CHAR.get(a[-1]) != b[0] or _COMPLEMENT_CHAR.get(a[0]) != b[-1]:
+        return False
+    return b == a.translate(_COMPLEMENT_TABLE)[::-1]
+
+
+def _fragment_units(records) -> Iterator[list]:
+    """Group a record stream into fragments: ``[R1, R2]`` or ``[single]``.
+
+    A paired R1 is grouped with the immediately following paired R2; anything
+    else stands alone.  Grouping lets record-level policies (the N-drop filter,
+    full-overlap detection) act on a whole fragment, so they can never leave a
+    lone mate behind — a lone ``IS_PAIRED`` record would otherwise be encoded as
+    half a fragment and mis-read downstream as a full molecule.
+    """
+    pending = None
+    for rec in records:
+        if pending is not None:
+            if rec[1] and rec[3]:          # paired R2 completes the held R1
+                yield [pending, rec]
+                pending = None
+            else:
+                yield [pending]
+                pending = rec if (rec[1] and rec[2]) else None
+                if pending is None:
+                    yield [rec]
+        elif rec[1] and rec[2]:            # paired R1 — hold for its mate
+            pending = rec
+        else:
+            yield [rec]
+    if pending is not None:
+        yield [pending]
+
+
+def _full_fragment_flags(unit: list, treat_unpaired_as_merged: bool) -> list:
+    """Which records of *unit* span their entire fragment (both edges real)."""
+    if len(unit) == 1:
+        return [treat_unpaired_as_merged]
+    full = _is_reverse_complement(unit[0][0], unit[1][0])
+    return [full, full]
+
+
+def _make_label_extractor(label_defs: tuple[LabelDef, ...], tag_map: dict):
+    """Return ``extract(raw_header) -> labels``, using the C++ path when built."""
     from .dtypes import resolve_missing as _resolve_missing
 
-    files = args.files if args.files else []
     num_labels = len(label_defs)
-
-    # Build C++ fast tag specs if available
-    use_fast = _accel_extract is not None
-    if use_fast:
+    if _accel_extract is not None:
         tag_specs = []
         for ldef in label_defs:
             tag_bytes = ldef.effective_tag.encode('ascii')
@@ -787,21 +859,86 @@ def stream_inputs_labeled(
                 conv_code = _CONV_INT
             tag_specs.append((tag_bytes, conv_code))
         missing_values = tuple(_resolve_missing(ld) for ld in label_defs)
-        _extract = _accel_extract
-    else:
-        _extract = None
 
-    src = files[0] if len(files) == 1 else None
+        def extract(raw_header):
+            return _accel_extract(raw_header, tag_specs, num_labels, missing_values)
+    else:
+        def extract(raw_header):
+            return extract_labels_from_header(
+                raw_header, tag_map, num_labels, label_defs=label_defs
+            )
+    return extract
+
+
+def _labeled_seqs(f: BinaryIO, extract) -> Iterator[Tuple[str, tuple]]:
+    """Yield ``(sequence, labels)`` from a labeled FASTQ stream.
+
+    Deliberately does not parse the read name: only interleaved input needs it,
+    and this runs on every read.
+    """
+    for raw_header, seq in parse_fastq_with_headers(f):
+        yield seq, extract(raw_header)
+
+
+def _labeled_named(f: BinaryIO, extract) -> Iterator[Tuple[str, Tuple[str, tuple]]]:
+    """Yield ``(read_name, (sequence, labels))`` — for interleaved pairing only."""
+    for raw_header, seq in parse_fastq_with_headers(f):
+        name = raw_header.split(None, 1)[0].decode('ascii') if raw_header else ""
+        yield name, (seq, extract(raw_header))
+
+
+def stream_inputs_labeled(
+    args, label_defs: tuple[LabelDef, ...], tag_map: dict
+) -> Iterator[Tuple[str, bool, bool, bool, tuple]]:
+    """Yield ``(seq, is_paired, is_read1, is_read2, labels)`` for labeled encoding.
+
+    Dispatches over the same input modes as :func:`stream_inputs` — two paired
+    files, interleaved, or single-end — so that labeled encoding preserves
+    pairing.  It previously assumed single-end and flagged every record
+    unpaired, which silently discarded the R1/R2 flags of interleaved input.
+
+    Labels are read from SAM tags in the FASTQ header, so FASTA input is not
+    supported.  Uses the C++ fast label extractor when available.
+    """
+    files = args.files if args.files else []
+    extract = _make_label_extractor(label_defs, tag_map)
+
+    format_override = None
+    if getattr(args, 'fasta', False):
+        format_override = 'fasta'
+    elif getattr(args, 'fastq', False):
+        format_override = 'fastq'
+
     with ExitStack() as stack:
+        # Strategy 1: two files = paired-end
+        if len(files) == 2:
+            if _infer_format(files[0], format_override) != 'fastq':
+                sys.exit("Error: labeled encoding requires FASTQ input "
+                         "(labels are parsed from SAM tags in the read header).")
+            f1 = stack.enter_context(get_input_handle(files[0]))
+            f2 = stack.enter_context(get_input_handle(files[1]))
+            for (s1, l1), (s2, l2) in zip(_labeled_seqs(f1, extract),
+                                          _labeled_seqs(f2, extract)):
+                yield s1, True, True, False, l1
+                yield s2, True, False, True, l2
+            return
+
+        src = files[0] if len(files) == 1 else None
+        if _infer_format(src, format_override) != 'fastq':
+            sys.exit("Error: labeled encoding requires FASTQ input "
+                     "(labels are parsed from SAM tags in the read header).")
         f = stack.enter_context(get_input_handle(src))
-        if use_fast:
-            for raw_header, seq in parse_fastq_with_headers(f):
-                labels = _extract(raw_header, tag_specs, num_labels, missing_values)
-                yield seq, False, False, False, labels
-        else:
-            for raw_header, seq in parse_fastq_with_headers(f):
-                labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=label_defs)
-                yield seq, False, False, False, labels
+
+        # Strategy 2: interleaved — share the pairing rule with stream_inputs
+        if getattr(args, 'interleaved', False):
+            for (seq, labels), is_paired, is_read1, is_read2 in _pair_interleaved(
+                    _labeled_named(f, extract)):
+                yield seq, is_paired, is_read1, is_read2, labels
+            return
+
+        # Strategy 3: single-end
+        for seq, labels in _labeled_seqs(f, extract):
+            yield seq, False, False, False, labels
 
 
 # --- COMMAND: ENCODE ---
@@ -882,6 +1019,20 @@ def encode_command(args):
         strand_specific = strand_specific_flag
         strand_normalized = strand_normalize_flag
 
+    # An already-normalized input carries its orientation in the per-record
+    # IS_RC flags. Copy it verbatim: orientation is not idempotent, and
+    # re-deriving it here would reverse-complement a second time, silently
+    # un-normalizing the file while the header still claimed otherwise.
+    preserve_normalization = bool(
+        is_reencoding and input_header is not None and input_header.strand_normalized
+    )
+    if preserve_normalization and strand_specific != input_header.strand_specific:
+        sys.exit(
+            "Error: cannot change strand-specificity when re-encoding an "
+            "already strand-normalized file. Its orientation was applied at "
+            "encode time and cannot be re-derived. Decode with --restore-strand "
+            "and re-encode from the original reads instead."
+        )
     # Build label definitions (if any)
     label_defs: tuple[LabelDef, ...] = ()
     tag_map: dict = {}
@@ -898,6 +1049,25 @@ def encode_command(args):
     elif label_specs:
         label_defs = build_label_defs(label_specs, label_descs)
         tag_map = build_tag_extractor(label_defs)
+
+    # Labels are not carried through the ZNA -> ZNA re-encode path. Refuse
+    # loudly: a labeled input widens the record tuple and dies mid-stream, and
+    # --label routes the input through the FASTQ label parser, which finds no
+    # records in a binary ZNA and writes an empty file with a zero exit status.
+    if is_reencoding:
+        if input_header is not None and input_header.labels:
+            sys.exit(
+                "Error: re-encoding a labeled ZNA file is not supported "
+                f"({files[0]} defines {len(input_header.labels)} label(s): "
+                f"{', '.join(ld.name for ld in input_header.labels)}). "
+                "Its labels would be dropped."
+            )
+        if label_defs:
+            sys.exit(
+                "Error: --label/--label-defs cannot be applied when re-encoding "
+                "a ZNA file. Labels are read from FASTQ headers at encode time; "
+                f"{files[0]} has none to read."
+            )
 
     # Header Setup
     header = ZnaHeader(
@@ -941,26 +1111,53 @@ def encode_command(args):
     # Use ExitStack to safely close output file (or leave stdout open)
     npolicy = getattr(args, 'npolicy', None)
     block_size = parse_block_size(args.block_size)
+    if preserve_normalization and not quiet:
+        print(
+            "[ZNA] Input is strand-normalized; copying orientation verbatim.",
+            file=sys.stderr,
+        )
+
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
-        writer = stack.enter_context(ZnaWriter(f_out, header, block_size=block_size, npolicy=npolicy))
-        
+        writer = stack.enter_context(ZnaWriter(
+            f_out, header, block_size=block_size, npolicy=npolicy,
+            preserve_normalization=preserve_normalization,
+        ))
+
+        # The N-drop filter is applied per FRAGMENT, not per record: dropping a
+        # single mate would leave its partner behind as a lone paired record.
+        drop_n = (npolicy == 'drop')
+        treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
+
         if label_defs:
-            for seq, is_paired, is_r1, is_r2, labels in stream_inputs_labeled(args, label_defs, tag_map):
-                if npolicy == 'drop' and 'N' in seq.upper():
-                    continue
-                writer.write_record(seq, is_paired, is_r1, is_r2, labels=labels)
-                count += 1
-                if count % 1_000_000 == 0 and not is_stdout and not quiet:
-                    print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+            stream = stream_inputs_labeled(args, label_defs, tag_map)
+        elif preserve_normalization:
+            stream = stream_inputs(args, with_ends=True)
         else:
-            for seq, is_paired, is_r1, is_r2 in stream_inputs(args):
-                if npolicy == 'drop' and 'N' in seq.upper():
-                    continue
-                writer.write_record(seq, is_paired, is_r1, is_r2)
-                count += 1
-                if count % 1_000_000 == 0 and not is_stdout and not quiet:
-                    print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+            stream = stream_inputs(args)
+
+        for unit in _fragment_units(stream):
+            if drop_n and any('N' in rec[0].upper() for rec in unit):
+                continue
+            if preserve_normalization:
+                # Orientation and fragment span are copied from the source.
+                for rec in unit:
+                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
+                    writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                        is_rc=is_rc, is_full_fragment=is_full)
+            else:
+                full = _full_fragment_flags(unit, treat_unpaired_as_merged)
+                if label_defs:
+                    for rec, is_full in zip(unit, full):
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                            labels=rec[4], is_full_fragment=is_full)
+                else:
+                    for rec, is_full in zip(unit, full):
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                            is_full_fragment=is_full)
+            count += len(unit)
+            if count % 1_000_000 < len(unit) and count >= 1_000_000 and not is_stdout and not quiet:
+                print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
 
     # ── Optional shuffle pass ─────────────────────────────────────────
     if getattr(args, 'shuffle', False) and not is_stdout:
@@ -1009,6 +1206,23 @@ def decode_command(args):
         if not args.quiet:
             src_name = input_file if input_file else "stdin"
             print(f"[ZNA] Decoding {src_name} (RG: {rg})...", file=sys.stderr)
+
+        # Decoding a normalized file without --restore-strand emits the STORED
+        # (normalized) frame.  Re-encoding that output with --strand-normalize
+        # applies orientation a second time and desynchronizes IS_RC from the
+        # bases — silently, because the two files' headers are identical.
+        if (reader.header.strand_normalized
+                and not getattr(args, 'restore_strand', False)
+                and not args.quiet):
+            print(
+                "[Warning] This file is strand-normalized and --restore-strand was "
+                "not given, so the output is in NORMALIZED orientation. Do not "
+                "re-encode it with --strand-normalize: orientation is not idempotent, "
+                "and applying it twice un-normalizes the data while the header still "
+                "claims otherwise. Use --restore-strand to recover the original read "
+                "orientation.",
+                file=sys.stderr,
+            )
 
         with ExitStack() as stack:
             # --- 1. File Output Mode ---
@@ -1154,7 +1368,10 @@ def inspect_command(args):
         # (partially) decompressing block payloads — the flags column is stored
         # first, so only its bytes need to be decoded per block.
         count_flags = getattr(args, 'counts', False)
-        n_paired_r1 = n_paired_r2 = n_single = n_rc = 0
+        n_paired_r1 = n_paired_r2 = n_single = n_rc = n_full = 0
+        # (mate x is_rc) cross-tabulation — the only tally that actually
+        # verifies a file's geometry before anything trains on it.
+        rc_by_mate = {"R1": 0, "R2": 0, "single": 0}
         dctx = None
         if count_flags and h.compression_method == COMPRESSION_ZSTD:
             import zstandard
@@ -1188,14 +1405,23 @@ def inspect_command(args):
                     flags_bytes = f.read(flags_size)
                     f.seek(c_size - flags_size, 1)
                 for fl in flags_bytes:
-                    if fl & 8:  # IS_RC
+                    rc = fl & 8          # IS_RC
+                    if rc:
                         n_rc += 1
-                    if fl & 1:  # IS_READ1
+                    if fl & 16:          # IS_FULL_FRAGMENT
+                        n_full += 1
+                    if fl & 1:           # IS_READ1
                         n_paired_r1 += 1
-                    elif fl & 2:  # IS_READ2
+                        if rc:
+                            rc_by_mate["R1"] += 1
+                    elif fl & 2:         # IS_READ2
                         n_paired_r2 += 1
+                        if rc:
+                            rc_by_mate["R2"] += 1
                     else:
                         n_single += 1
+                        if rc:
+                            rc_by_mate["single"] += 1
             else:
                 f.seek(c_size, 1)
 
@@ -1208,6 +1434,21 @@ def inspect_command(args):
             print(f"  Paired R2:        {n_paired_r2}")
             print(f"  Single/merged:    {n_single}")
             print(f"  Reverse-comp'd:   {n_rc}")
+            print(f"  Full-fragment:    {n_full}   (both edges are true fragment boundaries)")
+            print("\n--- Fragment Geometry (mate x IS_RC) ---")
+            for mate, total in (("R1", n_paired_r1), ("R2", n_paired_r2),
+                                ("single/merged", n_single)):
+                key = {"R1": "R1", "R2": "R2", "single/merged": "single"}[mate]
+                rc_n = rc_by_mate[key]
+                pct = (100.0 * rc_n / total) if total else 0.0
+                print(f"  {mate:<14s} {total:>10d} records, {rc_n:>10d} RC'd ({pct:5.1f}%)")
+            if h.strand_normalized and h.strand_specific:
+                print("  expect: stranded — RC'd should be ~all of one mate and ~none of the other")
+            elif h.strand_normalized:
+                print("  expect: unstranded — RC'd should be ~50% of each mate, one per pair")
+            if n_paired_r1 != n_paired_r2:
+                print(f"  [Warning] R1 and R2 counts differ by {abs(n_paired_r1 - n_paired_r2)}: "
+                      "the file contains orphaned mates.")
 
         if compressed_payload > 0:
              print(f"Compressed Payload: {compressed_payload / (1024*1024):.2f} MB")
@@ -1289,7 +1530,14 @@ def main():
                                 "With --strand-specific: deterministic (antisense reads RC'd). "
                                 "Without: random RC (for unstranded data).")
     meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"], default="drop",
-                           help="Policy for handling 'N' nucleotides: drop (skip sequences), random (replace with random base), or A/C/G/T (replace with specific base)")
+                           help="Policy for handling 'N' nucleotides: drop (skip the whole fragment, so mates are never orphaned), random (replace with random base), or A/C/G/T (replace with specific base)")
+    meta_group.add_argument("--treat-unpaired-as-merged", dest="treat_unpaired_as_merged",
+                           action="store_true",
+                           help="Unpaired records span their whole fragment, so BOTH edges "
+                                "are true fragment boundaries (IS_FULL_FRAGMENT). Use for "
+                                "overlap-merged reads. Default off: an unpaired record is "
+                                "assumed to have one real edge, like a single-end read. "
+                                "Full-overlap PAIRS are detected automatically and need no flag.")
     
     # R1 strand orientation (mutually exclusive)
     # Default: R1 is antisense (dUTP protocol)

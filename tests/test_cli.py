@@ -2,6 +2,7 @@
 Unit tests for CLI functionality (encode, decode, inspect).
 """
 import gzip
+import random
 import tempfile
 import struct
 from pathlib import Path
@@ -9,6 +10,7 @@ from io import BytesIO
 
 import pytest
 
+from zna import reverse_complement
 from zna.cli import (
     parse_fasta, parse_fastq, choose_parser,
     stream_inputs, encode_command, decode_command, inspect_command,
@@ -1021,6 +1023,470 @@ class TestStrandProtocol:
             assert "Strand Specific:  True" in output
             assert "R1 Antisense:     True" in output
             assert "R2 Antisense:     False" in output
+
+
+# --- ZNA -> ZNA Re-encode Tests ---
+
+class TestReencode:
+    """Re-encoding an already strand-normalized ZNA must copy its orientation.
+
+    Orientation is not idempotent: the writer used to re-derive it from the
+    header, reverse-complementing one mate of every pair a second time and
+    silently un-normalizing the file while the header still claimed otherwise.
+    """
+
+    FRAG_LEN = 300
+    READ_LEN = 100
+    N_PAIRS = 120
+
+    def _fragments(self):
+        rng = random.Random(4242)
+        return ["".join(rng.choice("ACGT") for _ in range(self.FRAG_LEN))
+                for _ in range(self.N_PAIRS)]
+
+    def _write_normalized(self, path, frags, **header_kwargs):
+        """Write FR pairs as sequenced, letting the writer normalize them."""
+        L, R = self.FRAG_LEN, self.READ_LEN
+        kwargs = dict(read_group="reenc", strand_specific=False,
+                      strand_normalized=True, seq_len_bytes=1)
+        kwargs.update(header_kwargs)
+        header = ZnaHeader(**kwargs)
+        with open(path, "wb") as fh:
+            with ZnaWriter(fh, header) as writer:
+                for f in frags:
+                    writer.write_record(f[:R], True, True, False)
+                    writer.write_record(reverse_complement(f[L - R:]), True, False, True)
+
+    def _read(self, path, **kwargs):
+        with open(path, "rb") as fh:
+            return list(ZnaReader(fh).records(**kwargs))
+
+    def _args(self, in_path, out_path, **overrides):
+        class Args:
+            files = [in_path]
+            interleaved = False
+            fasta = False
+            fastq = False
+            read_group = "Unknown"      # sentinel: inherit from input header
+            description = ""            # sentinel: inherit
+            strand_specific = False
+            strand_normalize = False
+            read1_sense = False
+            read2_antisense = False
+            output = out_path
+            seq_len_bytes = 2           # sentinel: inherit
+            block_size = 512            # deliberately unlike the input's blocks
+            compress_flag = False
+            level = 3
+            quiet = True
+        for k, v in overrides.items():
+            setattr(Args, k, v)
+        return Args()
+
+    def test_reencode_preserves_orientation(self, tmp_path):
+        """A re-encode is a faithful copy: same sequences, same IS_RC flags.
+
+        The block size differs from the input's on purpose. The accel backend
+        seeds its coin to a constant per block, so with identical blocks a
+        second pass re-flips the same mate and the damage shows up only in the
+        sequences — the IS_RC flags still round-trip. Changing the block
+        boundaries makes the second pass pick different mates, so the flags go
+        wrong too and the assertion covers strictly more.
+        """
+        frags = self._fragments()
+        src = str(tmp_path / "norm.zna")
+        out = str(tmp_path / "reencoded.zna")
+        self._write_normalized(src, frags)
+
+        before = self._read(src, with_rc=True)
+        encode_command(self._args(src, out))
+        after = self._read(out, with_rc=True)
+
+        assert after == before
+
+        # And the pairs are still co-oriented: both mates in one frame.
+        L, R = self.FRAG_LEN, self.READ_LEN
+        for i, f in enumerate(frags):
+            a, b = after[2 * i][0], after[2 * i + 1][0]
+            assert (a == f[:R]) == (b == f[L - R:]), f"pair {i} lost co-orientation"
+
+    def test_reencode_twice_is_stable(self, tmp_path):
+        """Repeated re-encodes must converge, not toggle."""
+        frags = self._fragments()
+        p0 = str(tmp_path / "a.zna")
+        p1 = str(tmp_path / "b.zna")
+        p2 = str(tmp_path / "c.zna")
+        self._write_normalized(p0, frags)
+
+        encode_command(self._args(p0, p1))
+        encode_command(self._args(p1, p2, block_size=4096))
+
+        assert self._read(p2, with_rc=True) == self._read(p0, with_rc=True)
+
+    def test_reencode_restores_original_orientation(self, tmp_path):
+        """--restore-strand on a re-encoded file must still recover the input reads."""
+        frags = self._fragments()
+        L, R = self.FRAG_LEN, self.READ_LEN
+        src = str(tmp_path / "norm.zna")
+        out = str(tmp_path / "reencoded.zna")
+        self._write_normalized(src, frags)
+        encode_command(self._args(src, out))
+
+        restored = [rec[0] for rec in self._read(out, restore_strand=True)]
+        expected = []
+        for f in frags:
+            expected.append(f[:R])
+            expected.append(reverse_complement(f[L - R:]))
+        assert restored == expected
+
+    def test_reencode_labeled_input_refused(self, tmp_path):
+        """A labeled input would lose its label columns — refuse, don't crash."""
+        from zna.dtypes import LabelDef, DTYPE_BY_CODE
+
+        src = str(tmp_path / "labeled.zna")
+        header = ZnaHeader(
+            read_group="lab", seq_len_bytes=1,
+            labels=(LabelDef(label_id=0, name="score", description="",
+                             dtype=DTYPE_BY_CODE['i'], missing=0),),
+        )
+        with open(src, "wb") as fh:
+            with ZnaWriter(fh, header) as writer:
+                writer.write_record("ACGTACGT", False, False, False, labels=(1,))
+
+        with pytest.raises(SystemExit):
+            encode_command(self._args(src, str(tmp_path / "out.zna")))
+
+    def test_reencode_with_label_flag_refused(self, tmp_path):
+        """--label on a ZNA input used to parse the binary as FASTQ and write
+        an empty file with a zero exit status."""
+        src = str(tmp_path / "norm.zna")
+        self._write_normalized(src, self._fragments()[:4])
+
+        with pytest.raises(SystemExit):
+            encode_command(self._args(src, str(tmp_path / "out.zna"),
+                                      label=["NH:C"], label_desc=[]))
+
+    def test_reencode_cannot_change_strand_specificity(self, tmp_path):
+        """Orientation already applied cannot be re-derived under new rules."""
+        src = str(tmp_path / "norm.zna")
+        self._write_normalized(src, self._fragments()[:4])
+
+        with pytest.raises(SystemExit):
+            encode_command(self._args(src, str(tmp_path / "out.zna"),
+                                      strand_specific=True, strand_normalize=True))
+
+    def test_reencode_unnormalized_input_still_normalizes(self, tmp_path):
+        """Pass-through must be conditional: an un-normalized input asked to be
+        normalized still gets orientation derived for it."""
+        L, R = self.FRAG_LEN, self.READ_LEN
+        frags = self._fragments()[:20]
+        src = str(tmp_path / "plain.zna")
+        header = ZnaHeader(read_group="plain", seq_len_bytes=1)
+        with open(src, "wb") as fh:
+            with ZnaWriter(fh, header) as writer:
+                for f in frags:
+                    writer.write_record(f[:R], True, True, False)
+                    writer.write_record(reverse_complement(f[L - R:]), True, False, True)
+        assert not any(rec[4] for rec in self._read(src, with_rc=True))
+
+        out = str(tmp_path / "out.zna")
+        encode_command(self._args(src, out, strand_normalize=True))
+
+        after = self._read(out, with_rc=True)
+        with open(out, "rb") as fh:
+            assert ZnaReader(fh).header.strand_normalized
+        for i in range(len(frags)):
+            assert after[2 * i][4] != after[2 * i + 1][4], "exactly one mate must be RC'd"
+
+
+# --- Labeled encoding must preserve pairing ---
+
+class TestLabeledPairing:
+    """Labels must not cost pairing information.
+
+    ``stream_inputs_labeled`` used to have its own single-file FASTQ reader and
+    flag every record unpaired, so ``--interleaved`` was silently ignored and the
+    R1/R2 flags were discarded. A consumer then cannot tell a mate (one true
+    fragment end) from a merged read (two), which is the difference between
+    correct endpoint supervision and endpoint tokens on interior positions.
+    """
+
+    # A mixed interleaved stream as a read merger emits it: adjacent /1,/2 pairs
+    # plus merged singles whose pair suffix has been stripped.
+    MIXED = (
+        b"@readA/1\tNH:i:3\nAAAACCCCGGGGTTTT\n+\nIIIIIIIIIIIIIIII\n"
+        b"@readA/2\tNH:i:3\nTTTTGGGGCCCCAAAA\n+\nIIIIIIIIIIIIIIII\n"
+        b"@readB merged_20_8\tNH:i:7\nACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIII\n"
+        b"@readC/1\tNH:i:1\nGGGGAAAACCCCTTTT\n+\nIIIIIIIIIIIIIIII\n"
+        b"@readC/2\tNH:i:1\nCCCCTTTTGGGGAAAA\n+\nIIIIIIIIIIIIIIII\n"
+    )
+    EXPECTED_FLAGS = [
+        (True, True, False),    # readA R1
+        (True, False, True),    # readA R2
+        (False, False, False),  # readB merged single
+        (True, True, False),    # readC R1
+        (True, False, True),    # readC R2
+    ]
+
+    def _args(self, files, out, **overrides):
+        class Args:
+            interleaved = False
+            fasta = False
+            fastq = True
+            read_group = "lab"
+            description = ""
+            strand_specific = False
+            strand_normalize = True
+            read1_sense = False
+            read2_antisense = False
+            output = out
+            seq_len_bytes = 1
+            block_size = 131072
+            compress_flag = False
+            level = 3
+            quiet = True
+            label = None
+            label_desc = None
+            label_defs = None
+        Args.files = files
+        for k, v in overrides.items():
+            setattr(Args, k, v)
+        return Args()
+
+    def _flags(self, path):
+        with open(path, "rb") as fh:
+            return [(r[1], r[2], r[3]) for r in ZnaReader(fh).records()]
+
+    def test_labeled_interleaved_preserves_pairing(self, tmp_path):
+        """The regression test: labels must not change the pairing flags."""
+        src = tmp_path / "mixed.fq"
+        src.write_bytes(self.MIXED)
+        plain = str(tmp_path / "plain.zna")
+        labeled = str(tmp_path / "labeled.zna")
+
+        encode_command(self._args([str(src)], plain, interleaved=True))
+        encode_command(self._args([str(src)], labeled, interleaved=True, label=["NH:i"]))
+
+        assert self._flags(plain) == self.EXPECTED_FLAGS
+        assert self._flags(labeled) == self.EXPECTED_FLAGS
+
+        # ...and the labels still line up with their sequences.
+        with open(labeled, "rb") as fh:
+            recs = list(ZnaReader(fh).records())
+        assert [r[4] for r in recs] == [(3,), (3,), (7,), (1,), (1,)]
+
+    def test_labeled_interleaved_normalizes_per_pair(self, tmp_path):
+        """With pairing restored, unstranded normalization RC's exactly one mate
+        per pair again instead of drawing an independent coin per record.
+
+        Uses many pairs on purpose: with only a couple, an independent-coin
+        encoder passes this by chance. At 60 pairs that is 2**-60.
+        """
+        n_pairs = 60
+        rec = []
+        for i in range(n_pairs):
+            rec.append(b"@read%d/1\tNH:i:1\nAAAACCCCGGGGTTTT\n+\nIIIIIIIIIIIIIIII\n" % i)
+            rec.append(b"@read%d/2\tNH:i:1\nTTTTGGGGCCCCAAAA\n+\nIIIIIIIIIIIIIIII\n" % i)
+        src = tmp_path / "pairs.fq"
+        src.write_bytes(b"".join(rec))
+        out = str(tmp_path / "labeled.zna")
+        encode_command(self._args([str(src)], out, interleaved=True, label=["NH:i"]))
+
+        with open(out, "rb") as fh:
+            recs = list(ZnaReader(fh).records(with_rc=True))
+        assert len(recs) == 2 * n_pairs
+        for i in range(n_pairs):
+            assert recs[2 * i][4] != recs[2 * i + 1][4], f"pair {i}: not exactly one RC"
+
+    def test_labeled_paired_files_preserves_pairing(self, tmp_path):
+        """The two-file labeled path must emit R1/R2, not two singles."""
+        r1 = tmp_path / "r1.fq"
+        r2 = tmp_path / "r2.fq"
+        r1.write_bytes(b"@readA/1\tNH:i:2\nAAAACCCCGGGGTTTT\n+\nIIIIIIIIIIIIIIII\n")
+        r2.write_bytes(b"@readA/2\tNH:i:2\nTTTTGGGGCCCCAAAA\n+\nIIIIIIIIIIIIIIII\n")
+        out = str(tmp_path / "pe.zna")
+
+        encode_command(self._args([str(r1), str(r2)], out, label=["NH:i"]))
+
+        assert self._flags(out) == [(True, True, False), (True, False, True)]
+        with open(out, "rb") as fh:
+            assert [r[4] for r in ZnaReader(fh).records()] == [(2,), (2,)]
+
+    def test_labeled_single_end_still_unpaired(self, tmp_path):
+        """Genuine single-end labeled input is unchanged by the refactor."""
+        src = tmp_path / "se.fq"
+        src.write_bytes(b"@readA\tNH:i:5\nAAAACCCCGGGGTTTT\n+\nIIIIIIIIIIIIIIII\n")
+        out = str(tmp_path / "se.zna")
+        encode_command(self._args([str(src)], out, label=["NH:i"]))
+        assert self._flags(out) == [(False, False, False)]
+
+    def test_labeled_fasta_refused(self, tmp_path):
+        """Labels come from SAM tags in FASTQ headers; FASTA cannot carry them."""
+        src = tmp_path / "in.fa"
+        src.write_bytes(b">readA\nACGTACGT\n")
+        with pytest.raises(SystemExit):
+            encode_command(self._args([str(src)], str(tmp_path / "o.zna"),
+                                      fasta=True, fastq=False, label=["NH:i"]))
+
+
+# --- Fragment-span flag and pair-atomic filtering ---
+
+class TestFullFragment:
+    """A record that spans its whole fragment has BOTH edges as true boundaries.
+
+    ``IS_RC`` can only name one edge, so without this flag a consumer placing
+    fragment-end supervision either under-marks merged reads or over-marks
+    genuine single-end reads — and it cannot tell the two apart.
+    """
+
+    def _args(self, files, out, **overrides):
+        class Args:
+            interleaved = True
+            fasta = False
+            fastq = True
+            read_group = "ff"
+            description = ""
+            strand_specific = False
+            strand_normalize = True
+            read1_sense = False
+            read2_antisense = False
+            output = out
+            seq_len_bytes = 1
+            block_size = 131072
+            compress_flag = False
+            level = 3
+            quiet = True
+            label = None
+            label_desc = None
+            label_defs = None
+            npolicy = "drop"
+            treat_unpaired_as_merged = False
+        Args.files = files
+        for k, v in overrides.items():
+            setattr(Args, k, v)
+        return Args()
+
+    def _write_fq(self, path, records):
+        with open(path, "w") as fh:
+            for name, seq in records:
+                fh.write(f"@{name}\n{seq}\n+\n{'I' * len(seq)}\n")
+
+    def _ends(self, path):
+        with open(path, "rb") as fh:
+            return [(r[4], r[5]) for r in ZnaReader(fh).records(with_ends=True)]
+
+    def test_full_overlap_pair_detected(self, tmp_path):
+        """Mates whose insert was <= the read length span the same interval, so
+        they are exact reverse complements — detectable with no insert size."""
+        frag = "ACGTACGTAAGGCCTTACGTACGT"
+        src = tmp_path / "in.fq"
+        self._write_fq(src, [
+            ("full/1", frag), ("full/2", reverse_complement(frag)),   # full overlap
+            ("ord/1", "AAAACCCCGGGGTTTT"), ("ord/2", "TTTTGGGGCCCCAAAA"),
+        ])
+        out = str(tmp_path / "o.zna")
+        encode_command(self._args([str(src)], out))
+        ends = self._ends(out)
+        assert ends[0] == (True, True) and ends[1] == (True, True), "full-overlap pair"
+        # the ordinary pair gets exactly one true edge per mate
+        assert ends[2] != (True, True) and ends[3] != (True, True)
+        assert ends[2][0] != ends[3][0]
+
+    def test_treat_unpaired_as_merged_flag(self, tmp_path):
+        """An unpaired record's span cannot be inferred, so it is declared."""
+        src = tmp_path / "in.fq"
+        self._write_fq(src, [("merged1 merged_16_0", "ACGTACGTAAGGCCTT")])
+
+        off = str(tmp_path / "off.zna")
+        encode_command(self._args([str(src)], off))
+        assert self._ends(off)[0] != (True, True), "default: one real edge"
+
+        on = str(tmp_path / "on.zna")
+        encode_command(self._args([str(src)], on, treat_unpaired_as_merged=True))
+        assert self._ends(on)[0] == (True, True), "declared: both edges real"
+
+    def test_npolicy_drop_is_pair_atomic(self, tmp_path):
+        """Dropping one mate would leave a lone paired record, which downstream
+        cannot distinguish from a genuine single."""
+        src = tmp_path / "in.fq"
+        self._write_fq(src, [
+            ("keep/1", "AAAACCCCGGGGTTTT"), ("keep/2", "TTTTGGGGCCCCAAAA"),
+            ("bad/1", "AAAACCCCGGGGTTTN"), ("bad/2", "TTTTGGGGCCCCAAAA"),  # N in R1 only
+        ])
+        out = str(tmp_path / "o.zna")
+        encode_command(self._args([str(src)], out))
+        with open(out, "rb") as fh:
+            recs = list(ZnaReader(fh).records())
+        assert len(recs) == 2, "the whole fragment must go, not just the N-containing mate"
+        assert [(r[1], r[2], r[3]) for r in recs] == [(True, True, False), (True, False, True)]
+
+    def test_npolicy_drop_keeps_single_records_independent(self, tmp_path):
+        """Atomic dropping must not over-reach: unpaired records stand alone."""
+        src = tmp_path / "in.fq"
+        self._write_fq(src, [
+            ("s1", "AAAACCCCGGGGTTTT"),
+            ("s2", "AAAACCCCGGGGTTTN"),   # dropped
+            ("s3", "TTTTGGGGCCCCAAAA"),
+        ])
+        out = str(tmp_path / "o.zna")
+        encode_command(self._args([str(src)], out))
+        with open(out, "rb") as fh:
+            assert len(list(ZnaReader(fh).records())) == 2
+
+
+class TestGeometryVisibility:
+    """A file's geometry must be checkable before anything trains on it, and the
+    one silent way to destroy it must warn."""
+
+    def _norm_zna(self, path):
+        header = ZnaHeader(read_group="g", strand_specific=False,
+                           strand_normalized=True, seq_len_bytes=1)
+        with open(path, "wb") as fh:
+            with ZnaWriter(fh, header) as w:
+                for i in range(6):
+                    w.write_record("ACGTACGTAAGG", True, i % 2 == 0, i % 2 == 1)
+                w.write_record("TTTTGGGGCCCC", False, False, False,
+                               is_full_fragment=True)
+
+    def test_decode_warns_when_reencode_would_double_normalize(self, tmp_path, capsys):
+        """`zna decode` emits the normalized frame by default; re-encoding that
+        with --strand-normalize applies orientation twice, silently."""
+        src = str(tmp_path / "n.zna")
+        self._norm_zna(src)
+
+        class Args:
+            input = src
+            output = str(tmp_path / "out.fa")
+            quiet = False
+            gzip = False
+            labels = False
+            restore_strand = False
+
+        decode_command(Args())
+        err = capsys.readouterr().err
+        assert "not idempotent" in err and "--restore-strand" in err
+
+        Args.restore_strand = True
+        Args.output = str(tmp_path / "out2.fa")
+        decode_command(Args())
+        assert "not idempotent" not in capsys.readouterr().err
+
+    def test_inspect_counts_reports_fragment_geometry(self, tmp_path, capsys):
+        """--counts must expose the (mate x IS_RC) cross-tab and full-fragment
+        tally; a bare RC total is equally consistent with a healthy and a broken
+        file."""
+        src = str(tmp_path / "n.zna")
+        self._norm_zna(src)
+
+        class InspArgs:
+            input = src
+            counts = True
+
+        inspect_command(InspArgs())
+        out = capsys.readouterr().out
+        assert "Full-fragment:" in out
+        assert "Fragment Geometry" in out
+        assert "unstranded" in out
 
 
 # --- N-Policy CLI Tests ---

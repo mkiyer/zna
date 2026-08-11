@@ -97,6 +97,37 @@ class ZnaRecordFlags(IntFlag):
     IS_READ2 = 2
     IS_PAIRED = 4
     IS_RC = 8
+    #: Both edges of this record are true fragment boundaries — the record spans
+    #: its entire fragment (a merged read, or a pair whose insert was shorter
+    #: than the read).  Without it, ``IS_RC`` names the single edge that is a
+    #: boundary; see :meth:`ZnaReader.records` with ``with_ends=True``.
+    IS_FULL_FRAGMENT = 16
+
+
+def _ends_from_flags(is_rc: bool, is_full_fragment: bool) -> tuple[bool, bool]:
+    """``(is_rc, is_full_fragment)`` → ``(has_start, has_end)``.
+
+    A read begins at a fragment boundary and runs inward, so base 0 is a true
+    boundary; storing it reverse-complemented moves that boundary to the right
+    edge.  A full-fragment record has both.
+    """
+    if is_full_fragment:
+        return True, True
+    return (not is_rc), bool(is_rc)
+
+
+#: ``flag byte -> (has_start, has_end)``, precomputed so the decode hot loop is a
+#: single index instead of a branch and a function call.
+_ENDS_BY_FLAG = tuple(
+    (True, True) if (f & 16) else (not (f & 8), bool(f & 8))
+    for f in range(256)
+)
+
+
+def _flags_from_ends(has_start: bool, has_end: bool) -> tuple[bool, bool]:
+    """Inverse of :func:`_ends_from_flags` — the mapping is a bijection over the
+    three reachable states, so ``(has_start, has_end)`` round-trips losslessly."""
+    return (bool(has_end) and not has_start), (bool(has_start) and bool(has_end))
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +193,15 @@ class ZnaWriter:
     Records are buffered and flushed in blocks.  All sequence
     encoding is handled by the active codec backend.
 
+    ``strand_normalized`` in the header being written describes the **output**.
+    By default the writer *derives* orientation: it reverse-complements records
+    as the header's strand settings dictate and records what it did in each
+    record's ``IS_RC`` flag.  If the input is already normalized — re-encoding
+    or copying an existing ZNA file — pass ``preserve_normalization=True`` and
+    supply each record's ``is_rc`` verbatim instead.  Orientation is **not
+    idempotent**: applying it twice returns the data to an un-normalized state
+    while leaving the header still claiming otherwise.
+
     Block layout (V1)::
 
         [20-byte header]
@@ -179,6 +219,7 @@ class ZnaWriter:
         "_do_strand_norm_r1",
         "_do_strand_norm_r2",
         "_do_random_norm",
+        "_preserve_normalization",
         "_batch_seqs",
         "_batch_flags",
         "_size_estimate",
@@ -193,6 +234,7 @@ class ZnaWriter:
         header: ZnaHeader,
         block_size: int = DEFAULT_BLOCK_SIZE,
         npolicy: str | None = None,
+        preserve_normalization: bool = False,
     ) -> None:
         self._fh = fh
         self._header = header
@@ -200,14 +242,23 @@ class ZnaWriter:
         self._max_len = (1 << (8 * header.seq_len_bytes)) - 1
         self._block_size = block_size
         self._npolicy = npolicy or ""
+        self._preserve_normalization = preserve_normalization
 
-        self._do_strand_norm_r1 = (
-            header.strand_normalized and header.strand_specific and header.read1_antisense
-        )
-        self._do_strand_norm_r2 = (
-            header.strand_normalized and header.strand_specific and header.read2_antisense
-        )
-        self._do_random_norm = header.strand_normalized and not header.strand_specific
+        if preserve_normalization:
+            # Pass-through: the caller supplies both the frame and the IS_RC
+            # bit.  Re-deriving orientation here would apply a *second*
+            # reverse-complement and silently un-normalize the file.
+            self._do_strand_norm_r1 = False
+            self._do_strand_norm_r2 = False
+            self._do_random_norm = False
+        else:
+            self._do_strand_norm_r1 = (
+                header.strand_normalized and header.strand_specific and header.read1_antisense
+            )
+            self._do_strand_norm_r2 = (
+                header.strand_normalized and header.strand_specific and header.read2_antisense
+            )
+            self._do_random_norm = header.strand_normalized and not header.strand_specific
 
         self._batch_seqs: list[str] = []
         self._batch_flags = bytearray()
@@ -239,9 +290,31 @@ class ZnaWriter:
 
     def write_record(
         self, seq: str, is_paired: bool, is_read1: bool, is_read2: bool,
-        labels: tuple | None = None,
+        labels: tuple | None = None, is_rc: bool = False,
+        is_full_fragment: bool = False,
     ) -> None:
-        """Buffer a single record.  Flushes automatically when the block is full."""
+        """Buffer a single record.  Flushes automatically when the block is full.
+
+        ``is_rc`` records that *seq* is already in its normalized frame and was
+        reverse-complemented to get there.  It requires
+        ``preserve_normalization=True`` on the writer; otherwise the writer
+        derives ``IS_RC`` itself and an externally supplied value would conflict
+        with it.
+
+        ``is_full_fragment`` records that *seq* spans its entire fragment, so
+        **both** of its edges are true fragment boundaries — a merged read, or a
+        mate whose insert was shorter than the read.  The encoder never derives
+        this (it cannot know the insert size), so it is always caller-supplied
+        and needs no pass-through mode.
+        """
+        # Validate before mutating any batch state: a caller that catches this
+        # must not be left with seqs and flags out of sync.
+        if is_rc and not self._preserve_normalization:
+            raise ValueError(
+                "is_rc=True requires ZnaWriter(preserve_normalization=True). "
+                "Without it the writer derives orientation itself, and supplying "
+                "IS_RC would double-normalize the record."
+            )
         seq_len = len(seq)
         if seq_len > self._max_len:
             raise ValueError(
@@ -259,8 +332,11 @@ class ZnaWriter:
                 self._batch_labels[i].append(val)
 
         self._batch_seqs.append(seq)
-        flag = (1 if is_read1 else 0) | (2 if is_read2 else 0) | (4 if is_paired else 0)
-        self._batch_flags.append(flag)
+        # Single expression, no follow-up statements: this runs on every record.
+        self._batch_flags.append(
+            (1 if is_read1 else 0) | (2 if is_read2 else 0) | (4 if is_paired else 0)
+            | (8 if is_rc else 0) | (16 if is_full_fragment else 0)
+        )
 
         self._size_estimate += (seq_len // 4) + 1 + self._seq_len_bytes
         # Defer flush when the last record is a paired R1 to keep pairs together
@@ -285,6 +361,13 @@ class ZnaWriter:
         because it caches attribute lookups and avoids per-call method
         dispatch overhead.
 
+        Accepts ``(seq, is_paired, is_read1, is_read2)`` tuples.  Under
+        ``preserve_normalization=True`` each tuple carries a trailing ``is_rc``
+        — i.e. exactly what ``ZnaReader.records(with_rc=True)`` yields — making a
+        lossless ZNA → ZNA copy a one-liner.  Plain 4-tuples are then accepted
+        only if the output header is not ``strand_normalized``; otherwise they
+        would silently write the orientation away.
+
         Note: this method does not support labels. Use :meth:`write_record`
         for labeled files.
         """
@@ -300,6 +383,55 @@ class ZnaWriter:
         block_size = self._block_size
         flush = self._flush_block
         size_est = self._size_estimate
+
+        if self._preserve_normalization:
+            # Pass-through. Accepts either shape the reader produces:
+            #   5-tuple  (..., is_rc)                  <- records(with_rc=True)
+            #   6-tuple  (..., has_start, has_end)     <- records(with_ends=True)
+            # A plain 4-tuple is only acceptable when the output is not
+            # normalized, since there is then no orientation to carry; otherwise
+            # accepting it would clear every IS_RC bit and lose the orientation
+            # silently.
+            require_rc = self._header.strand_normalized
+            for rec in records:
+                seq = rec[0]
+                is_paired = rec[1]
+                is_read1 = rec[2]
+                n_fields = len(rec)
+                if n_fields > 5:
+                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
+                    rc_bit = (8 if is_rc else 0) | (16 if is_full else 0)
+                elif n_fields > 4:
+                    rc_bit = 8 if rec[4] else 0
+                elif require_rc:
+                    raise ValueError(
+                        "preserve_normalization=True on a strand-normalized "
+                        "header requires each record to carry its orientation, "
+                        f"but got a {n_fields}-tuple. Read the source with "
+                        "ZnaReader.records(with_ends=True)."
+                    )
+                else:
+                    rc_bit = 0
+                seq_len = len(seq)
+                if seq_len > max_len:
+                    raise ValueError(
+                        f"Sequence length {seq_len} exceeds maximum {max_len} "
+                        f"allowed by header (seq_len_bytes={seq_len_bytes})"
+                    )
+                append_seq(seq)
+                append_flag(
+                    (1 if is_read1 else 0)
+                    | (2 if rec[3] else 0)
+                    | (4 if is_paired else 0)
+                    | rc_bit
+                )
+                size_est += (seq_len >> 2) + 1 + seq_len_bytes
+                if size_est >= block_size:
+                    self._size_estimate = size_est
+                    flush()
+                    size_est = self._size_estimate  # reset after flush
+            self._size_estimate = size_est
+            return
 
         for seq, is_paired, is_read1, is_read2 in records:
             seq_len = len(seq)
@@ -472,7 +604,8 @@ class ZnaReader:
     # -- public --------------------------------------------------------------
 
     def records(
-        self, restore_strand: bool = False
+        self, restore_strand: bool = False, with_rc: bool = False,
+        with_ends: bool = False,
     ) -> Iterator[Tuple[str, bool, bool, bool] | Tuple[str, bool, bool, bool, tuple]]:
         """Yield every record in file order.
 
@@ -482,10 +615,45 @@ class ZnaReader:
             If ``True`` and the file was strand-normalized, reverse-complement
             records that were RC'd during encoding (using the per-record
             ``IS_RC`` flag) to restore original orientation.
+        with_ends
+            If ``True``, yield ``has_start, has_end`` — whether the **left** and
+            **right** edge of the stored sequence is a true fragment boundary.
+            This is the form a consumer placing fragment-end supervision wants:
+            it already combines ``IS_RC`` with ``IS_FULL_FRAGMENT``, so a caller
+            never has to re-derive the geometry (and a full-fragment record
+            correctly reports *both* edges, which ``with_rc`` alone cannot
+            express).  The pair round-trips losslessly back to the two flags.
+        with_rc
+            If ``True``, include the per-record ``IS_RC`` flag in each tuple.
+            This is the only way to recover which edge of a mate is a real
+            fragment boundary — it cannot be derived from the sequence (see the
+            "Unstranded strand normalization" section of the README).  It is
+            mutually exclusive with ``restore_strand``, which *consumes* the
+            flag to undo the reverse-complement.
 
         Yields ``(seq, is_paired, is_read1, is_read2)`` for unlabeled files,
         or ``(seq, is_paired, is_read1, is_read2, labels)`` for labeled files.
+        With ``with_rc=True``, ``is_rc`` is inserted **before** ``labels``:
+        ``(seq, is_paired, is_read1, is_read2, is_rc)`` and
+        ``(seq, is_paired, is_read1, is_read2, is_rc, labels)``.  The default
+        widths (4, and 5 labeled) are a compatibility promise and never change.
         """
+        if restore_strand and (with_rc or with_ends):
+            raise ValueError(
+                "restore_strand=True is mutually exclusive with with_rc/with_ends: "
+                "restore_strand consumes IS_RC to undo the reverse-complement, so "
+                "the orientation they describe has already been undone."
+            )
+        if with_rc and with_ends:
+            raise ValueError(
+                "with_rc=True and with_ends=True are mutually exclusive; "
+                "with_ends already encodes IS_RC (has_end and not has_start)."
+            )
+        return self._iter_records(restore_strand, with_rc, with_ends)
+
+    def _iter_records(
+        self, restore_strand: bool, with_rc: bool, with_ends: bool = False
+    ) -> Iterator[tuple]:
         fh_read = self._fh.read
         read_exact = self._read_exact
         len_bytes = self._header.seq_len_bytes
@@ -573,7 +741,26 @@ class ZnaReader:
                     flags_stream, lengths_stream, seqs_stream, len_bytes, count
                 )
 
-            if has_labels:
+            if with_ends:
+                # IS_FULL_FRAGMENT is read straight off the flags column rather
+                # than widening the backends' record tuples, so both decoders
+                # (and the compiled extension) are untouched by this feature.
+                # zip over the flags bytes and a table lookup keep this close to
+                # the cost of the plain path.
+                ends = _ENDS_BY_FLAG
+                if has_labels:
+                    for rec, fl in zip(block_records, flags_stream):
+                        has_start, has_end = ends[fl]
+                        yield rec[0], rec[1], rec[2], rec[3], has_start, has_end, rec[5]
+                else:
+                    for rec, fl in zip(block_records, flags_stream):
+                        has_start, has_end = ends[fl]
+                        yield rec[0], rec[1], rec[2], rec[3], has_start, has_end
+            elif with_rc:
+                # Both backends already decode to exactly this shape:
+                # (seq, is_paired, is_read1, is_read2, is_rc[, labels])
+                yield from block_records
+            elif has_labels:
                 if needs_restore:
                     for seq, is_paired, is_read1, is_read2, is_rc, labels in block_records:
                         if is_rc:
@@ -662,16 +849,25 @@ def write_zna(
     header: ZnaHeader,
     records: Iterable[Tuple[str, bool, bool, bool]],
     npolicy: str | None = None,
+    preserve_normalization: bool = False,
 ) -> None:
-    """Write a complete ZNA file from an iterable of records."""
-    with ZnaWriter(fh, header, npolicy=npolicy) as writer:
+    """Write a complete ZNA file from an iterable of records.
+
+    Pass ``preserve_normalization=True`` when *records* already carry their
+    normalized frame and a trailing ``is_rc`` (as from
+    :meth:`ZnaReader.records` with ``with_rc=True``); see :class:`ZnaWriter`.
+    """
+    with ZnaWriter(
+        fh, header, npolicy=npolicy, preserve_normalization=preserve_normalization
+    ) as writer:
         writer.write_records(records)
 
 
 def read_zna(
     fh: BinaryIO,
     restore_strand: bool = False,
+    with_rc: bool = False,
 ) -> Tuple[ZnaHeader, Iterator[Tuple[str, bool, bool, bool]]]:
     """Read a ZNA file header and return a record iterator."""
     reader = ZnaReader(fh)
-    return reader.header, reader.records(restore_strand=restore_strand)
+    return reader.header, reader.records(restore_strand=restore_strand, with_rc=with_rc)

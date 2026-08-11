@@ -14,6 +14,13 @@ permutation over all units.
 
 *K* is derived from ``buffer_bytes`` so that each bucket fits
 comfortably in memory during step 2.
+
+A shuffle is a pure permutation, so orientation must be copied rather than
+re-derived: every writer here runs in pass-through mode
+(``preserve_normalization=True``) and carries each record's ``IS_RC`` flag
+through verbatim.  Re-deriving it would reverse-complement a second time on the
+bucket pass and a third time on the output pass, leaving the sequences plausible
+but ``IS_RC`` uncorrelated with the real fragment boundary.
 """
 from __future__ import annotations
 
@@ -23,7 +30,7 @@ import sys
 import tempfile
 from typing import List, Tuple
 
-from .core import ZnaHeader, ZnaWriter, ZnaReader
+from .core import ZnaHeader, ZnaWriter, ZnaReader, _flags_from_ends
 
 
 # Type alias for a single record tuple (without or with labels).
@@ -129,7 +136,9 @@ def shuffle_zna(
         ]
         bucket_fhs = [open(p, "wb") for p in bucket_paths]
         bucket_writers = [
-            ZnaWriter(fh, out_header, block_size=block_size) for fh in bucket_fhs
+            ZnaWriter(fh, out_header, block_size=block_size,
+                      preserve_normalization=True)
+            for fh in bucket_fhs
         ]
 
         try:
@@ -138,42 +147,49 @@ def shuffle_zna(
                 distributed = 0
                 _pending_bucket = 0
 
-                for rec in reader.records():
+                for rec in reader.records(with_ends=True):
                     seq = rec[0]
                     is_paired = rec[1]
                     is_read1 = rec[2]
                     is_read2 = rec[3]
-                    labels = rec[4] if has_labels else None
+                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
+                    labels = rec[6] if has_labels else None
 
                     if is_paired and is_read1:
                         _pending_bucket = rng.randrange(n_buckets)
                         if has_labels:
                             bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels
+                                seq, is_paired, is_read1, is_read2, labels=labels,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                         else:
                             bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2
+                                seq, is_paired, is_read1, is_read2,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                     elif is_paired and is_read2:
                         if has_labels:
                             bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels
+                                seq, is_paired, is_read1, is_read2, labels=labels,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                         else:
                             bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2
+                                seq, is_paired, is_read1, is_read2,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                         distributed += 1
                     else:
                         bucket_idx = rng.randrange(n_buckets)
                         if has_labels:
                             bucket_writers[bucket_idx].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels
+                                seq, is_paired, is_read1, is_read2, labels=labels,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                         else:
                             bucket_writers[bucket_idx].write_record(
-                                seq, is_paired, is_read1, is_read2
+                                seq, is_paired, is_read1, is_read2,
+                                is_rc=is_rc, is_full_fragment=is_full,
                             )
                         distributed += 1
 
@@ -202,7 +218,8 @@ def shuffle_zna(
 
         written = 0
         with open(output_path, "wb") as out_fh:
-            out_writer = ZnaWriter(out_fh, out_header, block_size=block_size)
+            out_writer = ZnaWriter(out_fh, out_header, block_size=block_size,
+                                   preserve_normalization=True)
             try:
                 for bi in bucket_order:
                     bp = bucket_paths[bi]
@@ -214,7 +231,7 @@ def shuffle_zna(
                     with open(bp, "rb") as bfh:
                         breader = ZnaReader(bfh)
                         current_unit: List[Record] = []
-                        for rec in breader.records():
+                        for rec in breader.records(with_ends=True):
                             is_paired = rec[1]
                             is_read1 = rec[2]
                             is_read2 = rec[3]
@@ -242,14 +259,17 @@ def shuffle_zna(
                             is_paired = rec[1]
                             is_read1 = rec[2]
                             is_read2 = rec[3]
+                            is_rc, is_full = _flags_from_ends(rec[4], rec[5])
                             if has_labels:
-                                labels = rec[4]
+                                labels = rec[6]
                                 out_writer.write_record(
-                                    seq, is_paired, is_read1, is_read2, labels=labels
+                                    seq, is_paired, is_read1, is_read2, labels=labels,
+                                    is_rc=is_rc, is_full_fragment=is_full,
                                 )
                             else:
                                 out_writer.write_record(
-                                    seq, is_paired, is_read1, is_read2
+                                    seq, is_paired, is_read1, is_read2,
+                                    is_rc=is_rc, is_full_fragment=is_full,
                                 )
                     written += len(units)
 
