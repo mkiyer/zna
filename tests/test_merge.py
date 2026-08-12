@@ -223,6 +223,35 @@ class TestScoreArithmetic:
 # backend selection
 # --------------------------------------------------------------------------- #
 
+class TestExtensionsAreDistinct:
+    """`zna._accel` and `zna.merge._accel` are two different extensions.
+
+    Both are imported as `_accel` within their package, so both CMake targets emit a
+    file called `_accel.cpython-*.so`. Without separate build output directories they
+    collide and one overwrites the other — which happened during development: the merge
+    scan ended up installed as `zna._accel`, `zna.is_accelerated()` returned False, and
+    the codec silently fell back to pure Python. Nothing in the merge suite noticed,
+    because the merge suite was perfectly happy.
+    """
+
+    def test_the_codec_extension_is_the_codec(self):
+        accel = pytest.importorskip("zna._accel")
+        assert hasattr(accel, "encode_block"), "zna._accel is not the codec extension"
+        assert not hasattr(accel, "scan")
+
+    def test_the_merge_extension_is_the_scan(self):
+        accel = pytest.importorskip("zna.merge._accel")
+        assert hasattr(accel, "scan"), "zna.merge._accel is not the scan extension"
+        assert not hasattr(accel, "encode_block")
+
+    def test_the_codec_is_still_accelerated(self):
+        """The whole point of the package. A build that quietly loses this passes every
+        functional test it has, which is why the conda recipe asserts it too."""
+        pytest.importorskip("zna._accel")
+        import zna
+        assert zna.is_accelerated()
+
+
 class TestBackendSelection:
     """The kernel is selectable, the same way the codec's is.
 
@@ -256,6 +285,227 @@ class TestBackendSelection:
         finally:
             overlap.use_backend(original)
         assert overlap.backend_name() == original
+
+
+# --------------------------------------------------------------------------- #
+# cross-backend equivalence: the accelerated scan must agree EXACTLY
+# --------------------------------------------------------------------------- #
+
+def _backends():
+    from zna.merge.backend import available_merge_backends, get_merge_backend
+    if "accel" not in available_merge_backends():
+        pytest.skip("C++ merge backend not built")
+    return get_merge_backend("python").scan, get_merge_backend("accel").scan
+
+
+@pytest.fixture(params=["python", "accel"])
+def any_backend(request):
+    """Run a test once per available backend.
+
+    Without this, anything that goes through ``find_overlap`` silently tests only
+    whichever backend is *selected* — which is ``accel`` wherever it is built, leaving
+    the reference oracle unchecked in exactly the environment that ships. The oracle is
+    what the accelerated kernel is defined to agree with, so an unchecked oracle makes
+    the whole cross-backend suite circular.
+    """
+    from zna.merge import overlap
+    from zna.merge.backend import available_merge_backends
+    if request.param not in available_merge_backends():
+        pytest.skip(f"{request.param} merge backend not available")
+    original = overlap.backend_name()
+    overlap.use_backend(request.param)
+    try:
+        yield request.param
+    finally:
+        overlap.use_backend(original)
+
+
+def exhaustive_scan(s1, s2rc, floor_q):
+    """Every shift, no pruning, no early exit — the slow truth to check a scan against."""
+    out = []
+    for s in range(-(len(s2rc) - 1), len(s1)):
+        lo, hi = max(s, 0), min(len(s1), s + len(s2rc))
+        n = hi - lo
+        if n <= 0:
+            continue
+        off = lo - s
+        d = sum(s1[lo + k] != s2rc[off + k] for k in range(n))
+        sc = score_of(n - d, d)
+        if sc >= floor_q:
+            out.append((s, n, d, sc))
+    return out
+
+
+def argmax_by_rule(scored):
+    """The specified order: maximise score, then minimise s. Returns (winner, n_ties)."""
+    top = max(t[3] for t in scored)
+    ties = [t for t in scored if t[3] == top]
+    return min(ties, key=lambda t: t[0]), len(ties)
+
+
+#: Periodic content on unequal-length mates: the plateau then holds several shifts of
+#: equal overlap and equal mismatch count, which is the only way ties arise in practice.
+#: Random sequence essentially never ties -- a sweep over 7,000 random and adversarial
+#: pairs produced exactly zero -- so any tie-break assertion must build them like this.
+def tie_fixtures():
+    # (a) PLATEAU ties: unequal-length mates, so several maximal-overlap shifts exist,
+    #     and periodic content makes some of them score identically.
+    for period in (b"CA", b"ACG", b"AT", b"A", b"CAG", b"ACGT"):
+        for l1 in range(20, 46, 3):
+            for l2 in range(20, 46, 3):
+                seq = period * 50
+                yield seq[:l1], seq[:l2], f"plateau-{period.decode()}-{l1}x{l2}"
+
+    # (b) FLANK ties: equal-length mates, periodic, mutually OUT of phase. The plateau
+    #     (s=0) then mismatches everywhere and is rejected, while the two flanks at the
+    #     same overlap length both come into phase — s = -k and s = +k, tied at the top,
+    #     one read-through and one normal. This is the only construction that
+    #     distinguishes the two flanks' visiting order, and without it swapping them
+    #     passes every other test in this file while changing the winner on every tied
+    #     pair. Verified to produce shifts {-1, +1} for CA/AC and {-2, +2} for ACGT/GTAC.
+    for period, rot in ((b"CA", b"AC"), (b"ACGT", b"GTAC"), (b"AATT", b"TTAA")):
+        for L in (24, 30, 40, 41, 50):
+            yield (period * 40)[:L], (rot * 40)[:L], f"flank-{period.decode()}-L{L}"
+
+
+class TestCrossBackend:
+    """The oracle and the accelerated kernel are one algorithm with two implementations.
+
+    Equality here is exact, not approximate, and that is only possible because the score
+    is an integer (params.py) and the argmax is a specified total order rather than an
+    artifact of iteration order (docs/MERGE_CPP_DESIGN.md §5). Asserting the weaker
+    "returned *an* argmax" would let a tie-break divergence through, and a tie-break
+    divergence changes which bases a merged read is built from.
+    """
+
+    ARGS = (_P.match_q, _P.step_q, _P.t_trim_q)
+
+    def _agree(self, s1, s2rc, label):
+        py, cc = _backends()
+        a = py(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
+        b = cc(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
+        assert a == b, (label, a, b)
+        return a
+
+    def test_overlapping_pairs(self):
+        rng = random.Random(11)
+        for i in range(400):
+            frag = draw(rng, rng.randrange(40, 320))
+            l1 = rng.randrange(20, 151)
+            l2 = rng.randrange(20, 151)
+            r1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
+            r2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
+            self._agree(r1, rc(r2), f"ovl{i}")
+
+    def test_unrelated_pairs_exercise_the_rejection_path(self):
+        """Where the scan spends nearly all its time: every shift bails early."""
+        rng = random.Random(12)
+        for i in range(400):
+            self._agree(draw(rng, rng.randrange(1, 200)),
+                        draw(rng, rng.randrange(1, 200)), f"unrel{i}")
+
+    @pytest.mark.parametrize("s1,s2rc", [
+        (b"", b""), (b"", b"ACGT"), (b"ACGT", b""), (b"A", b"A"), (b"A", b"T"),
+        (b"ACGT" * 4, b"ACGT" * 4),                       # exactly one vector wide
+        (b"ACGT" * 8, b"ACGT" * 8),                       # exactly one bail block
+        (b"ACGT" * 8 + b"A", b"ACGT" * 8 + b"A"),         # one past a bail block
+        (b"ACGT" * 4 + b"A", b"ACGT" * 4 + b"A"),         # one past a vector
+        (b"N" * 40, b"N" * 40),                           # N vs N is a match
+        (b"N" * 40, b"A" * 40),                           # N vs A is not
+        (b"RYKMSWBDHVN" * 4, b"RYKMSWBDHVN" * 4),         # IUPAC compares as itself
+        (b"acgt" * 10, b"ACGT" * 10),                     # case is significant
+    ])
+    def test_edges_and_non_acgt(self, s1, s2rc):
+        """Byte comparison IS the reference semantics, so none of this needs a special
+        path — but that claim is exactly what a packed kernel would break, so pin it."""
+        self._agree(s1, s2rc, repr((s1[:12], s2rc[:12])))
+
+    def test_a_mismatch_at_every_position_of_a_bail_block(self):
+        """The vector loop's own block-loop test.
+
+        `test_block_loop_sees_every_position` guards the reference's 8-wide unrolled
+        loop; this guards the accelerated 16-byte/32-base one. A stride bug, a wrong
+        vector boundary, or a tail that starts one byte late mis-scores only overlaps
+        whose mismatch sits at particular offsets — so sweep it across a vector
+        boundary, a bail-block boundary, and into the scalar tail.
+        """
+        rng = random.Random(13)
+        for n in (16, 31, 32, 33, 40, 47, 48, 49, 64, 65, 150):
+            frag = draw(rng, n)
+            for i in range(n):
+                r1 = bytearray(frag)
+                r1[i] = ord("A") if r1[i] != ord("A") else ord("C")
+                got = self._agree(bytes(r1), frag, f"n{n}pos{i}")
+                assert got[3] == 1, (n, i, got)      # exactly one mismatch, found
+
+    def test_lengths_around_the_vector_and_block_boundaries(self):
+        """Reads whose length lands on, either side of, and between the 16- and 32-byte
+        boundaries — where an off-by-one in the tail would hide."""
+        rng = random.Random(14)
+        for l1 in range(1, 70):
+            for l2 in (l1, max(1, l1 - 1), l1 + 1, 16, 32, 33):
+                frag = draw(rng, l1 + l2)
+                self._agree(frag[:l1], rc(rc(frag[-l2:])), f"{l1}x{l2}")
+
+    def test_deliberate_ties_agree_and_follow_the_specified_order(self):
+        """The test this class was missing, and the one that matters most.
+
+        Everything above is built from random or adversarial sequence, which essentially
+        never ties — so *reversing the flank visiting order in the C++ kernel passes
+        every other test in this class*, while silently changing which shift wins on
+        every tied pair, and with it which bases a merged read is built from.
+
+        Ties need periodic content on unequal-length mates. Here both backends must not
+        only agree with each other but land on the specified winner: maximise score,
+        then minimise s.
+        """
+        py, cc = _backends()
+        n_tied = 0
+        for s1, s2rc, label in tie_fixtures():
+            a = py(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
+            b = cc(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
+            assert a == b, (label, a, b)
+            scored = exhaustive_scan(s1, s2rc, _P.t_trim_q)
+            if not scored:
+                assert a[2] == 0, label
+                continue
+            (want_s, want_n, want_d, want_sc), ties = argmax_by_rule(scored)
+            assert a == (want_s, want_sc, want_n, want_d), (label, a, want_s, ties)
+            n_tied += ties - 1
+        assert n_tied >= 100, f"only {n_tied} ties exercised; the tie-break is untested"
+
+    def test_random_bytes_not_just_nucleotides(self):
+        """The kernel promises raw byte semantics; hold it to that on arbitrary input."""
+        rng = random.Random(15)
+        for i in range(300):
+            n1, n2 = rng.randrange(0, 80), rng.randrange(0, 80)
+            self._agree(bytes(rng.randrange(256) for _ in range(n1)),
+                        bytes(rng.randrange(256) for _ in range(n2)), f"bytes{i}")
+
+    def test_whole_pairs_agree_through_process_pair(self):
+        """One level up: the same decisions, records and counters from either backend."""
+        from zna.merge import overlap
+        _backends()          # skips when the extension is not built, like the rest
+        rng = random.Random(16)
+        pairs = []
+        for _ in range(300):
+            frag = draw(rng, rng.randrange(40, 320))
+            l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
+            r1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
+            r2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
+            pairs.append((r1, qual(r1), r2, qual(r2)))
+
+        def run(name):
+            original = overlap.backend_name()
+            try:
+                overlap.use_backend(name)
+                return [process_pair(b"x/1", s1, q1, b"x/2", s2, q2,
+                                     MergeParams(min_read_length=40))
+                        for s1, q1, s2, q2 in pairs]
+            finally:
+                overlap.use_backend(original)
+
+        assert run("python") == run("accel")
 
 
 # --------------------------------------------------------------------------- #
@@ -315,39 +565,21 @@ class TestArgmaxTotalOrder:
     ties here are built deliberately.
     """
 
-    @staticmethod
-    def _exhaustive(s1, s2rc, floor_q):
-        """Every shift, no pruning, no early exit."""
-        out = []
-        for s in range(-(len(s2rc) - 1), len(s1)):
-            lo, hi = max(s, 0), min(len(s1), s + len(s2rc))
-            n = hi - lo
-            if n <= 0:
-                continue
-            off = lo - s
-            d = sum(s1[lo + k] != s2rc[off + k] for k in range(n))
-            sc = score_of(n - d, d)
-            if sc >= floor_q:
-                out.append((s, n, d, sc))
-        return out
-
     def _check(self, s1, s2rc, label):
         p = MergeParams()
         direction, shift, olen, diff, score = find_overlap(s1, s2rc, p)
         got = None if direction == NO_OVERLAP else (
             (shift if direction == FORWARD else -shift), olen, diff)
-        allsc = self._exhaustive(s1, s2rc, p.t_trim_q)
+        allsc = exhaustive_scan(s1, s2rc, p.t_trim_q)
         if not allsc:
             assert got is None, label
             return 0
-        top = max(t[3] for t in allsc)
-        ties = [t for t in allsc if t[3] == top]
-        want = min(ties, key=lambda t: t[0])           # ...among ties, the smallest s
-        assert got == (want[0], want[1], want[2]), (label, got, want, len(ties))
-        assert score == top, label
-        return len(ties) - 1
+        want, n_ties = argmax_by_rule(allsc)
+        assert got == (want[0], want[1], want[2]), (label, got, want, n_ties)
+        assert score == want[3], label
+        return n_ties - 1
 
-    def test_matches_an_unpruned_scan_on_real_reads(self):
+    def test_matches_an_unpruned_scan_on_real_reads(self, any_backend):
         rng = random.Random(9)
         for i in range(300):
             frag = draw(rng, rng.randrange(40, 110))
@@ -356,18 +588,13 @@ class TestArgmaxTotalOrder:
             r2 = (rc(frag) + ADAPTER2 + draw(rng, 60))[:l2]
             self._check(r1, rc(r2), f"real{i}")
 
-    def test_ties_are_broken_towards_the_smallest_shift(self):
+    def test_ties_are_broken_towards_the_smallest_shift(self, any_backend):
         """Periodic content on unequal-length mates makes the plateau tie exactly.
 
         Without this the tie-break is untested: an earlier sweep over 7,000 random and
         adversarial pairs produced *zero* ties and proved nothing about it.
         """
-        tied = 0
-        for period in (b"CA", b"ACG", b"AT"):
-            for l1 in range(20, 46, 3):
-                for l2 in range(20, 46, 3):
-                    seq = period * 40
-                    tied += self._check(seq[:l1], seq[:l2], f"{period}-{l1}x{l2}")
+        tied = sum(self._check(s1, s2rc, label) for s1, s2rc, label in tie_fixtures())
         assert tied >= 100, f"only {tied} ties exercised; the tie-break is untested"
 
     def test_a_tie_across_different_overlap_lengths_is_unreachable(self):
@@ -449,7 +676,7 @@ class TestFindOverlap:
             assert (direction, shift, olen) == (FORWARD, 60, 40)
             assert score == score_of(40)
 
-    def test_block_loop_sees_every_position(self):
+    def test_block_loop_sees_every_position(self, any_backend):
         """Sweep a single mismatch across every position of a 40 bp overlap.
 
         ``_shift_score`` accumulates mismatches branchlessly in blocks of 8 and only

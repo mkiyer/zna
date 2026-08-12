@@ -66,3 +66,38 @@ endif()
 
 # Install the module into the zna package
 install(TARGETS _accel LIBRARY DESTINATION zna)
+
+# --- zna.merge._accel: the overlap scan -------------------------------------
+#
+# A second target rather than more of src/zna/_accel.cpp: merging is a different
+# concern from the codec, a failure to build one must not take out the other, and
+# `import zna` must keep costing nothing.
+#
+# No -march, no ISA flags, no runtime dispatch.  The kernel uses 16-byte vectors,
+# which are baseline on every target we build for -- NEON on aarch64, SSE2 on
+# x86-64 -- and falls back to a scalar loop anywhere else.  Anything wider is not
+# baseline, and per docs/MERGE_CPP_DESIGN.md §6.1 is not obviously faster either:
+# the scan is rejection-dominated, so the bail interval matters more than the
+# vector width.  x86 tuning is scheduled for 0.4.1 (docs/FUTURE.md).
+nanobind_add_module(
+    _merge_accel
+    NB_STATIC
+    src/zna/merge/_accel.cpp
+)
+# Both extensions are imported as `_accel` (from zna and from zna.merge), so both
+# targets produce a file called _accel.cpython-*.so.  Without a separate output
+# directory they collide in the build tree and one silently overwrites the other --
+# which happened, and left `zna._accel` holding the merge scan while
+# `zna.is_accelerated()` quietly returned False and the codec fell back to pure Python.
+# tests/test_merge.py::TestExtensionsAreDistinct pins it.
+set_target_properties(_merge_accel PROPERTIES
+    OUTPUT_NAME "_accel"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/merge"
+)
+target_compile_features(_merge_accel PRIVATE cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(_merge_accel PRIVATE -O3)
+else()
+    target_compile_options(_merge_accel PRIVATE /O2)
+endif()
+install(TARGETS _merge_accel LIBRARY DESTINATION zna/merge)
