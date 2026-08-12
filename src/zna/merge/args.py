@@ -12,6 +12,10 @@ This module imports nothing but ``argparse``. Keep it that way.
 from __future__ import annotations
 
 import argparse
+import os
+
+#: More threads than this cannot help -- see --threads.
+_DEFAULT_THREADS = min(4, os.cpu_count() or 1)
 
 _DESCRIPTION = ("Overlap-merge paired-end reads (and trim residual overlap on unmerged "
                 "pairs) into one mixed interleaved FASTQ for ZNA encoding.")
@@ -45,15 +49,13 @@ from the two Phred scores (and derates its quality, because a contested base is
 less certain) -- no cutoffs, nothing to tune. Defaults suit 2x150 bp data; you
 normally set nothing.
 
-Example (production, multicore node):
-  zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz \\
-            --json merge.json --threads 8 --processes 8
+Example:
+  zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz --json merge.json
 
-PERFORMANCE: the overlap scan is JIT-compiled with numba, which is an OPTIONAL zna
-dependency -- install it with `pip install zna[merge]`. Without it the identical
-scan runs as pure Python, correct but ~50x slower, so this command refuses to start
-rather than turn a fast job into a silently slow one; pass --allow-slow if you mean
-it. Set --processes to the number of allocated cores.
+PERFORMANCE: the merge kernel is compiled C++ and releases the GIL, so --threads
+are real threads. It is not usually the bottleneck -- gzip decompression is -- so
+2-3 threads saturate and more does nothing. Output is byte-identical at any thread
+count.
 """
 
 
@@ -67,15 +69,18 @@ def add_merge_arguments(p):
     p.add_argument("--in2", required=True, help="R2 FASTQ (optionally .gz)")
     p.add_argument("--out", required=True, help="output mixed interleaved FASTQ (.gz to gzip)")
     p.add_argument("--json", help="write run statistics (length histogram, counts) as JSON")
-    p.add_argument("--threads", type=int, default=4, help="pigz threads for gzip I/O")
-    p.add_argument("--processes", type=int, default=1,
-                   help="worker processes for the merge scan. 1 = single process. "
-                        "Set to the allocated core count on a cluster node for a large "
-                        "speedup (output order is irrelevant, so this is safe).")
+    p.add_argument("--threads", type=int, default=_DEFAULT_THREADS,
+                   help="merge worker threads. The merge kernel releases the GIL, so "
+                        "these are real. Compute is ~1 us/pair against a ~0.8 us/pair "
+                        "gzip decompression floor, so 2-3 saturates and more does "
+                        "nothing.")
+    p.add_argument("--io-threads", type=int, default=4,
+                   help="pigz threads for the gzipped OUTPUT. The reader always uses "
+                        "one, because pigz cannot parallelise inflate and extra reader "
+                        "threads only contend with the workers.")
     p.add_argument("--chunk-size", type=int, default=2000,
-                   help="read pairs per work unit. Smaller chunks keep the workers fed "
-                        "and bound the parent's memory; 50000 measured 1.24x slower "
-                        "end to end because the pool drains between refills.")
+                   help="read pairs per work unit. Bounds memory and sets the "
+                        "parallel granularity.")
     p.add_argument("--compress-level", type=int, default=1,
                    help="pigz level for --out. Default 1 (fast): the output is an "
                         "intermediate consumed by `zna encode`, so speed beats ratio. "
@@ -88,11 +93,10 @@ def add_merge_arguments(p):
                    help="overlap score (bits) >= this (but below --threshold-merge) "
                         "-> keep both reads and trim the redundant overlap off R2's "
                         "3' end. Low on purpose: a wrong trim costs a few bases.")
-    p.add_argument("--min-read-length", "--length-required", type=int, default=40,
-                   dest="min_read_length",
+    p.add_argument("--min-read-length", type=int, default=40, dest="min_read_length",
                    help="drop emitted reads shorter than this (after merge/trim; a "
                         "trimmed read can fall below it). MUST match the pipeline-wide "
-                        "floor used by the initial fastp run. `--length-required` is an alias.")
+                        "floor used by any earlier quality-trimming step.")
     p.add_argument("--no-sync-check", action="store_true",
                    help="skip the per-pair R1/R2 read-name consistency check")
     p.add_argument("--allow-empty", action="store_true",
@@ -100,10 +104,13 @@ def add_merge_arguments(p):
                         "empty input otherwise succeeds silently all the way to a "
                         "0-record .zna, and the library vanishes from the corpus with "
                         "every stage green.")
-    p.add_argument("--allow-slow", action="store_true",
-                   help="run without numba. Off by default: the pure-Python scan is "
-                        "correct but ~50x slower, and a silently-correct 50x slowdown "
-                        "on a cluster is indistinguishable from a slow node.")
+    p.add_argument("--backend", choices=("auto", "accel", "python"), default="auto",
+                   help="merge kernel. `auto` uses the compiled backend and fails if it "
+                        "is missing; `python` selects the reference implementation, "
+                        "which is correct but ~50x slower and exists to be an oracle, "
+                        "not a fallback. A silently-correct 50x slowdown on a cluster "
+                        "is indistinguishable from a slow node, so it is never chosen "
+                        "for you.")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress progress logging")
     return p
 

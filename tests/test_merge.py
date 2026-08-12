@@ -23,7 +23,7 @@ from zna.merge.overlap import (
     FORWARD, NO_OVERLAP, REVERSE, find_overlap, reverse_complement,
 )
 from zna.merge.params import (
-    SCALE, MergeParams, score_weights, threshold_bits, to_bits, to_q,
+    DISAGREE_Q, SCALE, MergeParams, score_weights, threshold_bits, to_bits, to_q,
 )
 from zna.merge.pairs import PairOutcome, base_name, process_pair
 from zna.merge import cli
@@ -298,6 +298,15 @@ def _backends():
     return get_merge_backend("python").scan, get_merge_backend("accel").scan
 
 
+def _chunk_backends():
+    """The two `merge_chunk` implementations, for the level-3 differential."""
+    from zna.merge.backend import available_merge_backends, get_merge_backend
+    if "accel" not in available_merge_backends():
+        pytest.skip("C++ merge backend not built")
+    return (get_merge_backend("python").merge_chunk,
+            get_merge_backend("accel").merge_chunk)
+
+
 @pytest.fixture(params=["python", "accel"])
 def any_backend(request):
     """Run a test once per available backend.
@@ -481,6 +490,67 @@ class TestCrossBackend:
             n1, n2 = rng.randrange(0, 80), rng.randrange(0, 80)
             self._agree(bytes(rng.randrange(256) for _ in range(n1)),
                         bytes(rng.randrange(256) for _ in range(n2)), f"bytes{i}")
+
+    def test_chunks_agree_blob_for_blob(self):
+        """Level 3: the production path. Same bytes out, same counters, same histograms.
+
+        This is the strongest check available — it needs no model of what the answer
+        should be, only that two independent implementations of one specification agree
+        completely on a realistic input.
+        """
+        py, cc = _chunk_backends()
+        rng = random.Random(17)
+        r1s, r2s = [], []
+        for i in range(400):
+            frag = draw(rng, rng.randrange(40, 320))
+            l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
+            s1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
+            s2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
+            # quality varies so the posterior consensus actually has work to do
+            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
+            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
+            r1s.append(b"@f%d/1 tag\n%b\n+\n%b\n" % (i, s1, q1))
+            r2s.append(b"@f%d/2 tag\n%b\n+\n%b\n" % (i, s2, q2))
+        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+
+        a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+        b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+        assert a[0] == b[0], "blobs differ"
+        assert a[1:3] == b[1:3], "consumed byte counts differ"
+        assert a[3] == b[3], "counters differ"
+        assert list(a[4]) == list(b[4]) and list(a[5]) == list(b[5]) \
+            and list(a[6]) == list(b[6]), "histograms differ"
+        assert a[3][0] == 400 and a[3][1] > 100, a[3]      # the fixture proves nothing
+        assert a[3][8] > 0, "no consensus changes: the fixture is not exercising it"
+
+    @pytest.mark.parametrize("payload", [
+        b"",                                             # empty buffer
+        b"@r1\nACGT\n+\nIIII\n",                         # a single complete record
+        b"@r1\nACGT\n+\nIIII\n@r2\nAC",                  # trailing partial record
+        b"@r1\r\nACGT\r\n+\r\nIIII\r\n",                 # CRLF must not reach the output
+        b"@r1\nacgt\n+\nIIII\n",                         # lower case is upper-cased
+    ])
+    def test_parsing_edges_agree(self, payload):
+        """The parser is where the audit's prototype had its four defects; CRLF
+        surviving into the sequence was one of them."""
+        py, cc = _chunk_backends()
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 1, DISAGREE_Q, False, 0)
+        a = py(payload, 0, len(payload), payload, 0, len(payload), *args)
+        b = cc(payload, 0, len(payload), payload, 0, len(payload), *args)
+        assert a[0] == b[0] and a[1:4] == b[1:4], (a, b)
+        assert b"\r" not in a[0], "CRLF leaked into the output"
+
+    def test_split_records_agrees(self):
+        py = __import__("zna.merge._pymerge", fromlist=["x"]).split_records
+        from zna.merge.backend import available_merge_backends, get_merge_backend
+        if "accel" not in available_merge_backends():
+            pytest.skip("C++ merge backend not built")
+        cc = get_merge_backend("accel").split_records
+        buf = b"".join(b"@r%d\nACGTAC\n+\nIIIIII\n" % i for i in range(7)) + b"@part\nAC"
+        for start in (0, 22, 44):
+            for n in (0, 1, 3, 7, 99):
+                assert py(buf, start, n) == cc(buf, start, n), (start, n)
 
     def test_whole_pairs_agree_through_process_pair(self):
         """One level up: the same decisions, records and counters from either backend."""
@@ -1168,10 +1238,6 @@ class TestProcessPair:
         args = build_parser().parse_args(["--in1", "a", "--in2", "b", "--out", "c"])
         assert args.min_read_length == 40
         assert (args.t_merge, args.t_trim) == (28.0, 8.0)
-        # --length-required is accepted as an alias
-        assert build_parser().parse_args(
-            ["--in1", "a", "--in2", "b", "--out", "c", "--length-required", "33"]
-        ).min_read_length == 33
 
     def test_fully_redundant_r2_collapses_to_merged_insert(self):
         # R2 (15 bp) fully inside the overlap -> R1 spans the short insert -> merged single.
@@ -1391,8 +1457,9 @@ class TestCLI:
         with pytest.raises(SystemExit):
             cli.run(args)
 
-    def test_parallel_matches_single(self, tmp_path):
-        """--processes N must emit the SAME set of records as single-process."""
+    def test_threads_match_single(self, tmp_path):
+        """--threads N must emit the same records as one thread -- in fact the same
+        BYTES, because chunks are written in submission order."""
         r1s, r2s = [], []
         for i in range(40):
             insert = 30 + (i % 31)            # spans merge / trim / keep bands (L=100)
@@ -1406,7 +1473,7 @@ class TestCLI:
             out = tmp_path / f"o{procs}.fastq"
             args = cli.build_parser().parse_args([
                 "--in1", str(in1), "--in2", str(in2), "--out", str(out),
-                "--processes", str(procs), "--chunk-size", "7", "-q",
+                "--threads", str(procs), "--chunk-size", "7", "-q",
             ])
             stats = cli.run(args)
             lines = out.read_bytes().splitlines()
@@ -1444,12 +1511,12 @@ class TestCLI:
         ids = [l[1:].split()[0] for l in out.read_bytes().splitlines()[0::4]]
         assert set(ids) == {b"G/1", b"G/2"}                    # no lone S read emitted
 
-    def test_stats_are_identical_across_process_counts(self, tmp_path):
+    def test_stats_are_identical_across_thread_counts(self, tmp_path):
         """TOTAL equality, not a hardcoded key list.
 
-        Both paths now share one accounting implementation (`_process_chunk`), so this
-        is what pins it. The old test enumerated 8 keys and silently stopped covering
-        `score_histogram_bits` the moment it was added.
+        All counting happens in one place (the backend's merge_chunk), so this is what
+        pins it. An older version enumerated 8 keys and silently stopped covering a
+        histogram the moment it was added.
         """
         r1s, r2s = [], []
         for i in range(60):
@@ -1463,7 +1530,7 @@ class TestCLI:
             args = cli.build_parser().parse_args([
                 "--in1", str(in1), "--in2", str(in2),
                 "--out", str(tmp_path / f"o{procs}_{chunk}.fastq"),
-                "--processes", str(procs), "--chunk-size", str(chunk),
+                "--threads", str(procs), "--chunk-size", str(chunk),
                 "-q"])
             stats = cli.run(args)
             for wallclock in ("elapsed_s", "pairs_per_second"):
@@ -1502,24 +1569,48 @@ class TestCLI:
         stats = cli.run(cli.build_parser().parse_args(argv + ["--allow-empty"]))
         assert stats["input_pairs"] == 0
 
-    def test_truncated_final_quality_line_is_rejected(self, tmp_path):
-        """The one truncation the reader used to accept: `if not q` is satisfied by a
-        short-but-nonempty quality line, so the record was emitted malformed, rc=0."""
+    def _run_on(self, tmp_path, r1_bytes, r2_bytes):
         in1, in2 = tmp_path / "r1.fastq", tmp_path / "r2.fastq"
-        good = b"".join(b"@r%d/1\n%b\n+\n%b\n" % (i, rand_seq(40, i), b"I" * 40)
-                        for i in range(3))
-        in1.write_bytes(good[:-12])                   # cut inside the last quality line
-        in2.write_bytes(b"".join(b"@r%d/2\n%b\n+\n%b\n" % (i, rand_seq(40, 100 + i),
-                                                          b"I" * 40) for i in range(3)))
+        in1.write_bytes(r1_bytes)
+        in2.write_bytes(r2_bytes)
+        return cli.run(cli.build_parser().parse_args(
+            ["--in1", str(in1), "--in2", str(in2),
+             "--out", str(tmp_path / "o.fastq"), "-q"]))
+
+    @staticmethod
+    def _records(n, suffix, seed0):
+        return b"".join(b"@r%d/%b\n%b\n+\n%b\n" % (i, suffix, rand_seq(40, seed0 + i),
+                                                    b"I" * 40) for i in range(n))
+
+    def test_a_short_final_quality_line_is_rejected(self, tmp_path):
+        """The truncation the old reader accepted: a short-but-nonempty quality line
+        satisfied `if not q`, so the record was emitted malformed with rc=0."""
+        good = self._records(3, b"1", 0)
+        # drop 12 bases from the last quality line but KEEP its newline, so the record
+        # still looks complete and only the length check can catch it
+        broken = good[:-13] + b"\n"
         with pytest.raises(SystemExit, match="quality"):
-            cli.run(cli.build_parser().parse_args(
-                ["--in1", str(in1), "--in2", str(in2),
-                 "--out", str(tmp_path / "o.fastq"), "-q"]))
+            self._run_on(tmp_path, broken, self._records(3, b"2", 100))
+
+    def test_a_truncated_final_record_is_rejected(self, tmp_path):
+        """Cut so the last record loses its final newline: it is no longer a complete
+        record, and must be reported as truncation rather than as a count mismatch."""
+        good = self._records(3, b"1", 0)
+        with pytest.raises(SystemExit, match="truncated"):
+            self._run_on(tmp_path, good[:-12], self._records(3, b"2", 100))
+
+    def test_unequal_read_counts_are_rejected(self, tmp_path):
+        """Whole extra records on one side -- a different fault, and it must say so.
+        This is the one the audit's raw-blob prototype returned success for."""
+        with pytest.raises(SystemExit, match="unequal read counts"):
+            self._run_on(tmp_path, self._records(4, b"1", 0), self._records(3, b"2", 100))
+        with pytest.raises(SystemExit, match="unequal read counts"):
+            self._run_on(tmp_path, self._records(3, b"1", 0), self._records(4, b"2", 100))
 
     @pytest.mark.parametrize("flags", [
         ["--threshold-merge", "0.5", "--threshold-trim", "0.5"],   # merges 94% silently
         ["--min-read-length", "-5"],
-        ["--processes", "0"],
+        ["--threads", "0"],
         ["--chunk-size", "0"],
         ["--threshold-trim", "40"],                                # trim > merge
     ])
@@ -1549,13 +1640,11 @@ class TestCLI:
 # numba is an optional extra, and the CLI must not quietly do without it
 # --------------------------------------------------------------------------- #
 
-class TestNumbaIsRequiredByTheCLI:
-    """`pip install zna` leaves out numba; `pip install zna[merge]` adds it.
-
-    The pure-Python fallback is correct, so a numba-less run does not fail — it just
-    takes ~50x longer, which at cluster scale is indistinguishable from a slow node and
-    burns the whole allocation before anyone looks. So the command line refuses, and
-    `run()` — the in-process API this suite uses — does not.
+class TestTheCompiledBackendIsRequiredByTheCLI:
+    """The reference kernel is correct, so a run on it does not fail — it just takes
+    ~50x longer, which at cluster scale is indistinguishable from a slow node and burns
+    the whole allocation before anyone looks. So the command line refuses to choose it
+    for you, while `run()` — the in-process API this suite uses — does not.
     """
 
     def _args(self, tmp_path, extra=()):
@@ -1566,19 +1655,24 @@ class TestNumbaIsRequiredByTheCLI:
             ["--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fastq"),
              "--min-read-length", "10", "-q", *extra])
 
-    def test_the_cli_refuses_without_numba(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(cli, "HAVE_NUMBA", False)
-        with pytest.raises(SystemExit, match="allow-slow"):
+    def test_the_cli_refuses_when_the_compiled_backend_is_missing(self, tmp_path,
+                                                                  monkeypatch):
+        monkeypatch.setattr("zna.merge.backend.available_merge_backends",
+                            lambda: ["python"])
+        with pytest.raises(SystemExit, match="backend python"):
             cli.run_command(self._args(tmp_path))
 
-    def test_allow_slow_permits_it(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(cli, "HAVE_NUMBA", False)
-        assert cli.run_command(self._args(tmp_path, ["--allow-slow"])) == 0
+    def test_asking_for_the_reference_backend_by_name_is_allowed(self, tmp_path,
+                                                                 monkeypatch):
+        monkeypatch.setattr("zna.merge.backend.available_merge_backends",
+                            lambda: ["python"])
+        assert cli.run_command(self._args(tmp_path, ["--backend", "python"])) == 0
 
     def test_the_library_entry_point_never_refuses(self, tmp_path, monkeypatch):
         """`run()` is what `zna encode --merge-pairs` will call in-process, and what
         every other test here calls. The guard belongs to the CLI, not to it."""
-        monkeypatch.setattr(cli, "HAVE_NUMBA", False)
+        monkeypatch.setattr("zna.merge.backend.available_merge_backends",
+                            lambda: ["python"])
         assert cli.run(self._args(tmp_path))["input_pairs"] == 1
 
     def test_it_is_registered_as_a_zna_subcommand(self, tmp_path):
@@ -1593,10 +1687,14 @@ class TestNumbaIsRequiredByTheCLI:
         frag = rand_seq(40, 55)                       # overlap 20 -> merges
         (h1, s1, _), (h2, s2, _) = make_pair(frag, 30, name=b"S")
         _write_fastq_gz(in1, [(h1, s1)]); _write_fastq_gz(in2, [(h2, s2)])
+        from zna.merge.backend import available_merge_backends
+        # Without the compiled backend the CLI refuses by design, so name the one that
+        # is actually there -- the point of this test is the dispatch, not the kernel.
+        backend = "auto" if "accel" in available_merge_backends() else "python"
         proc = subprocess.run(
             [sys.executable, "-m", "zna.cli", "merge", "--in1", str(in1),
              "--in2", str(in2), "--out", str(out), "--min-read-length", "10",
-             "--allow-slow", "-q"],
+             "--backend", backend, "-q"],
             capture_output=True, text=True, timeout=300)
         assert proc.returncode == 0, proc.stderr
         assert out.read_bytes().splitlines()[1] == frag
@@ -1606,109 +1704,15 @@ class TestNumbaIsRequiredByTheCLI:
 # worker death: must fail, not hang
 # --------------------------------------------------------------------------- #
 
-_KILL_DRIVER = r'''
-import os, sys
-from zna.merge import cli
-
-_real = cli._process_chunk
-_seen = []
-
-def _suicidal(work):
-    """Die the way a cgroup OOM kill does: no exception, no cleanup, no exit handler."""
-    _seen.append(1)
-    if len(_seen) >= 2:
-        os._exit(9)
-    return _real(work)
-
-cli._process_chunk = _suicidal
-args = cli.build_parser().parse_args([
-    "--in1", {in1!r}, "--in2", {in2!r}, "--out", {out!r},
-    "--processes", "2", "--chunk-size", "5", "-q"])
-cli.run(args)
-'''
-
-
-_NO_FORK_DRIVER = r'''
-import multiprocessing as mp
-
-# Exactly what Windows does: no fork context is registered at all.
-_real = mp.get_context
-def _no_fork(method=None):
-    if method == "fork":
-        raise ValueError("cannot find context for 'fork'")
-    return _real(method)
-mp.get_context = _no_fork
-
-if __name__ == "__main__":          # spawn re-imports this module in each child
-    from zna.merge import cli
-
-    def run(procs, out):
-        stats = cli.run(cli.build_parser().parse_args(
-            ["--in1", {in1!r}, "--in2", {in2!r}, "--out", out,
-             "--processes", str(procs), "--chunk-size", "9", "-q"]))
-        for k in ("elapsed_s", "pairs_per_second"):
-            stats.pop(k, None)
-        lines = open(out, "rb").read().splitlines()
-        recs = frozenset((lines[i], lines[i + 1], lines[i + 3])
-                         for i in range(0, len(lines), 4))
-        return stats, recs
-
-    one = run(1, {out1!r})
-    many = run(2, {out2!r})
-    assert one == many, "no-fork parallel path diverged from single-process"
-    assert one[1], "no records emitted"
-    print("OK", len(one[1]))
-'''
-
-
-def test_the_parallel_path_survives_a_platform_without_fork(tmp_path):
-    """`_run_parallel` asks for a fork context so the workers inherit the parent's
-    already-JIT-compiled kernel. Windows has no fork at all, so without the fallback
-    `--processes 2` is a hard ValueError there — and no test on a POSIX box would ever
-    see it. Under the fallback each worker compiles the kernel itself (the kernels pass
-    `cache=True`, so that is a first-run cost), and the output must be unchanged.
-
-    Driven out of process because spawn re-imports the parent's `__main__`, which under
-    pytest is pytest itself.
-    """
-    import subprocess
-    in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
-    r1s, r2s = [], []
-    for i in range(30):
-        frag = rand_seq(260, 900 + i)[:100 + 30 + (i % 31)]
-        (h1, s1, _), (h2, s2, _) = make_pair(frag, 100, name=f"N{i}".encode())
-        r1s.append((h1, s1)); r2s.append((h2, s2))
-    _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
-    driver = tmp_path / "nofork.py"
-    driver.write_text(_NO_FORK_DRIVER.format(
-        in1=str(in1), in2=str(in2),
-        out1=str(tmp_path / "one.fastq"), out2=str(tmp_path / "many.fastq")))
-    proc = subprocess.run([sys.executable, str(driver)],
-                          capture_output=True, text=True, timeout=600)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.startswith("OK"), proc.stdout
-
-
-def test_a_killed_worker_fails_the_run_instead_of_hanging(tmp_path):
-    """`multiprocessing.Pool` cannot detect abrupt worker death: it respawns the
-    process while `IMapUnorderedIterator.next()` blocks on a result that will never
-    arrive, so the parent sits at 0% CPU forever. At cluster scale that is
-    indistinguishable from a slow node and burns the whole wall-clock allocation.
-
-    The pass condition is not just "non-zero exit" — it is *terminating at all*. A
-    timeout here is the regression.
-    """
-    import subprocess
-    in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
-    _write_fastq_gz(in1, [(b"K%d/1" % i, rand_seq(60, i)) for i in range(200)])
-    _write_fastq_gz(in2, [(b"K%d/2" % i, rand_seq(60, 500 + i)) for i in range(200)])
-    driver = tmp_path / "driver.py"
-    driver.write_text(_KILL_DRIVER.format(
-        in1=str(in1), in2=str(in2), out=str(tmp_path / "o.fastq")))
-    try:
-        proc = subprocess.run([sys.executable, str(driver)],
-                              capture_output=True, text=True, timeout=90)
-    except subprocess.TimeoutExpired:
-        pytest.fail("the run hung after a worker was killed (the mp.Pool behaviour)")
-    assert proc.returncode != 0
-    assert "worker died" in (proc.stderr + proc.stdout)
+# The process pool is gone: the merge kernel releases the GIL, so workers are threads.
+# Two tests went with it, and it is worth recording what they covered rather than
+# quietly dropping them:
+#
+#   * `test_a_killed_worker_fails_the_run_instead_of_hanging` -- mp.Pool could not
+#     detect abrupt worker death and blocked forever. There are no worker processes to
+#     kill now; a fatal fault takes the whole process down, loudly.
+#   * `test_the_parallel_path_survives_a_platform_without_fork` -- there is no fork
+#     context to be missing.
+#
+# What replaced them is stronger than either: output is written in submission order, so
+# `test_threads_match_single` compares whole files across thread counts.

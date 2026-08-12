@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "merge_core.hpp"
+#include "fastq_chunk.hpp"
 
 namespace {
 
@@ -97,6 +98,64 @@ int main() {
         run(s, s);
     }
 
-    std::printf("asan_scan: %lld scans clean\n", checks);
+    // ---- the chunk adapter: parser, formatter, counters -------------------------
+    //
+    // The parser is where the audit's raw-blob prototype had four defects, three of
+    // them out-of-bounds reads on malformed input. Feed it truncations at EVERY byte
+    // offset, out of exactly-sized allocations so a one-byte overread traps.
+    const uint8_t table[256 * 256] = {};                 // contents irrelevant here
+    const zna_merge::Params params{33311170, 137813407, 28 * (1 << 24), 8 * (1 << 24),
+                                   40, table};
+    std::string good;
+    for (int i = 0; i < 6; ++i) {
+        auto s = draw(rng, 60 + (size_t)(rng() % 40), "ACGT", 4);
+        good += "@read" + std::to_string(i) + "/1 tag\n";
+        good.append(reinterpret_cast<const char*>(s.data()), s.size());
+        good += "\n+\n";
+        good.append(s.size(), 'I');
+        good += "\n";
+    }
+    long long chunks = 0;
+    zna_merge::ChunkScratch sc;
+    for (size_t cut = 0; cut <= good.size(); ++cut) {
+        for (size_t cut2 = 0; cut2 <= good.size(); cut2 += 7) {
+            uint8_t* a1 = static_cast<uint8_t*>(std::malloc(cut ? cut : 1));
+            uint8_t* a2 = static_cast<uint8_t*>(std::malloc(cut2 ? cut2 : 1));
+            std::memcpy(a1, good.data(), cut);
+            std::memcpy(a2, good.data(), cut2);
+            std::string blob;
+            zna_merge::ChunkStats st;
+            size_t p1 = 0, p2 = 0;
+            try {
+                zna_merge::merge_chunk(a1, cut, p1, a2, cut2, p2, params, true, 0,
+                                       sc, blob, st);
+            } catch (const zna_merge::InputError&) {
+                // malformed input is supposed to raise; the point is that it does not
+                // read out of bounds on the way
+            }
+            std::free(a1);
+            std::free(a2);
+            ++chunks;
+        }
+    }
+
+    // arbitrary bytes: no structure at all
+    for (int i = 0; i < 3000; ++i) {
+        const size_t n = rng() % 400;
+        std::vector<uint8_t> v(n);
+        for (auto& c : v) c = static_cast<uint8_t>(rng() & 0xFF);
+        uint8_t* a1 = static_cast<uint8_t*>(std::malloc(n ? n : 1));
+        std::memcpy(a1, v.data(), n);
+        std::string blob;
+        zna_merge::ChunkStats st;
+        size_t p1 = 0, p2 = 0;
+        try {
+            zna_merge::merge_chunk(a1, n, p1, a1, n, p2, params, false, 0, sc, blob, st);
+        } catch (const zna_merge::InputError&) {}
+        std::free(a1);
+        ++chunks;
+    }
+
+    std::printf("asan_scan: %lld scans and %lld chunks clean\n", checks, chunks);
     return 0;
 }

@@ -15,7 +15,8 @@ Scores are integers throughout — see :mod:`zna.merge.params` for why, and
 """
 from __future__ import annotations
 
-from .names import strip_pair_suffix
+from .fastqio import InputError
+from .names import base_name, strip_pair_suffix
 
 try:  # numba JIT-compiles the scan; without it the same code runs as pure Python.
     from numba import njit
@@ -292,3 +293,147 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
         kept = [r for r in cand if len(r[1]) >= lr]
     return (kept, outcome, len(cand) - len(kept), score, olen, diff,
             n_consensus, trim_guard)
+
+
+# =========================================================================== #
+# Level 3: a slab of raw FASTQ text in, formatted FASTQ text out.
+#
+# The production path in the accelerated backend; here, the oracle its blob and its
+# counters are compared against byte for byte.
+#
+# `merge_chunk` consumes only WHOLE PAIRS and reports how many bytes it took from each
+# stream separately, so the two buffers may carry different leftovers and the caller
+# never scans for record boundaries. A partial record at the end of a buffer is not an
+# error -- it is simply not consumed, and at EOF the caller checks that both buffers
+# came out empty.
+# =========================================================================== #
+
+HIST_MAX = 1024
+
+
+def _next_record(buf, pos, limit, which):
+    """Parse one record at *pos*. Returns ``(header, seq, qual, new_pos)`` or None when
+    no COMPLETE record remains (not an error: the caller refills and retries)."""
+    if pos >= limit:
+        return None
+    e1 = buf.find(b"\n", pos, limit)
+    if e1 < 0:
+        return None
+    e2 = buf.find(b"\n", e1 + 1, limit)
+    if e2 < 0:
+        return None
+    e3 = buf.find(b"\n", e2 + 1, limit)
+    if e3 < 0:
+        return None
+    e4 = buf.find(b"\n", e3 + 1, limit)
+    if e4 < 0:
+        return None
+    if buf[pos] != 0x40:                       # b'@'
+        raise InputError(f"malformed FASTQ header in {which}")
+    h = buf[pos + 1:e1].rstrip(b"\r")
+    s = buf[e1 + 1:e2].rstrip(b"\r").upper()
+    q = buf[e3 + 1:e4].rstrip(b"\r")
+    if len(s) != len(q):
+        # A file truncated inside its LAST quality line otherwise looks like a complete
+        # record and is emitted malformed with a zero exit status.
+        raise InputError(f"FASTQ record in {which} has {len(s)} bases but {len(q)} "
+                         f"quality scores (truncated or malformed)")
+    return h, s, q, e4 + 1
+
+
+def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge_q,
+                t_trim_q, min_read_length, disagree_q, check_sync, base_index):
+    """Merge every whole pair available in both buffers.
+
+    Returns ``(blob, consumed1, consumed2, counters, len_hist, olen_hist,
+    insert_hist)``.
+    """
+    parts = []
+    n_pairs = merged = trimmed = kept = emitted = dropped = 0
+    bases_trimmed = frags_short = bases_consensus = trim_guard = 0
+    sum_olen = sum_diff = 0
+    len_hist = [0] * (HIST_MAX + 1)
+    olen_hist = [0] * (HIST_MAX + 1)
+    insert_hist = [0] * (HIST_MAX + 1)
+    pos1, pos2 = start1, start2
+
+    while True:
+        a = _next_record(buf1, pos1, end1, "R1")
+        if a is None:
+            break
+        b = _next_record(buf2, pos2, end2, "R2")
+        if b is None:
+            break
+        h1, s1, q1, try1 = a
+        h2, s2, q2, try2 = b
+
+        if check_sync and base_name(h1) != base_name(h2):
+            raise InputError(
+                f"R1/R2 out of sync at pair {base_index + n_pairs + 1}: "
+                f"'{base_name(h1).decode('latin-1')}' != "
+                f"'{base_name(h2).decode('latin-1')}'")
+
+        (records, outcome, n_dropped, score, olen, diff,
+         n_consensus, guard) = process_pair(
+            h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
+            min_read_length, disagree_q)
+
+        n_pairs += 1
+        dropped += n_dropped
+        bases_consensus += n_consensus
+        trim_guard += guard
+        if outcome == MERGED:
+            merged += 1
+        elif outcome == TRIMMED:
+            trimmed += 1
+            if records:
+                bases_trimmed += len(s2) - len(records[1][1])
+        else:
+            kept += 1
+        if not records and outcome != MERGED:
+            frags_short += 1
+        if olen:
+            olen_hist[olen if olen <= HIST_MAX else HIST_MAX] += 1
+            sum_olen += olen
+            sum_diff += diff
+        for header, seq, qual in records:
+            parts.append(b"@%b\n%b\n+\n%b\n" % (header, seq, qual))
+            emitted += 1
+            L = len(seq)
+            len_hist[L if L <= HIST_MAX else HIST_MAX] += 1
+            if outcome == MERGED:
+                insert_hist[L if L <= HIST_MAX else HIST_MAX] += 1
+        pos1, pos2 = try1, try2
+
+    counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
+                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff)
+    return (b"".join(parts), pos1 - start1, pos2 - start2, counters,
+            len_hist, olen_hist, insert_hist)
+
+
+def split_records(buf, start, max_records):
+    """Byte offset just past *max_records* complete records, and how many were found.
+
+    Lets the caller cut a buffer into whole-record chunks for parallel workers without
+    parsing anything itself. A trailing partial record is not counted and its bytes are
+    left for the next chunk.
+    """
+    pos = start
+    found = 0
+    n = len(buf)
+    while max_records <= 0 or found < max_records:
+        p = pos
+        complete = True
+        for _ in range(4):
+            nl = buf.find(b"\n", p)
+            if nl < 0:
+                complete = False
+                break
+            p = nl + 1
+        if not complete:
+            break
+        pos = p
+        found += 1
+        if pos >= n:
+            break
+    return pos, found

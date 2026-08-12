@@ -4,9 +4,9 @@ Reads two positionally-synced FASTQ files, merges/trims/keeps each pair, and wri
 mixed interleaved FASTQ stream for ``zna encode --interleaved`` (see
 ``docs/READ_MERGE_REDESIGN.md``). Also invocable as ``python -m zna.merge``.
 
-Single-process by default. With ``--processes N`` (N>1) the CPU-bound merge work is
-fanned out to a worker pool; output order is irrelevant (ZNA shuffles), so workers
-process chunks independently and the main process interleaves their output blobs.
+All per-pair work happens inside one backend call per chunk, which releases the GIL,
+so ``--threads`` are real worker threads. Output is written in submission order and is
+therefore byte-identical at any thread count.
 """
 from __future__ import annotations
 
@@ -17,235 +17,253 @@ import shutil
 import sys
 import time
 
+from . import backend as _backend
 from .args import add_merge_arguments, add_merge_parser, build_parser  # noqa: F401
-from .fastqio import FastqWriter, InputError, read_pairs
-from ._pymerge import HAVE_NUMBA
-from .params import SCALE, score_weights, threshold_bits
-from .pairs import MergeParams, PairOutcome, base_name, process_pair
+from .fastqio import FastqWriter, InputError, _open_binary_read
+from .params import DISAGREE_Q, SCALE, score_weights, threshold_bits
+from .pairs import MergeParams
 
 logger = logging.getLogger("zna.merge")
 
 _HIST_MAX = 1024   # length/overlap histograms are clamped to this many bins
-
-
 # --------------------------------------------------------------------------- #
-# accounting
+# the merge loop
 #
-# There is exactly ONE implementation of the per-pair bookkeeping (`_process_chunk`),
-# used by both the single-process and the worker paths. It used to be duplicated —
-# ~35 lines, once per path — which meant every statistic added had to be added twice
-# and the parallel-vs-single test could only compare a hardcoded list of keys. The two
-# copies were verified equivalent, but the duplication was the standing hazard, not the
-# divergence.
+# All per-pair work -- parsing, scanning, consensus, construction, formatting and the
+# histograms -- happens inside one backend call per chunk, which releases the GIL for
+# its whole duration. That is what makes worker THREADS worth having where the previous
+# design needed worker processes, and it deletes the fork context, the pickling of
+# chunks and blobs, the per-worker globals, and the sparse-histogram workaround that
+# only existed because dense ones were being pickled 
 # --------------------------------------------------------------------------- #
+
+#: Counter fields, in the order every backend returns them.
+_N_COUNTERS = 12
+(_N_PAIRS, _MERGED, _TRIMMED, _KEPT, _EMITTED, _DROPPED, _BASES_TRIMMED,
+ _FRAGS_SHORT, _BASES_CONSENSUS, _TRIM_GUARD, _SUM_OLEN, _SUM_DIFF) = range(_N_COUNTERS)
+
 
 def _new_acc():
-    # [n_pairs, merged, trimmed, kept, n_emitted, n_dropped, bases_trimmed,
-    #  fragments_dropped_short_mate, length_hist, bases_consensus, overlap_hist,
-    #  trim_guard_kept, sum_olen, sum_diff, insert_hist]
-    return [0, 0, 0, 0, 0, 0, 0, 0, [0] * (_HIST_MAX + 1), 0,
-            [0] * (_HIST_MAX + 1), 0, 0, 0, [0] * (_HIST_MAX + 1)]
+    return ([0] * _N_COUNTERS,
+            [0] * (_HIST_MAX + 1), [0] * (_HIST_MAX + 1), [0] * (_HIST_MAX + 1))
 
 
-def _fold(result, acc):
-    """Fold one chunk's counters into the accumulator (in-place). Returns the blob."""
-    (blob, merged, trimmed, kept, n_emitted, n_dropped, bases_trimmed,
-     frags_short, hist, bases_consensus, ohist, trim_guard,
-     sum_olen, sum_diff, ihist) = result
-    acc[1] += merged; acc[2] += trimmed; acc[3] += kept
-    acc[4] += n_emitted; acc[5] += n_dropped; acc[6] += bases_trimmed
-    acc[7] += frags_short; acc[9] += bases_consensus; acc[11] += trim_guard
-    acc[12] += sum_olen; acc[13] += sum_diff
-    for src, dst in ((hist, acc[8]), (ohist, acc[10]), (ihist, acc[14])):
-        for i, c in src.items():
-            dst[i] += c
-    return blob
+def _fold(counters, len_hist, olen_hist, insert_hist, acc):
+    """Fold one chunk's statistics into the accumulator, in place."""
+    ac, al, ao, ai = acc
+    for i in range(_N_COUNTERS):
+        ac[i] += counters[i]
+    for src, dst in ((len_hist, al), (olen_hist, ao), (insert_hist, ai)):
+        for i, c in enumerate(src):
+            if c:
+                dst[i] += c
 
 
-# --------------------------------------------------------------------------- #
-# the merge work itself. Runs in the main process (--processes 1) or in a forked
-# worker; workers are set up via fork so they inherit the parent's already-JIT-
-# compiled overlap kernel (no per-worker recompile).
-# --------------------------------------------------------------------------- #
-
-_W = {}  # worker-local state (set by _init_worker)
+#: Bytes per read from the decompressor. Modest on purpose: each read is overlapped
+#: with merge work by a prefetch thread, so what matters is keeping the pipeline full
+#: rather than amortising syscalls. Measured, 4 MiB blocks cost 45% against 256 KiB
+#: because a large blocking read starves the workers while it completes.
+_READ_BLOCK = 256 << 10
 
 
-def _init_worker(params, check):
-    _W["params"] = params
-    _W["check"] = check
+class _RawStream:
+    """Raw byte reader over one (optionally gzipped) FASTQ.
 
-
-def _process_chunk(work):
-    """Merge one chunk of pairs; return ``(output_blob, counters...)``.
-
-    ``work`` is ``(base_index, chunk)``; ``base_index`` is the index of the chunk's
-    first pair in the input, carried only so a desync can be reported by absolute pair
-    number rather than "somewhere in this chunk".
+    Holds an immutable ``bytes`` buffer and a read offset rather than slicing: chunks
+    are handed to the backend as ``(buf, start, end)``, so a chunk costs no copy and
+    worker threads can share one buffer safely (it is immutable, and rebinding
+    ``self.buf`` on a refill leaves the old object alive for whoever still holds it).
+    Only a refill copies, and then only the unconsumed tail.
     """
-    base_index, chunk = work
-    params = _W["params"]
-    check = _W["check"]
-    merged = trimmed = kept = n_emitted = n_dropped = bases_trimmed = frags_short = 0
-    counters = [0, 0]                   # [bases_consensus_changed, trim_guard_kept]
-    sum_olen = sum_diff = 0
-    hist = [0] * (_HIST_MAX + 1)        # every emitted record's length
-    ohist = [0] * (_HIST_MAX + 1)       # detected overlap lengths
-    ihist = [0] * (_HIST_MAX + 1)       # inferred fragment length, merged pairs only
-    parts = []
-    ap = parts.append
-    for i, (h1, s1, q1, h2, s2, q2) in enumerate(chunk):
-        if check and base_name(h1) != base_name(h2):
-            raise InputError(f"R1/R2 out of sync at pair {base_index + i + 1}: "
-                             f"{base_name(h1)!r} != {base_name(h2)!r}")
-        records, outcome, dropped, score, olen, diff = process_pair(
-            h1, s1, q1, h2, s2, q2, params, counters)
-        n_dropped += dropped
-        if outcome == PairOutcome.MERGED:
-            merged += 1
-        elif outcome == PairOutcome.TRIMMED:
-            trimmed += 1
-            if records:
-                # records is exactly [R1, R2] on this branch (pairs.py), so index it.
-                # The old `next(r for r in records if r[0] != h1)` silently returned
-                # None when the two mates carried identical headers — which happens
-                # for any input not passed through `samtools fastq -N` — and then
-                # charged the whole of R2 as trimmed, overstating by ~12x.
-                bases_trimmed += len(s2) - len(records[1][1])
-        else:
-            kept += 1
-        if not records and outcome != PairOutcome.MERGED:
-            frags_short += 1
-        if olen:
-            ohist[olen if olen <= _HIST_MAX else _HIST_MAX] += 1
-            sum_olen += olen
-            sum_diff += diff
-        for header, seq, qual in records:
-            ap(b"@%b\n%b\n+\n%b\n" % (header, seq, qual))
-            n_emitted += 1
-            L = len(seq)
-            hist[L if L <= _HIST_MAX else _HIST_MAX] += 1
-            if outcome == PairOutcome.MERGED:
-                # A merged record IS the fragment, so its length is the insert size.
-                ihist[L if L <= _HIST_MAX else _HIST_MAX] += 1
-    # Sparse: a chunk touches ~150 of 1025 bins, and this tuple is pickled per chunk.
-    sparse = lambda h: {i: c for i, c in enumerate(h) if c}
-    return (b"".join(parts), merged, trimmed, kept, n_emitted, n_dropped,
-            bases_trimmed, frags_short, sparse(hist), counters[0], sparse(ohist),
-            counters[1], sum_olen, sum_diff, sparse(ihist))
 
+    def __init__(self, path, threads):
+        import concurrent.futures as cf
+        self._stream, self._proc = _open_binary_read(str(path), threads)
+        self._path = str(path)
+        self.buf = b""
+        self.pos = 0
+        self.eof = False
+        # One prefetch thread per stream, so a blocking read overlaps with the merge
+        # work instead of stalling it. `read` releases the GIL, so this is real overlap.
+        # Without it the main thread alternates read-then-merge and the workers starve:
+        # measured 1.71 -> 1.32 us/pair at --threads 2.
+        self._pool = cf.ThreadPoolExecutor(max_workers=1,
+                                           thread_name_prefix="zna-merge-read")
+        self._pending = self._pool.submit(self._stream.read, _READ_BLOCK)
 
-def _iter_chunks(pair_iter, size):
-    """Yield ``(base_index, chunk)``; splits only on whole pairs."""
-    chunk = []
-    ap = chunk.append
-    base = 0
-    for r1, r2 in pair_iter:
-        ap((r1[0], r1[1], r1[2], r2[0], r2[1], r2[2]))
-        if len(chunk) >= size:
-            yield base, chunk
-            base += len(chunk)
-            chunk = []
-            ap = chunk.append
-    if chunk:
-        yield base, chunk
+    @property
+    def avail(self):
+        return len(self.buf) - self.pos
 
+    def fill(self, target):
+        """Ensure at least *target* unconsumed bytes are buffered, if input remains."""
+        if self.avail >= target or self.eof:
+            return self.avail > 0
+        blocks = [self.buf[self.pos:]] if self.pos else [self.buf]
+        got = len(blocks[0])
+        self.pos = 0
+        while got < target and not self.eof:
+            block = self._pending.result()
+            if not block:
+                self.eof = True
+                self._pending = None
+                break
+            # Start the next read before touching this one, so it runs under the merge.
+            self._pending = self._pool.submit(self._stream.read, _READ_BLOCK)
+            blocks.append(block)
+            got += len(block)
+        self.buf = blocks[0] if len(blocks) == 1 else b"".join(blocks)
+        return self.avail > 0
 
-# --------------------------------------------------------------------------- #
-# single-process path (default; exactly what the unit tests exercise)
-# --------------------------------------------------------------------------- #
-
-def _run_single(args, params):
-    _init_worker(params, not args.no_sync_check)
-    acc = _new_acc()
-    with FastqWriter(args.out, threads=args.threads, level=args.compress_level) as w:
+    def close(self):
+        if self._pending is not None:
+            try:
+                self._pending.result()
+            except Exception:
+                pass
+            self._pending = None
+        self._pool.shutdown(wait=True)
         try:
-            for work in _iter_chunks(read_pairs(args.in1, args.in2, args.threads),
-                                     args.chunk_size):
-                w.write_raw(_fold(_process_chunk(work), acc))
-                acc[0] = work[0] + len(work[1])
-                if not args.quiet and acc[0] % 5_000_000 < args.chunk_size:
-                    logger.info("processed %d pairs", acc[0])
-        except InputError as e:                       # desync, or a malformed record
-            raise SystemExit(str(e))
-    acc[0] = acc[1] + acc[2] + acc[3]
+            self._stream.close()
+        except Exception:
+            pass
+        if self._proc is not None:
+            self._proc.wait()
+            # Positive exit = a real pigz error. Negative = killed by a signal (e.g.
+            # -13 SIGPIPE when the consumer stopped early), which is not an error.
+            if self._proc.returncode and self._proc.returncode > 0:
+                raise IOError(
+                    f"pigz failed reading {self._path} (exit {self._proc.returncode})")
+
+
+def _run_merge(args, params):
+    """Read, merge and write the whole input. Returns the accumulator."""
+    backend = _backend.active()
+    acc = _new_acc()
+    kwargs = (params.match_q, params.step_q, params.t_merge_q, params.t_trim_q,
+              params.min_read_length, DISAGREE_Q, not args.no_sync_check)
+
+    # Bytes to keep buffered per stream. Chunks are cut to whole records, so this only
+    # has to be comfortably larger than one chunk's worth of them.
+    target = max(_READ_BLOCK, args.chunk_size * 1024)
+
+    r1 = _RawStream(args.in1, 1)
+    r2 = _RawStream(args.in2, 1)
+    try:
+        with FastqWriter(args.out, threads=args.io_threads,
+                         level=args.compress_level) as w:
+            if args.threads > 1:
+                _drive_threaded(backend, r1, r2, w, acc, kwargs, target,
+                                args.threads, args.chunk_size, args.quiet)
+            else:
+                _drive_serial(backend, r1, r2, w, acc, kwargs, target, args.quiet)
+        # Both streams must run out together. A non-empty leftover here is the failure
+        # the audit's prototype for this shipped silently: R1 ending first left the
+        # trailing R2 records unread, and the desync check cannot see records that were
+        # never read.
+        _check_drained(backend, r1, "R1", "R2")
+        _check_drained(backend, r2, "R2", "R1")
+    finally:
+        r1.close()
+        r2.close()
     return acc
 
 
-# --------------------------------------------------------------------------- #
-# parallel path (--processes > 1)
-# --------------------------------------------------------------------------- #
+def _check_drained(backend, stream, which, other):
+    """Raise if *stream* has anything left after the merge.
 
-def _run_parallel(args, params):
-    """Fan the chunks out to a worker pool.
+    Distinguishes the two ways that happens, because they mean different things and a
+    wrong message sends the next person to the wrong file: leftover bytes that do not
+    form a complete record are a TRUNCATED input, while leftover whole records mean the
+    other stream ran out first.
+    """
+    if not stream.buf[stream.pos:].strip():
+        return
+    _off, count = backend.split_records(stream.buf, stream.pos, 1)
+    if count == 0:
+        raise InputError(f"truncated FASTQ record at the end of {which}")
+    raise InputError(f"{other} exhausted before {which} (unequal read counts)")
 
-    Uses ``ProcessPoolExecutor`` rather than ``multiprocessing.Pool`` because the
-    latter cannot detect abrupt worker death: a SIGKILLed worker (cgroup/node OOM, a
-    native crash in JIT code) leaves ``IMapUnorderedIterator.next()`` blocked forever
-    while ``_maintain_pool`` quietly respawns the process. Measured: the parent sat
-    alive at 0% CPU for 150 s with no output, no JSON and no error — at cluster scale
-    that is indistinguishable from a slow node, and it burns the whole allocation.
-    ``BrokenProcessPool`` surfaces the same failure in about a second.
 
-    Submission is windowed at ``2 * processes`` chunks so the input is streamed rather
-    than read into memory: peak parent RSS is bounded by ``chunk_size``, not by the
-    library.
+def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet):
+    while True:
+        r1.fill(target)
+        r2.fill(target)
+        if not r1.avail or not r2.avail:
+            break
+        blob, c1, c2, counters, lh, oh, ih = backend.merge_chunk(
+            r1.buf, r1.pos, len(r1.buf), r2.buf, r2.pos, len(r2.buf),
+            *kwargs, acc[0][_N_PAIRS])
+        if not c1 and not c2:
+            break                      # neither stream holds a complete record
+        w.write_raw(blob)
+        _fold(counters, lh, oh, ih, acc)
+        r1.pos += c1
+        r2.pos += c2
+        if not quiet and acc[0][_N_PAIRS] % 5_000_000 < 100_000:
+            logger.info("processed %d pairs", acc[0][_N_PAIRS])
+
+
+def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_size,
+                    quiet):
+    """Fan chunks out to worker threads, writing results in SUBMISSION order.
+
+    Ordered output makes the file a pure function of the input and the parameters, so
+    `zna merge` produces the same bytes at any thread count -- which is what a corpus
+    tool should do, and lets the tests compare whole files across `--threads`. The cost
+    is head-of-line blocking bounded by the variance in per-chunk compute time, which for
+    fixed-size chunks of Illumina reads is a few percent.
+
+    Submission is windowed so the input is streamed rather than read into memory.
     """
     import concurrent.futures as cf
-    import multiprocessing as mp
-    # Warm the JIT in the parent so forked workers inherit the compiled kernel.
-    process_pair(b"w", b"ACGT" * 10, b"I" * 40, b"w", b"ACGT" * 10, b"I" * 40, params)
-    acc = _new_acc()
-    # fork is deliberate: the workers inherit the parent's already-JIT-compiled kernel
-    # (warmed just above) instead of each paying the numba compile. Windows has no fork
-    # at all, so fall back rather than crash on --processes > 1 -- the kernels pass
-    # cache=True, so after the first run each worker loads the compiled artifact from
-    # the numba cache instead of rebuilding it.
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        ctx = mp.get_context()
-        logger.info("no fork on this platform: using %r, so each worker compiles the "
-                    "overlap kernel once (set NUMBA_CACHE_DIR to a writable path if "
-                    "that repeats every run)", ctx.get_start_method())
-    # One decompression thread per reader: with N workers already resident, extra
-    # pigz threads only contend for the same allocation (measured 1.13x).
-    chunks = _iter_chunks(read_pairs(args.in1, args.in2, 1), args.chunk_size)
-    window = max(2, 2 * args.processes)
-    with FastqWriter(args.out, threads=args.threads, level=args.compress_level) as w, \
-            cf.ProcessPoolExecutor(max_workers=args.processes, mp_context=ctx,
-                                   initializer=_init_worker,
-                                   initargs=(params, not args.no_sync_check)) as pool:
-        pending = set()
-        try:
-            for work in chunks:
-                pending.add(pool.submit(_process_chunk, work))
-                if len(pending) >= window:
-                    done, pending = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
-                    for fut in done:
-                        w.write_raw(_fold(fut.result(), acc))
-            while pending:
-                done, pending = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
-                for fut in done:
-                    w.write_raw(_fold(fut.result(), acc))
-        except InputError as e:                       # desync raised in a worker
-            raise SystemExit(str(e))
-        except cf.process.BrokenProcessPool:
-            raise SystemExit(
-                "a merge worker died abruptly (killed by the OS, or a native crash). "
-                "The output is incomplete; re-run, and if this repeats check the "
-                "memory limit against --processes/--chunk-size."
-            )
-    acc[0] = acc[1] + acc[2] + acc[3]
-    return acc
+    from collections import deque
 
+    pending = deque()
+    window = max(2, 2 * n_threads)
 
-# --------------------------------------------------------------------------- #
+    def drain(upto):
+        while len(pending) > upto:
+            blob, c1, c2, counters, lh, oh, ih = pending.popleft().result()
+            w.write_raw(blob)
+            _fold(counters, lh, oh, ih, acc)
+
+    with cf.ThreadPoolExecutor(max_workers=n_threads) as pool:
+        submitted_pairs = 0
+        while True:
+            r1.fill(target)
+            r2.fill(target)
+            if not r1.avail or not r2.avail:
+                break
+            o1, k1 = backend.split_records(r1.buf, r1.pos, chunk_size)
+            o2, k2 = backend.split_records(r2.buf, r2.pos, chunk_size)
+            k = k1 if k1 < k2 else k2
+            if k == 0:
+                break                  # neither stream holds a complete record
+            if k1 != k:
+                o1, _ = backend.split_records(r1.buf, r1.pos, k)
+            if k2 != k:
+                o2, _ = backend.split_records(r2.buf, r2.pos, k)
+            # No slicing: the workers read [pos, o) of a buffer they share.
+            pending.append(pool.submit(backend.merge_chunk,
+                                       r1.buf, r1.pos, o1, r2.buf, r2.pos, o2,
+                                       *kwargs, submitted_pairs))
+            r1.pos, r2.pos = o1, o2
+            submitted_pairs += k
+            drain(window)
+            if not quiet and submitted_pairs % 5_000_000 < chunk_size:
+                logger.info("processed %d pairs", submitted_pairs)
+        drain(0)
+
 
 def _assemble_stats(acc, params, elapsed=None):
-    (n_pairs, merged, trimmed, kept, n_emitted, n_dropped, bases_trimmed,
-     frags_short, hist, bases_consensus, ohist, trim_guard,
-     sum_olen, sum_diff, ihist) = acc
+    counters, hist, ohist, ihist = acc
+    n_pairs = counters[_N_PAIRS]
+    merged, trimmed, kept = counters[_MERGED], counters[_TRIMMED], counters[_KEPT]
+    n_emitted, n_dropped = counters[_EMITTED], counters[_DROPPED]
+    bases_trimmed, frags_short = counters[_BASES_TRIMMED], counters[_FRAGS_SHORT]
+    bases_consensus, trim_guard = counters[_BASES_CONSENSUS], counters[_TRIM_GUARD]
+    sum_olen, sum_diff = counters[_SUM_OLEN], counters[_SUM_DIFF]
     total_bases = sum(i * c for i, c in enumerate(hist))
     pct = (lambda n: round(100.0 * n / n_pairs, 3) if n_pairs else 0.0)
     match_w, mismatch_w = score_weights(params.err_rate)
@@ -256,7 +274,9 @@ def _assemble_stats(acc, params, elapsed=None):
         # gather's pipeline tool; only code identity was missing.
         "tool": "zna-merge",
         "tool_version": zna.__version__,
-        "numba": HAVE_NUMBA,          # a numba-less run is ~50x slower and SILENTLY correct
+        # Which kernel ran. The reference backend is ~50x slower and silently correct,
+        # so a run that quietly fell back to it looks like a slow node, not a mistake.
+        "backend": _backend.active_name(),
         "python": platform.python_version(),
         "input_pairs": n_pairs,
         "merged": merged,
@@ -349,30 +369,21 @@ def _validate(args, params) -> None:
         )
     if params.min_read_length < 1:
         raise SystemExit("--min-read-length must be >= 1")
-    if args.processes < 1:
-        raise SystemExit("--processes must be >= 1")
     if args.chunk_size < 1:
         raise SystemExit("--chunk-size must be >= 1")
     if args.threads < 1:
         raise SystemExit("--threads must be >= 1")
+    if args.io_threads < 1:
+        raise SystemExit("--io-threads must be >= 1")
 
 
 def run(args) -> dict:
-    """Execute the merge and return the statistics dict.
-
-    This is the in-process entry point: it does *not* refuse a numba-less run (see
-    :func:`_require_numba`, which the command-line entry points call first), because
-    a caller that reached this function chose the pure-Python scorer knowingly.
-    """
-    if not HAVE_NUMBA:
-        logger.warning(
-            "numba NOT found -> SLOW pure-Python overlap scan (~50x). "
-            "Install it with `pip install zna[merge]` for production speed."
-        )
-    logger.info("numba: %s | gzip: %s | processes: %d",
-                "active" if HAVE_NUMBA else "MISSING (slow)",
+    """Execute the merge and return the statistics dict."""
+    _backend.use(getattr(args, "backend", "auto"))
+    logger.info("backend: %s | gzip: %s | threads: %d",
+                _backend.active_name(),
                 "pigz" if shutil.which("pigz") else "stdlib gzip",
-                max(1, args.processes))
+                max(1, args.threads))
     params = MergeParams(
         t_merge=args.t_merge,
         t_trim=args.t_trim,
@@ -381,12 +392,16 @@ def run(args) -> dict:
     _validate(args, params)
 
     t0 = time.perf_counter()
-    acc = _run_parallel(args, params) if args.processes > 1 else _run_single(args, params)
+    try:
+        acc = _run_merge(args, params)
+    except InputError as e:                       # desync, or a malformed record
+        raise SystemExit(str(e))
     elapsed = time.perf_counter() - t0
+
     # An empty input is otherwise a silent success all the way down: rc=0 here, then a
     # 22-byte 0-record .zna, and a library disappears from the corpus with every stage
     # green. Cheaper to fail here than to find the hole in a trained model.
-    if acc[0] == 0 and not args.allow_empty:
+    if acc[0][_N_PAIRS] == 0 and not args.allow_empty:
         raise SystemExit(
             f"no read pairs in {args.in1} / {args.in2}. If that is expected, pass "
             f"--allow-empty; otherwise the input is truncated or the wrong file."
@@ -405,24 +420,25 @@ def run(args) -> dict:
     return stats
 
 
-def _require_numba(args) -> None:
-    """Refuse to start the pure-Python scan unless the user asked for it.
+def _require_backend(args) -> None:
+    """Refuse to start on the reference kernel unless it was asked for by name.
 
-    The fallback in ``overlap.py`` is correct, and it is what keeps ``import
-    zna.merge`` working on a plain ``pip install zna`` — but it is ~50x slower, and a
-    *silently correct* 50x slowdown is the worst shape a failure can take at cluster
-    scale: the job does not fail, it just looks like a slow node, and it burns the
-    whole allocation before anyone looks. So the command line refuses; the library
-    entry point (:func:`run`) does not.
+    The Python backend is correct and ~50x slower. It exists to be an oracle, not a
+    fallback, and a *silently correct* 50x slowdown is the worst shape a failure can
+    take at cluster scale: the job does not fail, it just looks like a slow node, and it
+    burns the whole allocation before anyone looks. So the command line refuses; the
+    library entry point (:func:`run`) does not.
     """
-    if HAVE_NUMBA or args.allow_slow:
+    if getattr(args, "backend", "auto") != "auto":
+        return
+    from .backend import available_merge_backends
+    if "accel" in available_merge_backends():
         return
     raise SystemExit(
-        "numba is not installed, so the overlap scan would run as pure Python: "
-        "correct, but about 50x slower. At cluster scale that is indistinguishable "
-        "from a slow node. Install it with `pip install zna[merge]` (or add "
-        "`numba >=0.61` to the conda environment). To run the slow path "
-        "deliberately, pass --allow-slow."
+        "the compiled merge backend is not available, so the scan would run as pure "
+        "Python: correct, but about 50x slower. At cluster scale that is "
+        "indistinguishable from a slow node. Reinstall zna with a working C++ "
+        "toolchain, or pass --backend python if you really mean it."
     )
 
 
@@ -433,7 +449,7 @@ def run_command(args) -> int:
         format="[zna merge] %(message)s",
         stream=sys.stderr,
     )
-    _require_numba(args)
+    _require_backend(args)
     run(args)
     return 0
 
