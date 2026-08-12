@@ -127,3 +127,59 @@ class MergeParams:
         self.step_q = self.match_q + to_q(mismatch_w)
         self.t_merge_q = to_q(self.t_merge)
         self.t_trim_q = to_q(self.t_trim)
+
+
+# --------------------------------------------------------------------------- #
+# the overlap-consensus posterior table
+# --------------------------------------------------------------------------- #
+#
+# Where the two mates overlap they are two independent reads of the same physical base,
+# so a disagreement means exactly one of them is wrong. Which one is not a judgement
+# call -- the sequencer already said, in the two Phred scores. With p_i = 10**(-Q_i/10)
+# and "exactly one is wrong":
+#
+#     P(R1 is the wrong one) = p1(1-p2) / (p1(1-p2) + p2(1-p1))
+#
+# so the consensus base is the higher-Q call, and the posterior error of that call is
+# the expression above -- which is *worse* than the winner's own Q, because a contested
+# base is less certain than an uncontested one. Nothing to tune.
+#
+# **This table is built here, in Python, and passed to whichever backend needs it.** It
+# is computed with `pow` and `log10`, and libm differs between platforms, so deriving it
+# independently on a C++ side would be a licence for the two implementations to disagree
+# by a quality unit on some cell. One source of truth, 64 KiB, once per process.
+
+DISAGREE_Q_DIM = 256
+
+
+def _build_disagree_table() -> bytes:
+    """``DISAGREE_Q[q_win * 256 + q_lose]`` = Phred+33 quality of the winning call.
+
+    Indexed by *raw byte value* so the inner loop is one subscript and no arithmetic.
+
+    The table covers all 256 byte values rather than just the legal Phred+33 range
+    (33..126). Quality bytes come from a FASTQ file and nothing upstream guarantees they
+    are in range; a 127x127 table would make a malformed byte an out-of-bounds read in
+    C++ and an ``IndexError`` (or a silent NUL, for bytes under 33) in Python. Covering
+    the whole byte space costs 64 KiB once and makes every input defined and identical
+    across backends.
+    """
+    import math
+    tbl = bytearray(DISAGREE_Q_DIM * DISAGREE_Q_DIM)
+    for qw in range(DISAGREE_Q_DIM):
+        pw = 10.0 ** (-(qw - 33) / 10.0)
+        base = qw * DISAGREE_Q_DIM
+        for ql in range(DISAGREE_Q_DIM):
+            pl = 10.0 ** (-(ql - 33) / 10.0)
+            num = pw * (1.0 - pl)
+            den = num + pl * (1.0 - pw)
+            post = 0.5 if den <= 0.0 else num / den
+            post = min(max(post, 1e-10), 0.9999)
+            q = int(round(-10.0 * math.log10(post)))
+            tbl[base + ql] = min(max(q + 33, 33), 126)
+    return bytes(tbl)
+
+
+#: Built at import. ~5 ms, paid only by code that actually merges -- `zna/cli.py`
+#: reaches this package through `args.py`, which imports nothing.
+DISAGREE_Q = _build_disagree_table()

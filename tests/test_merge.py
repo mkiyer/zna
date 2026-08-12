@@ -1081,8 +1081,8 @@ class TestProcessPair:
     def test_consensus_posterior_table_is_symmetric_and_monotone(self):
         """Pin the table itself: a bigger quality gap means more confidence in the
         winner, and the roles are symmetric."""
-        from zna.merge.pairs import _DISAGREE_Q as T
-        q = lambda w, l: T[w + 33][l + 33] - 33
+        from zna.merge.params import DISAGREE_Q as T
+        q = lambda w, l: T[(w + 33) * 256 + (l + 33)] - 33
         assert q(40, 10) > q(40, 30) > q(40, 39)         # wider gap -> higher confidence
         assert q(30, 10) == q(30, 10)
         assert q(20, 20) <= 4                            # a tie is ~50/50, i.e. ~Q3

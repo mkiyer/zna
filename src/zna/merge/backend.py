@@ -10,10 +10,15 @@ The Python backend is the **reference oracle**, not a fallback. It is never dele
 never optimised at the cost of clarity — it is what the accelerated backend is defined
 to agree with, so it has to stay readable enough to be believed.
 
-Backends implement, at minimum::
+Backends implement::
 
     scan(s1, s2rc, len1, len2, match_q, step_q, floor_q)
         -> (shift, score_q, overlap_len, mismatches)
+
+    process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
+                 min_read_length, disagree_q)
+        -> (records, outcome, n_dropped, score_q, overlap_len, mismatches,
+            bases_consensus_changed, trim_guard_fired)
 
 All scoring arguments are integers in the fixed-point scale of :mod:`zna.merge.params`;
 no float crosses this boundary, which is what makes the two implementations comparable
@@ -33,7 +38,7 @@ _BACKEND_MODULES = {
 #: Highest priority first.
 _PREFERENCE = ("accel", "python")
 
-_REQUIRED_FUNCTIONS = frozenset({"scan"})
+_REQUIRED_FUNCTIONS = frozenset({"scan", "process_pair"})
 
 _loaded: dict[str, ModuleType] = {}
 _default: Optional[ModuleType] = None
@@ -96,3 +101,39 @@ def _load(name: str) -> ModuleType:
             f"merge backend {name!r} is missing required functions: {sorted(missing)}")
     _loaded[name] = mod
     return mod
+
+
+# --------------------------------------------------------------------------- #
+# the active backend
+#
+# Held here rather than in each consumer so there is one thing to set and one thing to
+# read. Resolved on FIRST USE, not at import: the Python backend pulls in numba and the
+# accelerated one an extension module, and neither belongs in the import cost of code
+# that only wanted a constant.
+# --------------------------------------------------------------------------- #
+
+_active: Optional[ModuleType] = None
+_active_name: Optional[str] = None
+
+
+def use(name: Optional[str] = None) -> str:
+    """Select the backend for subsequent calls. Returns its canonical name."""
+    global _active, _active_name
+    _active = get_merge_backend(name)
+    _active_name = get_merge_backend_name(name)
+    return _active_name
+
+
+def active() -> ModuleType:
+    """The backend in use, selecting the default if none has been chosen."""
+    if _active is None:
+        use()
+    return _active
+
+
+def active_name() -> str:
+    """Canonical name of the backend in use."""
+    if _active is None:
+        use()
+    assert _active_name is not None
+    return _active_name

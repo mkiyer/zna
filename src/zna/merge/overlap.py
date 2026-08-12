@@ -45,7 +45,7 @@ path.
 """
 
 
-from .backend import get_merge_backend, get_merge_backend_name
+from . import backend as _backend
 from .params import (  # noqa: F401  (score_weights/threshold_bits are re-exported API)
     MergeParams, P_NULL, SCALE, score_weights, threshold_bits, to_bits, to_q,
 )
@@ -72,28 +72,17 @@ def reverse_complement(seq: bytes) -> bytes:
 #: Default parameters, so ``find_overlap(s1, s2rc)`` needs no ceremony.
 _DEFAULTS = MergeParams()
 
-#: The selected backend's scan, resolved on first use so that importing this module
-#: costs nothing (the Python backend pulls in numba; the accel one, an extension).
-_SCAN = None
-_BACKEND_NAME = None
-
-
 def use_backend(name=None) -> str:
-    """Select the scan backend (``"accel"``, ``"python"``, or ``None``/``"auto"``).
+    """Select the merge backend (``"accel"``, ``"python"``, or ``None``/``"auto"``).
 
     Returns its canonical name. Raises ``ImportError`` if it cannot be loaded.
     """
-    global _SCAN, _BACKEND_NAME
-    _SCAN = get_merge_backend(name).scan
-    _BACKEND_NAME = get_merge_backend_name(name)
-    return _BACKEND_NAME
+    return _backend.use(name)
 
 
 def backend_name() -> str:
     """Canonical name of the backend in use, selecting the default if none is yet."""
-    if _SCAN is None:
-        use_backend()
-    return _BACKEND_NAME
+    return _backend.active_name()
 
 
 def find_overlap(seq1: bytes, seq2rc: bytes, params: MergeParams = _DEFAULTS):
@@ -113,10 +102,9 @@ def find_overlap(seq1: bytes, seq2rc: bytes, params: MergeParams = _DEFAULTS):
     ``params.t_trim`` is the lower of the two decision thresholds: overlaps that cannot
     reach it are of no interest to any caller, so it doubles as the pruning floor.
     """
-    if _SCAN is None:
-        use_backend()
-    s, score_q, olen, diff = _SCAN(seq1, seq2rc, len(seq1), len(seq2rc),
-                                   params.match_q, params.step_q, params.t_trim_q)
+    s, score_q, olen, diff = _backend.active().scan(
+        seq1, seq2rc, len(seq1), len(seq2rc),
+        params.match_q, params.step_q, params.t_trim_q)
     if olen == 0:
         return NO_OVERLAP, 0, 0, 0, 0
     if s >= 0:
