@@ -58,6 +58,8 @@ from zna.core import (
     COMPRESSION_NONE,
     COMPRESSION_ZSTD,
     FLAG_FIELDS,
+    _BLOCK_HEADER_FMT,
+    _BLOCK_HEADER_SIZE,
     ZnaHeader,
     ZnaReader,
     ZnaWriter,
@@ -827,6 +829,170 @@ class TestBlocksAPI(FuzzCase):
         for stride, offset in ((0, 0), (-1, 0), (2, 2), (2, -1), (2, 5)):
             with self.assertRaises(ValueError, msg=f"stride={stride} offset={offset}"):
                 ZnaReader(io.BytesIO(plain)).blocks(stride=stride, offset=offset)
+
+
+class TestBlockIndex(FuzzCase):
+    """``block_index()`` is what lets a consumer size a subsample before reading
+    anything, so its counts have to be exact — an estimate would silently skew a
+    balanced corpus sample."""
+
+    def _file(self, n=400, block_size=BLOCK_SIZE, seq_len_bytes=2):
+        rng = random.Random(SEED + 16)
+        recs = gen_records(rng, "mixed", n, seq_len_bytes,
+                           allow_n=False, allow_lower=False)
+        header = make_header(seq_len_bytes, STRAND_CONFIGS[0], COMPRESSION_ZSTD)
+        buf = io.BytesIO()
+        with ZnaWriter(buf, header, block_size=block_size) as w:
+            for seq, is_paired, is_read1, is_read2, is_full in recs:
+                w.write_record(seq, is_paired, is_read1, is_read2,
+                               is_full_fragment=is_full)
+        return buf.getvalue(), recs
+
+    def test_counts_are_exact(self):
+        data, recs = self._file()
+        reader = ZnaReader(io.BytesIO(data))
+        index = reader.block_index()
+        self.assertEqual(sum(b.n_records for b in index), len(recs),
+                         "block_index() record total disagrees with the file")
+        # Agrees block-for-block with what blocks() actually yields.
+        got = [len(seqs) for seqs, _f in ZnaReader(io.BytesIO(data)).blocks()]
+        self.assertEqual([b.n_records for b in index], got)
+        self.assertEqual([b.index for b in index], list(range(len(index))))
+
+    def test_offsets_point_at_block_headers(self):
+        data, _ = self._file()
+        index = ZnaReader(io.BytesIO(data)).block_index()
+        for b in index:
+            fh = io.BytesIO(data)
+            fh.seek(b.offset)
+            raw = fh.read(_BLOCK_HEADER_SIZE)
+            comp_size, uncomp_size, count, _fs, _ls = struct.unpack(
+                _BLOCK_HEADER_FMT, raw)
+            self.assertEqual(
+                (comp_size, uncomp_size, count),
+                (b.comp_size, b.uncomp_size, b.n_records),
+                f"block {b.index}: offset does not point at its header",
+            )
+
+    def test_does_not_disturb_read_position(self):
+        """The cursor is restored, so an in-flight iteration is unaffected.
+
+        (Note this is about the *cursor*, not about ``records()`` rewinding — a
+        second ``records()`` call on the same reader has always continued from
+        wherever the first one stopped, independently of this method.)
+        """
+        data, recs = self._file()
+        reader = ZnaReader(io.BytesIO(data))
+        stream = reader.records()
+        first = [next(stream) for _ in range(5)]
+
+        pos_before = reader._fh.tell()
+        index = reader.block_index()
+        self.assertEqual(reader._fh.tell(), pos_before,
+                         "block_index() left the cursor somewhere else")
+        self.assertGreater(len(index), 0)
+
+        rest = list(stream)          # the same generator carries on
+        self.assertEqual(first + rest,
+                         list(ZnaReader(io.BytesIO(data)).records()),
+                         "block_index() perturbed an in-flight iteration")
+
+    def test_works_before_any_read_and_after_full_read(self):
+        data, recs = self._file()
+        reader = ZnaReader(io.BytesIO(data))
+        before = reader.block_index()
+        self.assertEqual(sum(b.n_records for b in before), len(recs))
+        list(reader.records())       # drain to EOF
+        after = reader.block_index()
+        self.assertEqual(before, after,
+                         "block_index() differs once the stream is exhausted")
+
+    def test_requires_a_seekable_stream(self):
+        class Unseekable(io.RawIOBase):
+            def __init__(self, data):
+                self._b = io.BytesIO(data)
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                return self._b.read(n)
+            def readinto(self, b):
+                return self._b.readinto(b)
+            def tell(self):
+                raise OSError("not seekable")
+            def seekable(self):
+                return False
+
+        data, _ = self._file()
+        reader = ZnaReader(Unseekable(data))
+        with self.assertRaises(TypeError):
+            reader.block_index()
+
+    def test_indices_selects_exactly_those_blocks(self):
+        data, _ = self._file(n=600, block_size=256)
+        reader = ZnaReader(io.BytesIO(data))
+        index = reader.block_index()
+        self.assertGreater(len(index), 4, "need several blocks to select among")
+
+        want = [b.index for b in index][::3]
+        got_counts = [
+            len(seqs) for seqs, _f in
+            ZnaReader(io.BytesIO(data)).blocks(indices=want)
+        ]
+        self.assertEqual(got_counts, [index[i].n_records for i in want])
+
+        # And the sequences match those blocks read individually.
+        by_block = [seqs for seqs, _f in ZnaReader(io.BytesIO(data)).blocks()]
+        selected = [s for i in want for s in by_block[i]]
+        flat = [s for seqs, _f in
+                ZnaReader(io.BytesIO(data)).blocks(indices=want) for s in seqs]
+        self.assertEqual(flat, selected)
+
+    def test_indices_edge_cases(self):
+        data, _ = self._file(n=600, block_size=256)
+        n_blocks = len(ZnaReader(io.BytesIO(data)).block_index())
+
+        # Empty selection yields nothing (and warns, like an empty shard).
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(
+                list(ZnaReader(io.BytesIO(data)).blocks(indices=[])), [])
+
+        # Out-of-range indices are simply never matched.
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(
+                list(ZnaReader(io.BytesIO(data)).blocks(indices=[n_blocks + 5])), [])
+
+        # Duplicates collapse; order of the argument does not matter.
+        a = [len(s) for s, _ in
+             ZnaReader(io.BytesIO(data)).blocks(indices=[2, 0, 2])]
+        b = [len(s) for s, _ in ZnaReader(io.BytesIO(data)).blocks(indices=[0, 2])]
+        self.assertEqual(a, b)
+
+        for bad in ([-1], [1.5], [True]):
+            with self.assertRaises(ValueError, msg=f"indices={bad}"):
+                ZnaReader(io.BytesIO(data)).blocks(indices=bad)
+        with self.assertRaises(ValueError):
+            ZnaReader(io.BytesIO(data)).blocks(stride=2, indices=[0])
+
+    def test_subsampling_is_representative(self):
+        """The property the corpus balancing depends on: taking k of n blocks
+        yields about k/n of the records."""
+        data, recs = self._file(n=4000, block_size=1024)
+        index = ZnaReader(io.BytesIO(data)).block_index()
+        total = sum(b.n_records for b in index)
+        self.assertGreater(len(index), 10)
+
+        rng = random.Random(SEED + 17)
+        k = max(1, len(index) // 4)
+        want = rng.sample([b.index for b in index], k)
+        got = sum(len(s) for s, _f in
+                  ZnaReader(io.BytesIO(data)).blocks(indices=want))
+        expected = total * k / len(index)
+        # Generous: the final block is a partial, so exactness is not the claim.
+        self.assertLess(
+            abs(got - expected) / expected, 0.35,
+            f"sampling {k}/{len(index)} blocks gave {got} records, "
+            f"expected about {expected:.0f}",
+        )
 
 
 class TestDecoderMemory(FuzzCase):

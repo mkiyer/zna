@@ -4,6 +4,60 @@
 
 ---
 
+## Static Subsampled Files (`zna sample --fraction`)
+
+A CLI that writes a new ZNA holding a random fraction of an input's blocks or
+records:
+
+```bash
+zna sample --fraction 0.05 big.zna -o small.zna
+zna sample --records 1000000 big.zna -o small.zna
+```
+
+The motivating case is corpus balancing for LLM training, where a manifest mixes
+files spanning several orders of magnitude in size and the large ones dominate
+the sample. Building balanced static subsets offline would make the training
+run's data pipeline trivial.
+
+**Why it is not the first answer.** Training iterates over the same corpus for
+many epochs and wants *different* reads each pass. A static subset freezes one
+draw, so every epoch sees the same reads — the opposite of what is wanted. The
+runtime path (`block_index()` to size the file, `blocks(indices=...)` to draw a
+fresh block subset per epoch) covers that case without materialising anything.
+
+`zna sample` is still worth having for: publishing a small public excerpt of a
+large dataset, cheap CI fixtures, and pinning an exact evaluation set that must
+not vary between runs.
+
+**Design sketch.** Block-granular sampling is nearly free — copy whole
+compressed payloads through without decoding, rewriting only the block headers.
+Record-granular sampling requires a decode/re-encode pass. Start with block
+granularity and `--records N` as an approximation that rounds to whole blocks.
+Both require the input to be shuffled to be statistically meaningful, so the
+command should read the file's own history if the format ever records it, and
+warn otherwise.
+
+---
+
+## Stored Block Index (sidecar or footer)
+
+`ZnaReader.block_index()` walks the block-header chain, seeking over each
+payload: about 2.3 microseconds per block, so ~1.4 ms for a 611-block file.
+That is cheap enough that a *stored* index buys nothing for local files.
+
+It would matter for remote corpora. With a sidecar `sample.zna.idx` holding
+`(offset, n_records)` per block, a consumer could:
+
+- read record counts for corpus balancing **without downloading the data file**,
+  which is the real cost when files arrive over Globus or S3;
+- issue ranged reads for only the blocks it sampled, turning a 5% sample into 5%
+  of the transfer rather than 100%.
+
+A sidecar is preferable to a footer: it needs no format-version bump, old
+readers ignore it, and it can be generated lazily and cached. A footer would
+have to be skipped by readers that predate it, and today's readers parse block
+headers until EOF — so trailing bytes would be misread as a block header.
+
 ## String Label Support (Re-introduce with proper design)
 
 The fixstr (`Z`) dtype was removed in V2 to simplify the initial implementation. Future versions could re-add string support with one of these approaches:

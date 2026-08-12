@@ -45,6 +45,22 @@ file needs re-encoding.
   of the whole file: 1.8x for one worker of 2, 9.4x for one worker of 16.
   Requires arbitrary record order (use `zna shuffle`) and many more blocks than
   shards; warns when a shard matches no blocks. Raises on labeled files.
+- **`ZnaReader.block_index()`** — one `BlockInfo(index, offset, n_records,
+  comp_size, uncomp_size)` per block, built by walking the block-header chain
+  and seeking over each payload. The *file* header stores no record or block
+  count; every *block* header carries its own count, so the totals cost no
+  decompression: 2.3 us per block, about 1.4 ms for a 38 MB / 611-block file,
+  against 89 ms to reach the same counts by decoding. Use it to size a
+  subsample, or to catalogue a corpus.
+- **`blocks(indices=...)`** — decode an explicit set of block numbers instead of
+  a stride. Needed when the sampling fraction is not a unit fraction, and when
+  repeated passes over one file should see different blocks: `stride` admits
+  only `stride` distinct phases, so several epochs at `stride=4` would revisit
+  the same four subsets. Mutually exclusive with `stride`/`offset`.
+- **`zna inspect --json`** (with `--blocks` and `--counts`) — machine-readable
+  output including `n_blocks` and `n_records`, for building manifests that carry
+  record counts and can therefore weight a balanced corpus sample without
+  opening the data files.
 - **`FLAG_FIELDS`** — `flag byte -> (is_paired, is_read1, is_read2)`, so
   `blocks()` consumers need not re-derive the bit layout.
 - `decode_block_sequences` on both codec backends.

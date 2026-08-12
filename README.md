@@ -371,6 +371,60 @@ That is worth 1.8x at 2 workers and 9.4x at 16, compared with striding over
 label columns would have to come back too, and dropping them silently is worse
 than not offering the API — so use `records()` there.
 
+#### Sizing a file before reading it: `block_index()`
+
+**The ZNA file header stores no record or block count** — only the format
+version, sequence-length width, strand flags, compression settings and label
+schema. Each *block* header does carry its own record count, so the totals are
+recovered by walking the block chain, seeking over each payload:
+
+```python
+reader = ZnaReader(fh)
+index = reader.block_index()          # list[BlockInfo]
+total = sum(b.n_records for b in index)
+```
+
+This decompresses nothing. Measured at 2.3 µs per block — 1.4 ms for a 38 MB,
+611-block, 1M-record file, against 89 ms to reach the same counts by decoding.
+Cheap enough to run at open time, or across a whole corpus to build a manifest.
+
+That makes proportional subsampling straightforward: use the counts to decide
+how much of each file you want, then decode only those blocks.
+
+```python
+import random
+
+index = reader.block_index()
+want = round(len(index) * target_fraction)
+keep = random.sample([b.index for b in index], want)
+
+for sequences, flags in reader.blocks(indices=keep):
+    ...
+```
+
+`indices` is mutually exclusive with `stride`/`offset`. Prefer it when the
+fraction is not a unit fraction, or when repeated passes over one file should see
+*different* blocks — `stride` admits only `stride` distinct phases, so training
+several epochs at `stride=4` would revisit the same four subsets.
+
+Blocks are flushed on an estimated byte size, so record counts per block are
+near-uniform for fixed-length reads and vary for variable-length ones. That is
+why `block_index()` returns per-block counts rather than an average, and why
+sampling *k* of *n* blocks gives approximately, not exactly, *k/n* of the records.
+
+#### Cataloguing a corpus: `zna inspect --json`
+
+```bash
+zna inspect sample.zna --json
+zna inspect sample.zna --json --blocks     # include the per-block array
+zna inspect sample.zna --json --counts     # add per-flag record tallies
+```
+
+Emits header fields plus `n_blocks` and `n_records`, read from block headers
+without decompressing. Fast enough to sweep thousands of files, so a manifest can
+record record counts once and weight a balanced sample later without opening any
+of them.
+
 Batching alone (without sharding) is worth about 24% for a loader doing real
 per-record work, and it fades with read length: ~24% at 150 bp, ~8% at 1 kb, and
 nothing measurable at 10 kb, where the sequence dominates the record overhead.

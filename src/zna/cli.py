@@ -17,7 +17,7 @@ from .core import (
     COMPRESSION_ZSTD, COMPRESSION_NONE, 
     DEFAULT_ZSTD_LEVEL, DEFAULT_BLOCK_SIZE,
     _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
-    _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
+    _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE, _VERSION,
     ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
     _flags_from_ends, _RC_FULL_BY_ENDS,
 )
@@ -1483,21 +1483,131 @@ def decode_command(args):
 
 # --- COMMAND: INSPECT ---
 
+def _inspect_json(args, fh, reader, h, file_size) -> None:
+    """Emit one machine-readable object describing the file.
+
+    Built for cataloguing a corpus: a manifest that records ``n_records`` per
+    file can weight a balanced sample without opening any of them at read time.
+    The block walk this uses decompresses nothing — it reads each 20-byte block
+    header and seeks over the payload — so it is fast enough to run across
+    thousands of files.
+
+    ``--counts`` additionally tallies the per-record flags, which does have to
+    decompress each block's flags column.
+    """
+    import json
+
+    index = reader.block_index()
+    out = {
+        "path": str(args.input),
+        "file_size": file_size,
+        "format_version": _VERSION,
+        "header": {
+            "read_group": h.read_group,
+            "description": h.description,
+            "seq_len_bytes": h.seq_len_bytes,
+            "max_seq_len": (1 << (8 * h.seq_len_bytes)) - 1,
+            "strand_specific": h.strand_specific,
+            "read1_antisense": h.read1_antisense,
+            "read2_antisense": h.read2_antisense,
+            "strand_normalized": h.strand_normalized,
+            "compression": ("zstd" if h.compression_method == COMPRESSION_ZSTD
+                            else "none"),
+            "compression_level": h.compression_level,
+            "labels": [
+                {"id": ld.label_id, "name": ld.name, "dtype": ld.dtype.code,
+                 "dtype_name": ld.dtype.name, "description": ld.description,
+                 "missing": ld.missing}
+                for ld in h.labels
+            ],
+        },
+        "n_blocks": len(index),
+        "n_records": sum(b.n_records for b in index),
+        "compressed_payload": sum(b.comp_size for b in index),
+        "uncompressed_payload": sum(b.uncomp_size for b in index),
+    }
+    comp = out["compressed_payload"]
+    out["compression_ratio"] = (
+        out["uncompressed_payload"] / comp if comp else 1.0
+    )
+
+    if getattr(args, 'blocks', False):
+        out["blocks"] = [
+            {"index": b.index, "offset": b.offset, "n_records": b.n_records,
+             "comp_size": b.comp_size, "uncomp_size": b.uncomp_size}
+            for b in index
+        ]
+
+    if getattr(args, 'counts', False):
+        out["counts"] = _scan_flag_counts(fh, reader, h)
+
+    json.dump(out, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+def _scan_flag_counts(fh, reader, h) -> dict:
+    """Per-flag record tallies, decompressing only each block's flags column."""
+    import zstandard
+
+    dctx = (zstandard.ZstdDecompressor()
+            if h.compression_method == COMPRESSION_ZSTD else None)
+    tally = {"paired_r1": 0, "paired_r2": 0, "single_or_merged": 0,
+             "reverse_complemented": 0, "full_fragment": 0,
+             "rc_by_mate": {"R1": 0, "R2": 0, "single_or_merged": 0}}
+
+    fh.seek(reader._data_start)
+    while True:
+        b_header = fh.read(_BLOCK_HEADER_SIZE)
+        if not b_header or len(b_header) < _BLOCK_HEADER_SIZE:
+            break
+        c_size, _u, _n, flags_size, _l = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+        if dctx is not None:
+            flags_bytes = dctx.stream_reader(fh.read(c_size)).read(flags_size)
+        else:
+            flags_bytes = fh.read(flags_size)
+            fh.seek(c_size - flags_size, 1)
+        for fl in flags_bytes:
+            rc = fl & 8
+            if rc:
+                tally["reverse_complemented"] += 1
+            if fl & 16:
+                tally["full_fragment"] += 1
+            if fl & 1:
+                tally["paired_r1"] += 1
+                if rc:
+                    tally["rc_by_mate"]["R1"] += 1
+            elif fl & 2:
+                tally["paired_r2"] += 1
+                if rc:
+                    tally["rc_by_mate"]["R2"] += 1
+            else:
+                tally["single_or_merged"] += 1
+                if rc:
+                    tally["rc_by_mate"]["single_or_merged"] += 1
+    return tally
+
+
 def inspect_command(args):
     f_path = Path(args.input)
     if not f_path.exists():
         sys.exit(f"Error: File {args.input} not found.")
 
+    as_json = getattr(args, 'json', False)
     file_size = f_path.stat().st_size
-    print(f"File: {args.input}")
-    print(f"Total Size: {file_size / (1024*1024):.2f} MB")
-    
+    if not as_json:
+        print(f"File: {args.input}")
+        print(f"Total Size: {file_size / (1024*1024):.2f} MB")
+
     with open(args.input, "rb") as f:
         try:
             reader = ZnaReader(f)
             h = reader.header
         except Exception as e:
             sys.exit(f"Error reading header: {e}")
+
+        if as_json:
+            _inspect_json(args, f, reader, h, file_size)
+            return
 
         print("\n--- Header Metadata ---")
         print(f"Read Group:       {h.read_group}")
@@ -1759,6 +1869,14 @@ def main():
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")
     insp.add_argument("input", help="Input .zna file")
+    insp.add_argument("--json", action="store_true",
+                      help="Emit machine-readable JSON instead of text. Includes "
+                           "n_records and n_blocks, read from block headers "
+                           "without decompressing anything -- fast enough to "
+                           "catalogue a whole corpus for manifest building.")
+    insp.add_argument("--blocks", action="store_true",
+                      help="With --json, include a per-block array (offset, "
+                           "n_records, sizes).")
     insp.add_argument("--counts", action="store_true",
                       help="Report per-flag record counts (paired R1/R2, single/merged, "
                            "reverse-complemented). Reads block payloads, so slower than the "
