@@ -1,5 +1,15 @@
 # ZNA Performance
 
+> **These figures predate ZNA 0.3.4 and understate current performance.**
+> They were measured in March 2026 against the 0.3.x codec, before the 0.3.4
+> rewrite roughly doubled decode and cut encode substantially. The dataset is a
+> real 10.76 GB library that is not reproducible here, so the numbers are left
+> as recorded rather than guessed at; the compression figures are unaffected
+> (the on-disk format did not change).
+>
+> For current throughput see the table in [`../README.md`](../README.md), and
+> [`../CHANGELOG.md`](../CHANGELOG.md) for the per-path deltas.
+
 Benchmarks on Apple Silicon (M-series), Python 3.12, March 2026.
 
 Test dataset: 25.4M paired-end Illumina reads (150 bp), interleaved FASTQ

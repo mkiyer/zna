@@ -4,10 +4,10 @@
 
 ## Performance
 
-- **135 MB/s roundtrip** throughput (9.5x faster than Python baseline)
-- **2.8+ GB/s** encoding/decoding for long reads
-- **3.7-4.0x compression** ratio with Zstd
-- **C++ acceleration** with pure Python fallback
+- **1.7 GB/s decode**, **726 MB/s encode** on 150 bp reads (in-memory, single core)
+- **6.6 GB/s decode** on long reads
+- **~4x compression** from 2-bit packing alone, more with Zstd on duplicated data
+- **C++ acceleration** with a pure Python fallback
 
 ## Features
 
@@ -41,7 +41,7 @@ python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_acceler
 ## Quick Start
 
 ```bash
-# Encode FASTQ to compressed ZNA (default: Zstd level 3)
+# Encode FASTQ to compressed ZNA (default: Zstd level 9)
 zna encode sample.fastq.gz -o sample.zna
 
 # Encode with shuffle (for ML training data)
@@ -68,17 +68,25 @@ zna decode reads.zna | head -n 1000
 
 ### Throughput by Read Length
 
-| Read Type | Encode (MB/s) | Decode (MB/s) | Compression |
-|-----------|---------------|---------------|-------------|
-| Short (Illumina, 100-150bp) | 189.5 | 668.8 | 3.68x |
-| Medium (300-500bp) | 540.5 | 1,280.9 | 3.87x |
-| Long (PacBio, 1-5kb) | 1,921.5 | 2,864.6 | 3.98x |
-| Very Long (Nanopore, 5-15kb) | **2,824.7** | **3,392.7** | 3.99x |
+Measured on ZNA 0.3.5, Apple Silicon, single core, in-memory (`BytesIO`),
+min-of-7. Throughput is sequence bases in/out per second; compression is bases
+per stored byte at Zstd level 9 on random (worst-case, incompressible) sequence.
+
+| Read Type | Encode (MB/s) | Decode (MB/s) | Encode (rec/s) | Decode (rec/s) | Compression |
+|---|---|---|---|---|---|
+| Short (Illumina, 150 bp) | 726 | 1,718 | 4.8 M | 11.5 M | 3.95x |
+| Medium (300 bp) | 1,073 | 2,443 | 3.6 M | 8.1 M | 4.00x |
+| Long (PacBio, 1 kb) | 1,775 | 2,924 | 1.8 M | 2.9 M | 4.00x |
+| Very Long (5 kb) | 2,610 | 5,770 | 0.5 M | 1.2 M | 4.00x |
+| Ultra Long (15 kb) | **2,701** | **6,621** | 0.2 M | 0.4 M | 4.00x |
 
 **Key Insights:**
-- Performance scales dramatically with read length
-- Compression ratio remains consistent across workloads
-- C++ acceleration provides 9.5x speedup over pure Python
+- Throughput scales with read length: per-record overhead dominates at 150 bp
+  and vanishes by 5 kb.
+- 4x is the 2-bit packing floor. Real libraries with duplicate reads compress
+  further; unique reads do not, because packed DNA is near-incompressible.
+- `blocks()` is faster still for batch consumers — see
+  [Batch Reading](#batch-reading-with-blocks).
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 
@@ -98,45 +106,61 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 ZNA files use a binary format optimized for nucleic acid sequences:
 
 - **File Extension**: `.zna` (for both compressed and uncompressed files)
-- **Default Compression**: Zstd level 3 (use `--uncompressed` flag to disable)
+- **Default Compression**: Zstd level 9 (use `--uncompressed` to disable)
 - **Magic Number**: `ZNA\x1A` (4 bytes)
-- **Version**: 1 (1 byte)
+- **Version**: 2 (1 byte)
 - **2-bit Encoding**: A=00, C=01, G=10, T=11
-- **Block Structure**: Data organized in compressed/uncompressed blocks
+- **Block Structure**: Columnar blocks, compressed as one Zstd frame each
 - **Metadata**: Read groups, descriptions, and custom information
 
 ### File Structure
 
 ```
-┌─────────────────────────────────────┐
-│         File Header                 │
-│  - Magic (4 bytes)                  │
-│  - Version (1 byte)                 │
-│  - Sequence length encoding (1 byte)│
-│  - Flags (1 byte)                   │
-│  - Compression method (1 byte)      │
-│  - Compression level (1 byte)       │
-│  - Metadata lengths (6 bytes)       │
-│  - Variable metadata strings        │
-├─────────────────────────────────────┤
-│         Block 1                     │
-│  - Block Header (12 bytes)          │
-│    * Compressed size (4 bytes)      │
-│    * Uncompressed size (4 bytes)    │
-│    * Record count (4 bytes)         │
-│  - Compressed/Raw Payload           │
-│    * Record 1: flags, length, seq   │
-│    * Record 2: flags, length, seq   │
-│    * ...                            │
-├─────────────────────────────────────┤
-│         Block 2                     │
-│  ...                                │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  File Header (15 bytes fixed)           │
+│   - Magic "ZNA\x1A" (4 bytes)           │
+│   - Version = 2 (1 byte)                │
+│   - Sequence length width (1 byte)      │
+│   - Flags (1 byte)                      │
+│   - Compression method (1 byte)         │
+│   - Compression level (1 byte)          │
+│   - Label count (2 bytes)               │
+│   - Read-group / description lens (4 B) │
+│  + read group, description (variable)   │
+│  + one 89-byte definition per label     │
+├─────────────────────────────────────────┤
+│  Block 0                                │
+│   Block Header (20 bytes)               │
+│    * Compressed size    (4 bytes)       │
+│    * Uncompressed size  (4 bytes)       │
+│    * Record count       (4 bytes)       │
+│    * Flags column size  (4 bytes)       │
+│    * Lengths column size(4 bytes)       │
+│   Payload — ONE Zstd frame, COLUMNAR:   │
+│    ┌───────────────────────────────┐    │
+│    │ flags    (1 byte  per record) │    │
+│    │ labels   (per schema, if any) │    │
+│    │ lengths  (1/2/4 B per record) │    │
+│    │ sequences (2-bit packed)      │    │
+│    └───────────────────────────────┘    │
+├─────────────────────────────────────────┤
+│  Block 1 ...                            │
+└─────────────────────────────────────────┘
 ```
+
+The payload is **columnar, not row-oriented**: all flags come first, then all
+label values, then all lengths, then all packed sequence. That is what lets
+`zna inspect` tally flags without touching sequence, and `blocks(labels=False)`
+skip label columns.
+
+**The file header stores no record or block count.** Each *block* header carries
+its own count, so totals come from walking the block chain — see
+[`block_index()`](#sizing-a-file-before-reading-it-block_index).
 
 ### Record Format
 
-Each record in a block contains:
+A record's fields live in separate columns of the block, not adjacent to each
+other. Per record:
 - **Flags** (1 byte): IS_READ1 (bit 0), IS_READ2 (bit 1), IS_PAIRED (bit 2),
   IS_RC (bit 3 — set when strand normalization reverse-complemented this record),
   IS_FULL_FRAGMENT (bit 4 — the record spans its whole fragment, so *both* edges
@@ -146,9 +170,15 @@ Each record in a block contains:
 
 ### Compression
 
-- **Method 0**: Uncompressed (`.zna`)
-- **Method 1**: Zstd compression (`.zzna`, levels 1-22)
-- **Block Size**: Default 128KB (configurable)
+- **Method 0**: Uncompressed
+- **Method 1**: Zstd, levels 1-22 (default 9)
+- **Block Size**: Default 4 MiB (`--block-size`, accepts K/M/G suffixes)
+
+Both use the `.zna` extension; compression is recorded in the header, not the
+filename. Smaller blocks cost compression ratio only on duplicate-rich data —
+on unique reads the packed sequence is incompressible, so block size is free.
+A batch consumer holding a decoded block at a time (see `blocks()`) may want
+`--block-size 1M` to bound its memory.
 
 ---
 
@@ -166,9 +196,9 @@ zna encode sample.fastq -o sample.zna
 zna encode sample.fasta -o sample.zna
 
 # From gzipped input
-zna encode sample.fastq.gz -o sample.zzna
+zna encode sample.fastq.gz -o sample.zna
 
-# With high compression (default is level 3)
+# Lower level = faster encode, larger file (default is 9)
 zna encode sample.fastq --level 5 -o sample.zna
 
 # Uncompressed (rarely needed)
@@ -191,7 +221,7 @@ zna encode R1.fastq.gz R2.fastq.gz -o paired.zna
 zna encode interleaved.fastq --interleaved -o paired.zna
 
 # Interleaved from stdin
-cat interleaved.fastq | zna encode --interleaved -o paired.zzna
+cat interleaved.fastq | zna encode --interleaved -o paired.zna
 ```
 
 #### Mixed Paired-End and Single-End Reads (Interleaved)
@@ -628,15 +658,20 @@ Typical compression ratios compared to raw FASTQ:
 
 ### Speed
 
-- **Encoding**: ~5-10M reads/second (single thread)
-- **Decoding**: ~8-15M reads/second (single thread)
-- **Block-based**: Enables parallel processing (future)
+- **Encoding**: ~4.8M reads/second at 150 bp (single thread)
+- **Decoding**: ~11.5M reads/second at 150 bp (single thread)
+- **Block-based**: shards and subsamples without decoding what it skips
 
 ### Memory Usage
 
-- **Streaming I/O**: Constant memory usage
-- **Default block size**: 128KB buffer
-- **No index required**: Sequential scan
+- **Streaming I/O**: constant memory for `records()`; the writer buffers one
+  block at a time
+- **Default block size**: 4 MiB (`--block-size`)
+- **`blocks()` holds one decoded block per open reader**, so block size sets the
+  memory of a batch consumer: at 150 bp, a 4 MiB block is ~100k records (~20 MB
+  of Python strings) against ~25k (~5 MB) for 1 MiB
+- **No stored index required**: `block_index()` walks block headers in ~2.3 µs
+  per block, so counts and offsets are recovered without one
 
 ---
 
@@ -670,9 +705,13 @@ Pre-computed lookup tables provide O(1) encoding/decoding:
 
 Data is organized in independently compressed blocks:
 
-- **Advantages**: Random access, parallel processing potential
-- **Overhead**: ~12 bytes per block
-- **Optimal size**: 128KB balances compression ratio and I/O
+- **Advantages**: block-granular sharding and sampling; per-block counts without
+  decompression
+- **Overhead**: 20 bytes of header per block
+- **Choosing a size**: 4 MiB (the default) maximises compression on
+  duplicate-rich data. On unique reads, packed sequence is incompressible and
+  block size costs nothing, so prefer smaller blocks (1 MiB) when a consumer
+  reads with `blocks()` or shards by block
 
 ### Compression Strategy
 
@@ -834,18 +873,18 @@ with open("in.zna", "rb") as fin, open("out.zna", "wb") as fout:
 
 ```bash
 # dUTP/TruSeq protocol (most common - this is the default)
-zna encode R1.fastq.gz R2.fastq.gz --strand-specific -o library.zzna
+zna encode R1.fastq.gz R2.fastq.gz --strand-specific -o library.zna
 
 # fr-secondstrand protocol
 zna encode R1.fastq.gz R2.fastq.gz \
   --strand-specific --read1-sense --read2-antisense \
-  -o library.zzna
+  -o library.zna
 
 # Decode with sense-normalized sequences (for alignment)
-zna decode library.zzna -o normalized.fasta
+zna decode library.zna -o normalized.fasta
 
 # Decode with original strand orientation restored
-zna decode library.zzna --restore-strand -o original.fasta
+zna decode library.zna --restore-strand -o original.fasta
 ```
 
 ---
@@ -1006,7 +1045,7 @@ header = ZnaHeader(
     compression_level=5
 )
 
-with open("output.zzna", "wb") as f:
+with open("output.zna", "wb") as f:
     with ZnaWriter(f, header) as writer:
         writer.write_record("ACGTACGT", is_paired=False, 
                           is_read1=False, is_read2=False)
@@ -1014,7 +1053,7 @@ with open("output.zzna", "wb") as f:
                           is_read1=False, is_read2=False)
 
 # Reading
-with open("output.zzna", "rb") as f:
+with open("output.zna", "rb") as f:
     reader = ZnaReader(f)
     print(f"Read Group: {reader.header.read_group}")
     
