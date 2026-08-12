@@ -767,18 +767,16 @@ class ZnaReader:
                 _BLOCK_HEADER_FMT, block_header_data
             )
 
-            if index % stride != offset:
+            index += 1
+            if (index - 1) % stride != offset:
                 # Not this shard's block: step over the payload without paying
                 # to decompress it.  Seek when the stream allows it; a pipe has
-                # to be read through.
-                index += 1
+                # to be read through.  ``_read_exact`` raises on a short read.
                 try:
                     fh.seek(comp_size, 1)
                 except (AttributeError, OSError):
-                    if len(self._read_exact(comp_size)) != comp_size:
-                        raise EOFError("Unexpected EOF while skipping a block")
+                    self._read_exact(comp_size)
                 continue
-            index += 1
 
             block_payload = self._read_exact(comp_size)
             if compression_method == COMPRESSION_ZSTD:
