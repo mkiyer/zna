@@ -831,6 +831,156 @@ class TestBlocksAPI(FuzzCase):
                 ZnaReader(io.BytesIO(plain)).blocks(stride=stride, offset=offset)
 
 
+class TestBlocksWithLabels(FuzzCase):
+    """``blocks()`` on a labeled file.
+
+    The risk here is not the API, it is the payload split.  A block is
+    ``flags | labels | lengths | sequences``, and ``blocks()`` previously refused
+    labeled files, so its splitting code had never had to account for the label
+    bytes.  Getting that offset wrong decodes sequences from the wrong position
+    and produces plausible garbage rather than an error — so every one of these
+    checks it against ``records()``, which has always split correctly.
+    """
+
+    CODES = ("i", "i", "C")  # hulkrna's schema: ZI, ZJ, ZF
+
+    def _labeled_file(self, rng, n=200, seq_len_bytes=2, strand_cfg=None,
+                      compression=COMPRESSION_ZSTD, codes=None,
+                      block_size=BLOCK_SIZE):
+        codes = codes or self.CODES
+        labels = tuple(
+            LabelDef(label_id=i, name=f"L{i}", description="",
+                     dtype=DTYPE_BY_CODE[c])
+            for i, c in enumerate(codes)
+        )
+        recs = gen_records(rng, "mixed", n, seq_len_bytes,
+                           allow_n=False, allow_lower=False)
+        values = [tuple(gen_label_value(rng, c) for c in codes) for _ in recs]
+        header = make_header(seq_len_bytes, strand_cfg or STRAND_CONFIGS[0],
+                             compression, labels=labels)
+        buf = io.BytesIO()
+        with ZnaWriter(buf, header, block_size=block_size) as w:
+            for (seq, is_paired, is_r1, is_r2, is_full), vals in zip(recs, values):
+                w.write_record(seq, is_paired, is_r1, is_r2, labels=vals,
+                               is_full_fragment=is_full)
+        return buf.getvalue(), recs, values
+
+    def test_default_still_refuses_labeled_files(self):
+        rng = random.Random(SEED + 20)
+        data, _, _ = self._labeled_file(rng)
+        with self.assertRaises(NotImplementedError) as cm:
+            ZnaReader(io.BytesIO(data)).blocks()
+        self.assertIn("labels=", str(cm.exception),
+                      "the refusal should name the way out")
+
+    def test_labels_false_matches_records(self):
+        """The split must be right even when the values are not wanted."""
+        for backend in BACKENDS:
+            for seq_len_bytes in (1, 2, 4):
+                for compression in (COMPRESSION_NONE, COMPRESSION_ZSTD):
+                    for codes in (("i", "i", "C"), ("C",), ("d", "q", "f", "A")):
+                        rng = random.Random(SEED + 21)
+                        data, recs, _ = self._labeled_file(
+                            rng, seq_len_bytes=seq_len_bytes,
+                            compression=compression, codes=codes)
+                        ctx = (f"backend={backend} slb={seq_len_bytes} "
+                               f"comp={compression} codes={codes}")
+                        with force_backend(backend):
+                            want = [(r[0], *r[1:4]) for r in
+                                    ZnaReader(io.BytesIO(data)).records()]
+                            got = []
+                            for seqs, flags in ZnaReader(io.BytesIO(data)).blocks(
+                                    labels=False):
+                                self.assertEqual(len(seqs), len(flags), ctx)
+                                for seq, fl in zip(seqs, flags):
+                                    got.append((seq, *FLAG_FIELDS[fl]))
+                        self.assertEqual(got, want, f"{ctx}: labels=False diverged")
+
+    def test_labels_true_returns_columns(self):
+        for backend in BACKENDS:
+            for compression in (COMPRESSION_NONE, COMPRESSION_ZSTD):
+                rng = random.Random(SEED + 22)
+                data, recs, values = self._labeled_file(
+                    rng, compression=compression)
+                ctx = f"backend={backend} comp={compression}"
+                got_seqs, got_vals = [], []
+                with force_backend(backend):
+                    for seqs, flags, columns in ZnaReader(io.BytesIO(data)).blocks(
+                            labels=True):
+                        self.assertEqual(len(columns), len(self.CODES),
+                                         f"{ctx}: wrong column count")
+                        for col in columns:
+                            self.assertEqual(len(col), len(seqs),
+                                             f"{ctx}: column length != record count")
+                        got_seqs.extend(seqs)
+                        got_vals.extend(zip(*columns))
+                self.assertEqual(got_seqs, [r[0] for r in recs], f"{ctx}: sequences")
+                self.assertEqual(got_vals, values, f"{ctx}: label values")
+
+    def test_labels_true_agrees_with_records(self):
+        """Columnar labels must equal what records() yields per record."""
+        rng = random.Random(SEED + 23)
+        data, _, _ = self._labeled_file(rng, n=300)
+        per_record = [tuple(r[4]) for r in ZnaReader(io.BytesIO(data)).records()]
+        columnar = []
+        for _seqs, _flags, columns in ZnaReader(io.BytesIO(data)).blocks(labels=True):
+            columnar.extend(zip(*columns))
+        self.assertEqual(columnar, per_record)
+
+    def test_labels_true_on_unlabeled_file_yields_no_columns(self):
+        """len(label_columns) == len(header.labels) is the invariant, so an
+        unlabeled file gives an empty tuple rather than an error."""
+        rng = random.Random(SEED + 24)
+        recs = gen_records(rng, "mixed", 50, 2, allow_n=False, allow_lower=False)
+        header = make_header(2, STRAND_CONFIGS[0], COMPRESSION_ZSTD)
+        data = write_file(header, recs, "")
+        n = 0
+        for seqs, flags, columns in ZnaReader(io.BytesIO(data)).blocks(labels=True):
+            self.assertEqual(columns, ())
+            n += len(seqs)
+        self.assertEqual(n, len(recs))
+
+    def test_labeled_sharding_and_restore_strand(self):
+        """The label offset has to hold under every other blocks() feature."""
+        rng = random.Random(SEED + 25)
+        data, recs, values = self._labeled_file(
+            rng, n=400, strand_cfg=STRAND_CONFIGS[1], block_size=256)
+        index = ZnaReader(io.BytesIO(data)).block_index()
+        self.assertGreater(len(index), 3, "need several blocks")
+
+        # Sharded, labels skipped: shards must partition the file exactly.
+        want = [r[0] for r in ZnaReader(io.BytesIO(data)).records()]
+        merged = []
+        for off in range(3):
+            for seqs, _f in ZnaReader(io.BytesIO(data)).blocks(
+                    stride=3, offset=off, labels=False):
+                merged.extend(seqs)
+        self.assertEqual(sorted(merged), sorted(want), "sharding lost records")
+
+        # indices=, with labels: values must stay aligned to their sequences.
+        want_pairs = [(r[0], tuple(r[4]))
+                      for r in ZnaReader(io.BytesIO(data)).records()]
+        by_block = []
+        for seqs, _f, cols in ZnaReader(io.BytesIO(data)).blocks(labels=True):
+            by_block.append(list(zip(seqs, zip(*cols))))
+        picked = [0, 2]
+        got = [p for i in picked for p in by_block[i]]
+        flat = []
+        for seqs, _f, cols in ZnaReader(io.BytesIO(data)).blocks(
+                indices=picked, labels=True):
+            flat.extend(zip(seqs, zip(*cols)))
+        self.assertEqual(flat, got, "indices= misaligned labels")
+
+        # restore_strand on a labeled file.
+        want_rs = [r[0] for r in
+                   ZnaReader(io.BytesIO(data)).records(restore_strand=True)]
+        got_rs = []
+        for seqs, _f in ZnaReader(io.BytesIO(data)).blocks(
+                restore_strand=True, labels=False):
+            got_rs.extend(seqs)
+        self.assertEqual(got_rs, want_rs, "restore_strand diverged on a labeled file")
+
+
 class TestBlockIndex(FuzzCase):
     """``block_index()`` is what lets a consumer size a subsample before reading
     anything, so its counts have to be exact — an estimate would silently skew a

@@ -373,9 +373,22 @@ That is worth 1.8x at 2 workers and 9.4x at 16, compared with striding over
   file. The default 4 MiB block gives a few hundred blocks per GB; write with a
   smaller `block_size` if you need finer shards.
 
-`blocks()` also takes `restore_strand=True`. It raises on labeled files — the
-label columns would have to come back too, and dropping them silently is worse
-than not offering the API — so use `records()` there.
+`blocks()` also takes `restore_strand=True`.
+
+On a **labeled** file it needs an explicit `labels=`, because quietly discarding
+label columns is not a decision it should make for you:
+
+```python
+reader.blocks()                 # labeled file -> raises
+reader.blocks(labels=False)     # skip the columns  -> (sequences, flags)
+reader.blocks(labels=True)      # -> (sequences, flags, label_columns)
+```
+
+`label_columns` holds one value-tuple per column in header order, each as long as
+`sequences`; `len(label_columns)` always equals `len(header.labels)`, so an
+unlabeled file yields `()`. On a three-column file, `labels=False` is 3.4x faster
+than `records()` and `labels=True` 2.1x. (Both still inflate the label bytes — a
+block is one zstd frame — what is saved is unpacking them into Python objects.)
 
 #### Sizing a file before reading it: `block_index()`
 

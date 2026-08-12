@@ -5,6 +5,49 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-08-12
+
+Two fixes found by reviewing the pipelines that write and read ZNA files
+(hulkrna and khorana). No on-disk format change.
+
+### Fixed
+- **`zna encode --shuffle-buffer-size` did nothing.** The flag was declared and
+  parsed, but `encode_command` passed a hardcoded `1 << 30` to `shuffle_zna`, so
+  the bucket budget was always 1 GiB no matter what was asked for.
+  (`zna shuffle`, the standalone command, honoured its `--buffer-size`
+  correctly; only the encode path was affected.) The default still parses to
+  1 GiB, so no existing invocation changes behaviour — the flag simply works now.
+
+### Added
+- **`ZnaReader.blocks(labels=...)`** — `blocks()` previously refused labeled
+  files outright, on the reasoning that handing back sequences while silently
+  dropping the label columns was worse than not offering the API. That reasoning
+  still holds for the *default*, but it made the batch API unusable on any
+  labeled corpus, which is what the pipeline it was built for actually produces.
+
+  The default still raises, now naming the way out. `labels=False` skips the
+  columns — not silent, the caller asked — and `labels=True` yields a third
+  element holding one value-tuple per label column, in header order.
+  `len(label_columns)` always equals `len(header.labels)`, so an unlabeled file
+  yields `()` rather than erroring.
+
+  Measured on a three-column file (int32, int32, uint8) of 200k x 150 bp:
+  `records()` 32.7 ms, `blocks(labels=True)` 15.5 ms (2.12x),
+  `blocks(labels=False)` 9.5 ms (3.44x).
+
+  Note this does not avoid *decompressing* the label bytes — a block payload is
+  a single zstd frame holding all four columns — it avoids unpacking them into
+  Python objects, which is where the cost is.
+
+### Fixed (latent)
+- `blocks()` split the block payload as `flags | lengths | sequences`, which is
+  only correct without labels. It never ran on a labeled file because of the
+  guard above, but lifting that guard without fixing the offset would have
+  decoded sequences from the wrong position — plausible garbage, no error. The
+  split now accounts for the label columns whether or not their values are
+  wanted, and the fuzz harness checks it against `records()` across dtypes,
+  compression, sharding, `indices=`, and `restore_strand`.
+
 ## [0.3.4] - 2026-08-11
 
 Performance release. Nothing about the on-disk format changes, and no existing

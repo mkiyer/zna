@@ -775,8 +775,8 @@ class ZnaReader:
 
     def blocks(
         self, stride: int = 1, offset: int = 0, restore_strand: bool = False,
-        indices: Iterable[int] | None = None,
-    ) -> Iterator[Tuple[list, bytes]]:
+        indices: Iterable[int] | None = None, labels: bool | None = None,
+    ) -> Iterator[Tuple[list, bytes] | Tuple[list, bytes, tuple]]:
         """Yield ``(sequences, flags)`` once per block, columnar.
 
         *sequences* is a ``list[str]``; *flags* is the block's raw flag column,
@@ -816,9 +816,31 @@ class ZnaReader:
         several epochs over a file at ``stride=4`` would revisit the same four
         subsets.  Non-selected blocks are seeked over either way.
 
-        Raises on labeled files: the label columns would have to come back too,
-        and silently dropping them is worse than not offering the API.
+        ``labels`` decides what happens to a labeled file's label columns:
+
+        * unset (the default) — a labeled file **raises**.  Handing back
+          sequences while quietly discarding the label columns is not a decision
+          this method should make on the caller's behalf.
+        * ``labels=False`` — the columns are skipped.  Not silent: the caller
+          asked for it.  This is what a consumer that only wants sequence should
+          pass; it is worth about 1.9x on a three-column file.
+        * ``labels=True`` — yields a third element, one value-tuple per label
+          column in header order, each ``count`` long.  ``len(label_columns)``
+          always equals ``len(header.labels)``, so an unlabeled file yields
+          ``()`` rather than erroring.
+
+        Note what ``labels=False`` does and does not save.  A block payload is a
+        single zstd frame holding all four columns, so the label bytes are
+        inflated either way; what is skipped is unpacking them into Python
+        objects, which is where the cost actually is.
         """
+        if labels is None and self._header.labels:
+            raise NotImplementedError(
+                "blocks() needs an explicit labels= on a labeled file "
+                f"({len(self._header.labels)} label column(s) defined). "
+                "Pass labels=False to skip the label columns, labels=True to "
+                "receive them columnar, or use records() to get them per record."
+            )
         if indices is not None:
             if stride != 1 or offset != 0:
                 raise ValueError(
@@ -837,24 +859,28 @@ class ZnaReader:
                 raise ValueError(f"stride must be >= 1, got {stride}")
             if not 0 <= offset < stride:
                 raise ValueError(f"offset must be in [0, {stride}), got {offset}")
-        if self._header.labels:
-            raise NotImplementedError(
-                "blocks() does not support labeled files "
-                f"({len(self._header.labels)} label column(s) defined). "
-                "Use records(), which returns labels with each record."
-            )
-        return self._iter_blocks(stride, offset, restore_strand, selected)
+        return self._iter_blocks(stride, offset, restore_strand, selected,
+                                 bool(labels))
 
     def _iter_blocks(
         self, stride: int, offset: int, restore_strand: bool,
-        selected: frozenset | None,
-    ) -> Iterator[Tuple[list, bytes]]:
+        selected: frozenset | None, want_labels: bool,
+    ) -> Iterator[Tuple[list, bytes] | Tuple[list, bytes, tuple]]:
         fh = self._fh
         fh_read = fh.read
         len_bytes = self._header.seq_len_bytes
         compression_method = self._header.compression_method
         needs_restore = restore_strand and self._header.strand_normalized
         decode_seqs = _codec.decode_block_sequences
+
+        # The payload is flags | labels | lengths | sequences.  The label column
+        # widths are needed even when the caller does not want the values,
+        # because without them the lengths and sequence streams start at the
+        # wrong offset -- which decodes silently, into garbage.
+        label_defs = self._header.labels
+        label_col_sizes = [label_bytes_per_record(ld) for ld in label_defs]
+        label_bytes_per_rec = sum(label_col_sizes)
+        label_formats = [ld.dtype.struct_ch for ld in label_defs]
 
         if compression_method == COMPRESSION_ZSTD:
             dctx = zstandard.ZstdDecompressor()
@@ -907,17 +933,29 @@ class ZnaReader:
             else:
                 block_data = block_payload
 
-            lengths_end = flags_size + lengths_size
+            labels_end = flags_size + label_bytes_per_rec * count
+            lengths_end = labels_end + lengths_size
             flags_stream = block_data[:flags_size]
-            lengths_stream = block_data[flags_size:lengths_end]
+            lengths_stream = block_data[labels_end:lengths_end]
             seqs_stream = block_data[lengths_end:]
 
             yielded += 1
-            yield (
-                decode_seqs(flags_stream, lengths_stream, seqs_stream,
-                            len_bytes, count, needs_restore),
-                flags_stream,
-            )
+            sequences = decode_seqs(flags_stream, lengths_stream, seqs_stream,
+                                    len_bytes, count, needs_restore)
+            if not want_labels:
+                yield sequences, flags_stream
+                continue
+
+            columns = []
+            offset_ = flags_size
+            for col_size, fmt in zip(label_col_sizes, label_formats):
+                col_bytes = col_size * count
+                columns.append(struct.unpack(
+                    f"<{count}{fmt}",
+                    block_data[offset_:offset_ + col_bytes],
+                ))
+                offset_ += col_bytes
+            yield sequences, flags_stream, tuple(columns)
 
     def _iter_records(
         self, restore_strand: bool, with_rc: bool, with_ends: bool = False

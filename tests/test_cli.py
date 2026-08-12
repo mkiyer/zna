@@ -2259,3 +2259,97 @@ class TestGzipInput:
             b = run(p, str(Path(tmp) / "b.zna"))
             assert a == seqs
             assert a == b
+
+
+class TestEncodeShuffleBufferSize:
+    """`--shuffle-buffer-size` was parsed and then ignored: `encode --shuffle`
+    hardcoded a 1 GiB bucket budget, so the documented flag did nothing."""
+
+    def _args(self, fq_path, out_path, buffer_size):
+        # NB: the parameters must not be named `fastq`/`output`; those are also
+        # class attributes below, which makes the class body's LOAD_NAME skip the
+        # enclosing function scope.
+        class Args:
+            files = [fq_path]
+            output = out_path
+            interleaved = False
+            read_group = "rg"
+            description = ""
+            seq_len_bytes = 2
+            strand_specific = False
+            strand_normalize = False
+            npolicy = "drop"
+            compress_flag = False
+            level = 3
+            block_size = "64K"
+            quiet = True
+            fasta = False
+            fastq = True
+            shuffle = True
+            seed = 7
+            shuffle_buffer_size = buffer_size
+        return Args()
+
+    def _write_fastq(self, path, n=200):
+        rng = random.Random(1234)
+        with open(path, "w") as fh:
+            for i in range(n):
+                s = "".join(rng.choices("ACGT", k=150))
+                fh.write(f"@r{i}\n{s}\n+\n{'I' * 150}\n")
+
+    def test_flag_reaches_shuffle_zna(self, monkeypatch):
+        from zna import cli
+
+        seen = {}
+        real = cli.shuffle_zna
+
+        def spy(*a, **kw):
+            seen.update(kw)
+            return real(*a, **kw)
+
+        monkeypatch.setattr(cli, "shuffle_zna", spy)
+        with tempfile.TemporaryDirectory() as tmp:
+            fq = str(Path(tmp) / "in.fastq")
+            self._write_fastq(fq)
+            cli.encode_command(
+                self._args(fq, str(Path(tmp) / "a.zna"), "8M"))
+        assert seen.get("buffer_bytes") == 8 * 1024 * 1024, (
+            f"--shuffle-buffer-size did not reach shuffle_zna: {seen!r}")
+
+    def test_default_is_still_one_gib(self, monkeypatch):
+        """The default must parse to the value that was previously hardcoded,
+        so no existing invocation changes behaviour."""
+        from zna import cli
+
+        seen = {}
+        real = cli.shuffle_zna
+
+        def spy(*a, **kw):
+            seen.update(kw)
+            return real(*a, **kw)
+
+        monkeypatch.setattr(cli, "shuffle_zna", spy)
+        with tempfile.TemporaryDirectory() as tmp:
+            fq = str(Path(tmp) / "in.fastq")
+            self._write_fastq(fq)
+            args = self._args(fq, str(Path(tmp) / "b.zna"), None)
+            cli.encode_command(args)
+        assert seen.get("buffer_bytes") == 1 << 30
+
+    def test_small_buffer_still_produces_a_valid_shuffled_file(self):
+        """A tiny budget means many buckets; the output must still round-trip."""
+        from zna import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fq = str(Path(tmp) / "in.fastq")
+            self._write_fastq(fq, n=400)
+            out = str(Path(tmp) / "c.zna")
+            cli.encode_command(self._args(fq, out, "16K"))
+            with open(out, "rb") as fh:
+                got = [r[0] for r in ZnaReader(fh).records()]
+            expected = []
+            with open(fq) as fh:
+                for i, line in enumerate(fh):
+                    if i % 4 == 1:
+                        expected.append(line.strip())
+            assert sorted(got) == sorted(expected)

@@ -1342,7 +1342,13 @@ def encode_command(args):
                 args.output,
                 tmp_shuffle,
                 seed=getattr(args, 'seed', 42),
-                buffer_bytes=1 << 30,
+                # --shuffle-buffer-size was parsed and then ignored here, so the
+                # documented flag did nothing and the budget was always 1 GiB.
+                # Its default still parses to 1 GiB, so this changes no existing
+                # invocation's behaviour -- it only makes the flag work.
+                buffer_bytes=parse_block_size(
+                    getattr(args, 'shuffle_buffer_size', None) or "1G"
+                ),
                 block_size=block_size,
                 quiet=True,
             )
