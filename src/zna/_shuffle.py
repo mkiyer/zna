@@ -28,9 +28,15 @@ import os
 import random
 import sys
 import tempfile
+from dataclasses import replace
 from typing import List, Tuple
 
-from .core import ZnaHeader, ZnaWriter, ZnaReader, _RC_FULL_BY_ENDS
+from .core import (
+    COMPRESSION_ZSTD, ZnaHeader, ZnaWriter, ZnaReader, _RC_FULL_BY_ENDS,
+)
+
+#: ZSTD level for the throwaway bucket files.  They exist for one read.
+BUCKET_ZSTD_LEVEL = 1
 
 
 # Type alias for a single record tuple (without or with labels).
@@ -128,6 +134,16 @@ def shuffle_zna(
         labels=in_header.labels,
     )
 
+    # Bucket files are written once, read back immediately, and deleted with the
+    # temp directory, so compressing them at the *source file's* level spends
+    # real CPU buying a ratio nothing ever benefits from.  Level 1 keeps the
+    # temp footprint in the same ballpark for a fraction of the cost.  The
+    # output header is untouched: the file the user keeps still gets their level.
+    if out_header.compression_method == COMPRESSION_ZSTD:
+        bucket_header = replace(out_header, compression_level=BUCKET_ZSTD_LEVEL)
+    else:
+        bucket_header = out_header
+
     has_labels = len(in_header.labels) > 0
     # Bound once: both write passes below index this per record, and a global
     # lookup plus a function call per record is what it replaces.
@@ -139,7 +155,7 @@ def shuffle_zna(
         ]
         bucket_fhs = [open(p, "wb") for p in bucket_paths]
         bucket_writers = [
-            ZnaWriter(fh, out_header, block_size=block_size,
+            ZnaWriter(fh, bucket_header, block_size=block_size,
                       preserve_normalization=True)
             for fh in bucket_fhs
         ]

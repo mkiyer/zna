@@ -1,6 +1,7 @@
 import sys
 import argparse
 import gzip
+import io
 import os
 import tempfile
 import time
@@ -28,6 +29,10 @@ try:
     from ._accel import extract_labels_fast as _accel_extract
 except (ImportError, AttributeError):
     pass
+
+
+#: Read-ahead placed in front of gzip input; see :func:`get_input_handle`.
+_GZIP_READ_BUFFER = 1 << 20
 
 
 def parse_block_size(value) -> int:
@@ -63,7 +68,10 @@ def get_input_handle(filepath: Optional[str]) -> BinaryIO:
     if filepath is None or filepath == "-":
         return sys.stdin.buffer
     if filepath.endswith(".gz"):
-        return gzip.open(filepath, "rb")
+        # A FASTQ record is four readline calls, and GzipFile serves each from
+        # its own modest internal buffer.  A wide BufferedReader in front
+        # amortises that across many records instead of paying it per line.
+        return io.BufferedReader(gzip.open(filepath, "rb"), buffer_size=_GZIP_READ_BUFFER)
     return open(filepath, "rb")
 
 def get_output_handle(filepath: Optional[str]) -> BinaryIO:
@@ -161,14 +169,7 @@ def parse_fastq(fh: BinaryIO) -> Iterator[str]:
         readline()  # + line (discard)
         readline()  # Quality line (discard)
         if seq_line:
-            # Strip newline and decode - use slice instead of strip() for speed
-            # Most lines end with \n, some with \r\n
-            end = len(seq_line)
-            if end > 0 and seq_line[-1] == 10:  # \n
-                end -= 1
-            if end > 0 and seq_line[end-1] == 13:  # \r
-                end -= 1
-            yield seq_line[:end].decode('ascii')
+            yield seq_line.rstrip(b"\r\n").decode('ascii')
 
 
 def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
@@ -184,24 +185,14 @@ def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
         if header[0] != 64:  # ord('@') = 64
             continue
         # Extract read name (skip @ and strip)
-        end = len(header)
-        if end > 1 and header[-1] == 10:  # \n
-            end -= 1
-        if end > 1 and header[end-1] == 13:  # \r
-            end -= 1
-        read_name = header[1:end].decode('ascii')
+        read_name = header[1:].rstrip(b"\r\n").decode('ascii')
         
         seq_line = readline()
         readline()  # + line
         readline()  # Quality line
         
         if seq_line:
-            end = len(seq_line)
-            if end > 0 and seq_line[-1] == 10:
-                end -= 1
-            if end > 0 and seq_line[end-1] == 13:
-                end -= 1
-            yield read_name, seq_line[:end].decode('ascii')
+            yield read_name, seq_line.rstrip(b"\r\n").decode('ascii')
 
 
 def parse_fastq_keyed(fh: BinaryIO) -> Iterator[Tuple[bytes, int, str]]:
@@ -219,24 +210,14 @@ def parse_fastq_keyed(fh: BinaryIO) -> Iterator[Tuple[bytes, int, str]]:
             break
         if header[0] != 64:  # ord('@')
             continue
-        end = len(header)
-        if end > 1 and header[-1] == 10:  # \n
-            end -= 1
-        if end > 1 and header[end - 1] == 13:  # \r
-            end -= 1
-        base, suffix = _read_key(header[1:end])
+        base, suffix = _read_key(header[1:].rstrip(b"\r\n"))
 
         seq_line = readline()
         readline()  # + line
         readline()  # quality line
 
         if seq_line:
-            end = len(seq_line)
-            if end > 0 and seq_line[-1] == 10:
-                end -= 1
-            if end > 0 and seq_line[end - 1] == 13:
-                end -= 1
-            yield base, suffix, seq_line[:end].decode('ascii')
+            yield base, suffix, seq_line.rstrip(b"\r\n").decode('ascii')
 
 
 def parse_fastq_with_headers(fh: BinaryIO) -> Iterator[Tuple[bytes, str]]:
@@ -253,24 +234,14 @@ def parse_fastq_with_headers(fh: BinaryIO) -> Iterator[Tuple[bytes, str]]:
             break
         if header[0] != 64:  # ord('@')
             continue
-        end = len(header)
-        if end > 1 and header[-1] == 10:
-            end -= 1
-        if end > 1 and header[end - 1] == 13:
-            end -= 1
-        raw_header = header[1:end]
+        raw_header = header[1:].rstrip(b"\r\n")
 
         seq_line = readline()
         readline()  # +
         readline()  # quality
 
         if seq_line:
-            end = len(seq_line)
-            if end > 0 and seq_line[-1] == 10:
-                end -= 1
-            if end > 0 and seq_line[end - 1] == 13:
-                end -= 1
-            yield raw_header, seq_line[:end].decode('ascii')
+            yield raw_header, seq_line.rstrip(b"\r\n").decode('ascii')
 
 def parse_fasta(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTA stream."""
