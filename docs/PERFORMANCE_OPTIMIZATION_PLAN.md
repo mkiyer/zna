@@ -1,8 +1,68 @@
 # Performance optimization plan
 
-Status: **proposed**. Written 2026-08-11 against `ab05813` (0.3.3).
-Nothing here is applied. The 0.3.3 tree is the correct, tested baseline these
-changes would build on.
+Status: **executed** in 0.3.4, except where noted in §0. Written 2026-08-11
+against `ab05813` (0.3.3); the plan text below is preserved as written, and §0
+records what actually happened when it was carried out.
+
+## 0. Outcome (0.3.4)
+
+The prerequisite fuzz harness (§1) exists as `tests/test_fuzz_roundtrip.py`. It
+found a **shipped data-corruption bug on its first run**: `_pycodec.encode_sequence`
+validated each 4-base group with `val > 255` applied *after* OR-ing the four
+2-bit values together, so an invalid base in the group's last slot ORed to
+exactly 255, never exceeded it, and was packed as `0xFF` — decoding back as
+`TTTT` and taking three valid bases with it. Every index congruent to 3 mod 4 was
+affected, including the IUPAC ambiguity codes that occur in real FASTQ. Fixed.
+
+Everything in Tiers A, B and D was applied, along with seven of the nine Tier C
+items and three of the four unverified ones. Verification for the codec rewrite
+was a byte-identity check against 90 encode/decode configurations captured from
+the 0.3.3 build — including `npolicy="random"` and every reverse-complement path
+— plus the fuzz harness over many seeds.
+
+**Where the plan's numbers did not hold.** Measured on the path each claim names:
+
+| claim | plan | measured |
+|---|---|---|
+| shuffle pass-0 counting scan | +95.9% *(unverified)* | **+2899%** |
+| gzip via external subprocess | +60% *(unverified)* | **+123%** |
+| `encode_block` reverse-complement | +87% | **+163%** |
+| `restore_strand` in the decoder | +63.5% | **+147%** |
+| `encode_block` STL round-trip | +122.4% | +113% |
+| `decode_block_columnar` | +178% | **+109%** |
+| `reverse_complement` str→str | 551% *(unverified)* | **+31%** |
+| `blocks()` | +274% | **+73%** batching only |
+| bucket zstd level | +19.7% | **+1% to +6.6%** |
+
+The two biggest single wins in 0.3.4 were not the plan's headline items. The
+shuffle counting scan (30x) and block-level sharding in `blocks()` (up to 9.4x
+for one worker of 16) both came from *not doing work* rather than doing it
+faster, and neither was sized correctly in the plan.
+
+`blocks()` in particular changed shape once designed against khorana's loader as
+§2 instructed. That loader shards with
+`itertools.islice(reader.records(), worker_id, None, total_workers)`, so every
+worker decodes the whole file and discards `(N-1)/N` of it. Columnar batching
+does not address that; `stride`/`offset` sharding by block does.
+
+**Not applied**, and still open:
+
+- Tier C, compressing blocks on a worker thread pool (+69.4%). Changes flush
+  ordering and concurrency in the writer; wanted its own change, not this one.
+- Tier C, fusing the shuffle into encode (+50.2%). The plan itself records that
+  the sketch corrupts data on three paths.
+- The compression-ratio half of the `DEFAULT_BLOCK_SIZE` 4→16 MiB finding, which
+  §3 notes does reproduce even though the decode half does not.
+
+Also measured and **rejected**: passing the flags `bytearray` to `encode_block`
+instead of `list(bytearray)` per block (−2.8%, noise).
+
+One thing the plan flagged as a silent dependency turned out to be worse than
+described: `CMakeLists.txt` passed `STABLE_ABI`, but nanobind honours that only
+when CMake finds `Development.SABIModule`, and the `find_package` asks for
+`Development.Module`. It was a no-op, and the module — which has used
+`PyTuple_SET_ITEM` since long before this work — could never have been
+limited-API. The request is now dropped rather than left misleading.
 
 Produced by a seven-layer measurement sweep (writer, reader, C++ encode, C++
 decode, FASTQ parsing, compression/IO, shuffle/CLI). 31 candidate findings were
