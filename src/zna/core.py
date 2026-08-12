@@ -18,6 +18,8 @@ Each block payload contains three concatenated columnar streams
 from __future__ import annotations
 
 import struct
+import warnings
+
 import zstandard
 from dataclasses import dataclass
 from enum import IntFlag
@@ -135,6 +137,13 @@ def _flags_from_ends(has_start: bool, has_end: bool) -> tuple[bool, bool]:
     """
     return (bool(has_end) and not has_start), (bool(has_start) and bool(has_end))
 
+
+#: ``flag byte -> (is_paired, is_read1, is_read2)`` — the three booleans
+#: :meth:`ZnaReader.records` yields, for consumers of :meth:`ZnaReader.blocks`
+#: that get the raw flag column instead and should not re-derive the bit layout.
+FLAG_FIELDS = tuple(
+    (bool(f & 4), bool(f & 1), bool(f & 2)) for f in range(256)
+)
 
 #: ``(has_start << 1 | has_end) -> (is_rc, is_full_fragment)``.
 _RC_FULL_BY_ENDS = tuple(
@@ -670,6 +679,124 @@ class ZnaReader:
                 "with_ends already encodes IS_RC (has_end and not has_start)."
             )
         return self._iter_records(restore_strand, with_rc, with_ends)
+
+    def blocks(
+        self, stride: int = 1, offset: int = 0, restore_strand: bool = False,
+    ) -> Iterator[Tuple[list, bytes]]:
+        """Yield ``(sequences, flags)`` once per block, columnar.
+
+        *sequences* is a ``list[str]``; *flags* is the block's raw flag column,
+        one byte per record, positionally aligned with *sequences*.  Decode a
+        byte with :class:`ZnaRecordFlags`, or index :data:`FLAG_FIELDS` for the
+        ``(is_paired, is_read1, is_read2)`` triple the record API yields.
+
+        This is the batch form for consumers that process a whole block at a
+        time — a training loader, say.  It skips the per-record tuple entirely,
+        which is most of what is left in :meth:`records` once the sequence itself
+        is cheap to produce.
+
+        ``stride``/``offset`` shard **by block**: with ``stride=8, offset=3``
+        this yields every eighth block starting at the fourth, and — the point —
+        seeks past the others without decompressing or decoding them.  A sharded
+        consumer that strides over :meth:`records` instead pays full decode cost
+        for every record it then discards, which is ``stride``x more work than it
+        needs.  Measured on 200k reads, one worker of 16 costs 9.4x less this way.
+
+        Two things this asks of the caller:
+
+        * **Record order must already be arbitrary.**  Shards get contiguous
+          runs, not an interleave, so a file grouped by anything meaningful will
+          hand each worker a biased sample.  ``zna shuffle`` exists for this.
+        * **The file needs many more blocks than shards.**  Shares are whole
+          blocks, so with ``stride`` close to the block count the split is
+          lopsided, and past it some shards get nothing at all.  A shard that
+          yields no blocks warns rather than looking like an empty file.
+          ``DEFAULT_BLOCK_SIZE`` gives a few hundred blocks per GB; a small file
+          split many ways wants a smaller ``block_size`` at write time.
+
+        Raises on labeled files: the label columns would have to come back too,
+        and silently dropping them is worse than not offering the API.
+        """
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        if not 0 <= offset < stride:
+            raise ValueError(f"offset must be in [0, {stride}), got {offset}")
+        if self._header.labels:
+            raise NotImplementedError(
+                "blocks() does not support labeled files "
+                f"({len(self._header.labels)} label column(s) defined). "
+                "Use records(), which returns labels with each record."
+            )
+        return self._iter_blocks(stride, offset, restore_strand)
+
+    def _iter_blocks(
+        self, stride: int, offset: int, restore_strand: bool
+    ) -> Iterator[Tuple[list, bytes]]:
+        fh = self._fh
+        fh_read = fh.read
+        len_bytes = self._header.seq_len_bytes
+        compression_method = self._header.compression_method
+        needs_restore = restore_strand and self._header.strand_normalized
+        decode_seqs = _codec.decode_block_sequences
+
+        if compression_method == COMPRESSION_ZSTD:
+            dctx = zstandard.ZstdDecompressor()
+
+        index = 0
+        yielded = 0
+        while True:
+            block_header_data = fh_read(_BLOCK_HEADER_SIZE)
+            if not block_header_data:
+                if stride > 1 and yielded == 0 and index > 0:
+                    # Silence here is indistinguishable from an empty file, and
+                    # in a training loader it is an idle worker nobody notices.
+                    warnings.warn(
+                        f"blocks(stride={stride}, offset={offset}) matched none "
+                        f"of this file's {index} block(s), so this shard has no "
+                        f"data. Shards are whole blocks: write the file with a "
+                        f"smaller block_size, or use fewer shards.",
+                        RuntimeWarning, stacklevel=3,
+                    )
+                break
+            if len(block_header_data) < _BLOCK_HEADER_SIZE:
+                raise EOFError(
+                    f"Incomplete block header. Expected {_BLOCK_HEADER_SIZE} "
+                    f"bytes, got {len(block_header_data)}"
+                )
+            comp_size, uncomp_size, count, flags_size, lengths_size = struct.unpack(
+                _BLOCK_HEADER_FMT, block_header_data
+            )
+
+            if index % stride != offset:
+                # Not this shard's block: step over the payload without paying
+                # to decompress it.  Seek when the stream allows it; a pipe has
+                # to be read through.
+                index += 1
+                try:
+                    fh.seek(comp_size, 1)
+                except (AttributeError, OSError):
+                    if len(self._read_exact(comp_size)) != comp_size:
+                        raise EOFError("Unexpected EOF while skipping a block")
+                continue
+            index += 1
+
+            block_payload = self._read_exact(comp_size)
+            if compression_method == COMPRESSION_ZSTD:
+                block_data = dctx.decompress(block_payload, max_output_size=uncomp_size)
+            else:
+                block_data = block_payload
+
+            lengths_end = flags_size + lengths_size
+            flags_stream = block_data[:flags_size]
+            lengths_stream = block_data[flags_size:lengths_end]
+            seqs_stream = block_data[lengths_end:]
+
+            yielded += 1
+            yield (
+                decode_seqs(flags_stream, lengths_stream, seqs_stream,
+                            len_bytes, count, needs_restore),
+                flags_stream,
+            )
 
     def _iter_records(
         self, restore_strand: bool, with_rc: bool, with_ends: bool = False

@@ -57,6 +57,7 @@ import unittest
 from zna.core import (
     COMPRESSION_NONE,
     COMPRESSION_ZSTD,
+    FLAG_FIELDS,
     ZnaHeader,
     ZnaReader,
     ZnaWriter,
@@ -703,6 +704,129 @@ class TestInvalidBaseHandling(FuzzCase):
                 got, "ACGAACGT",
                 f"accel should substitute the N-policy base for {ch!r}",
             )
+
+
+class TestBlocksAPI(FuzzCase):
+    """``blocks()`` is a second decode path over the same bytes, so the only
+    property worth testing is that it never disagrees with ``records()`` — and
+    that sharding by block partitions the file exactly, losing and duplicating
+    nothing."""
+
+    def test_blocks_match_records(self):
+        rng = random.Random(SEED + 12)
+        for backend in BACKENDS:
+            for seq_len_bytes in (1, 2, 4):
+                for strand_cfg in (STRAND_CONFIGS[0], STRAND_CONFIGS[1],
+                                   STRAND_CONFIGS[4]):
+                    for compression in (COMPRESSION_NONE, COMPRESSION_ZSTD):
+                        recs = gen_records(rng, "mixed", 60, seq_len_bytes,
+                                           allow_n=False, allow_lower=False)
+                        header = make_header(seq_len_bytes, strand_cfg, compression)
+                        ctx = (f"backend={backend} slb={seq_len_bytes} "
+                               f"strand={strand_cfg} comp={compression}")
+                        with force_backend(backend):
+                            data = write_file(header, recs, "")
+                            want = list(ZnaReader(io.BytesIO(data)).records())
+                            got = []
+                            for seqs, flags in ZnaReader(io.BytesIO(data)).blocks():
+                                self.assertEqual(
+                                    len(seqs), len(flags),
+                                    f"{ctx}: sequences and flags out of step")
+                                for seq, fl in zip(seqs, flags):
+                                    got.append((seq, *FLAG_FIELDS[fl]))
+                        self.assertEqual(got, want, f"{ctx}: blocks() != records()")
+
+    def test_blocks_restore_strand_matches_records(self):
+        rng = random.Random(SEED + 13)
+        for backend in BACKENDS:
+            for strand_cfg in (STRAND_CONFIGS[1], STRAND_CONFIGS[2],
+                               STRAND_CONFIGS[4]):
+                recs = gen_records(rng, "mixed", 50, 2,
+                                   allow_n=False, allow_lower=False)
+                header = make_header(2, strand_cfg, COMPRESSION_ZSTD)
+                ctx = f"backend={backend} strand={strand_cfg}"
+                with force_backend(backend):
+                    data = write_file(header, recs, "")
+                    want = [r[0] for r in
+                            ZnaReader(io.BytesIO(data)).records(restore_strand=True)]
+                    got = []
+                    for seqs, _flags in ZnaReader(io.BytesIO(data)).blocks(
+                            restore_strand=True):
+                        got.extend(seqs)
+                self.assertEqual(got, want, f"{ctx}: restore_strand differs")
+
+    def test_sharding_partitions_exactly(self):
+        """Every record lands in exactly one shard, for every stride."""
+        rng = random.Random(SEED + 14)
+        # A small block size so the file has many blocks to spread over shards.
+        recs = gen_records(rng, "mixed", 400, 2, allow_n=False, allow_lower=False)
+        header = make_header(2, STRAND_CONFIGS[0], COMPRESSION_ZSTD)
+        for backend in BACKENDS:
+            with force_backend(backend):
+                data = write_file(header, recs, "")
+                want = [r[0] for r in ZnaReader(io.BytesIO(data)).records()]
+                n_blocks = sum(1 for _ in ZnaReader(io.BytesIO(data)).blocks())
+                for stride in (1, 2, 3, 5, 8):
+                    shards = []
+                    for offset in range(stride):
+                        got = []
+                        for seqs, _f in ZnaReader(io.BytesIO(data)).blocks(
+                                stride=stride, offset=offset):
+                            got.extend(seqs)
+                        shards.append(got)
+                    merged = [s for shard in shards for s in shard]
+                    self.assertEqual(
+                        sorted(merged), sorted(want),
+                        f"backend={backend} stride={stride}: shards do not "
+                        f"partition the file ({n_blocks} blocks)",
+                    )
+                    self.assertEqual(
+                        len(merged), len(want),
+                        f"backend={backend} stride={stride}: record count changed",
+                    )
+
+    def test_sharding_works_on_a_non_seekable_stream(self):
+        """Block skipping seeks when it can and reads through when it cannot."""
+        class Unseekable(io.RawIOBase):
+            def __init__(self, data):
+                self._b = io.BytesIO(data)
+            def readable(self):
+                return True
+            def read(self, n=-1):
+                return self._b.read(n)
+            def readinto(self, b):
+                return self._b.readinto(b)
+            def seek(self, *a):
+                raise OSError("not seekable")
+            def seekable(self):
+                return False
+
+        rng = random.Random(SEED + 15)
+        recs = gen_records(rng, "mixed", 300, 2, allow_n=False, allow_lower=False)
+        header = make_header(2, STRAND_CONFIGS[0], COMPRESSION_ZSTD)
+        data = write_file(header, recs, "")
+        want = [r[0] for r in ZnaReader(io.BytesIO(data)).records()]
+        merged = []
+        for offset in range(3):
+            for seqs, _f in ZnaReader(Unseekable(data)).blocks(stride=3, offset=offset):
+                merged.extend(seqs)
+        self.assertEqual(sorted(merged), sorted(want),
+                         "sharding over a non-seekable stream lost records")
+
+    def test_rejects_labeled_files_and_bad_shards(self):
+        labels = (LabelDef(label_id=0, name="NH", description="",
+                           dtype=DTYPE_BY_CODE["C"]),)
+        header = make_header(2, STRAND_CONFIGS[0], COMPRESSION_NONE, labels=labels)
+        data = write_file(header, [("ACGT", False, True, False, False)], "",
+                          labels_per_rec=[(1,)])
+        with self.assertRaises(NotImplementedError):
+            ZnaReader(io.BytesIO(data)).blocks()
+
+        plain = write_file(make_header(2, STRAND_CONFIGS[0], COMPRESSION_NONE),
+                           [("ACGT", False, True, False, False)], "")
+        for stride, offset in ((0, 0), (-1, 0), (2, 2), (2, -1), (2, 5)):
+            with self.assertRaises(ValueError, msg=f"stride={stride} offset={offset}"):
+                ZnaReader(io.BytesIO(plain)).blocks(stride=stride, offset=offset)
 
 
 class TestDecoderMemory(FuzzCase):

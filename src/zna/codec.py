@@ -52,6 +52,7 @@ _REQUIRED_FUNCTIONS = frozenset({
     "reverse_complement",
     "encode_block",
     "decode_block",
+    "decode_block_sequences",
 })
 
 

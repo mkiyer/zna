@@ -329,6 +329,52 @@ zna decode sample.zna --gzip > output.fasta.gz
 zna decode sample.zna | seqtk seq -r - | gzip > reversed.fasta.gz
 ```
 
+#### Batch Reading with `blocks()`
+
+`records()` yields one tuple per record. A consumer that works a whole batch at
+a time — a training data loader, say — can instead take a block at a time and
+skip the per-record tuple entirely:
+
+```python
+from zna import ZnaReader, FLAG_FIELDS
+
+with open("sample.zna", "rb") as fh:
+    for sequences, flags in ZnaReader(fh).blocks():
+        # sequences: list[str];  flags: bytes, one per record, same order
+        for seq, fl in zip(sequences, flags):
+            is_paired, is_read1, is_read2 = FLAG_FIELDS[fl]
+            ...
+```
+
+`stride`/`offset` shard **by block**, and — the point — seek past the blocks
+this shard does not want instead of decoding and discarding them:
+
+```python
+# Worker 3 of 8: decodes ~1/8 of the file, not all of it.
+for sequences, flags in ZnaReader(fh).blocks(stride=8, offset=3):
+    ...
+```
+
+That is worth 1.8x at 2 workers and 9.4x at 16, compared with striding over
+`records()`. Two conditions come with it:
+
+- **Record order must already be arbitrary.** Shards get contiguous runs, not an
+  interleave, so a file grouped by anything meaningful hands each worker a
+  biased sample. Use `zna shuffle` first.
+- **The file needs many more blocks than shards.** Shares are whole blocks, so
+  a small file split many ways is lopsided, and past the block count some shards
+  get nothing — which `blocks()` warns about rather than passing off as an empty
+  file. The default 4 MiB block gives a few hundred blocks per GB; write with a
+  smaller `block_size` if you need finer shards.
+
+`blocks()` also takes `restore_strand=True`. It raises on labeled files — the
+label columns would have to come back too, and dropping them silently is worse
+than not offering the API — so use `records()` there.
+
+Batching alone (without sharding) is worth about 24% for a loader doing real
+per-record work, and it fades with read length: ~24% at 150 bp, ~8% at 1 kb, and
+nothing measurable at 10 kb, where the sequence dominates the record overhead.
+
 ### Inspecting Files
 
 ```bash

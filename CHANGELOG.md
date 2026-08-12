@@ -5,6 +5,104 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-08-11
+
+Performance release. Nothing about the on-disk format changes, and no existing
+file needs re-encoding.
+
+### Fixed
+- **The pure-Python backend silently corrupted sequences containing an invalid
+  base at an index congruent to 3 mod 4.** `_pycodec.encode_sequence` validated
+  each 4-base group with `val > 255`, applied *after* OR-ing the four 2-bit
+  values together. A 255 (invalid) in the group's last slot ORs to exactly 255
+  and never exceeds it, so instead of raising, the group was packed as `0xFF`
+  and decoded back as `TTTT` — losing the three valid bases beside it. This was
+  reachable on real data: the IUPAC ambiguity codes (`R`, `Y`, `S`, `W`, ...)
+  occur in FASTQ, and with an N-policy set they hit this path rather than being
+  substituted. The C++ backend was never affected. Validation now happens once
+  up front in a single scan, which is also faster than the per-group test.
+
+  Found by the new round-trip fuzz harness on its first run.
+
+### Added
+- **`tests/test_fuzz_roundtrip.py`** — a round-trip fuzz harness asserting
+  bit-exact recovery across sequence content x length (including 0, 1, and every
+  residue mod 4) x `seq_len_bytes` x N-policy x strand configuration x
+  compression x record layout x backend, against a reference model written from
+  the specification rather than from `_pycodec`. It also checks that the two
+  backends produce byte-identical columnar streams, that re-encoding is a
+  faithful copy, that every label dtype round-trips, and that the C++ decoder
+  neither leaks nor over-frees.
+
+  This exists because the suite could not previously catch codec corruption:
+  it round-trips fixed inputs and checks API contracts, and two changes proposed
+  during the 0.3.4 sweep silently corrupted data with all 282 tests passing.
+
+- **`ZnaReader.blocks(stride=1, offset=0, restore_strand=False)`** — a columnar
+  batch API yielding `(list_of_sequences, flags_bytes)` per block, for consumers
+  that process a batch at a time. `stride`/`offset` shard by block and seek past
+  blocks the shard does not want, so a sharded reader decodes its share instead
+  of the whole file: 1.8x for one worker of 2, 9.4x for one worker of 16.
+  Requires arbitrary record order (use `zna shuffle`) and many more blocks than
+  shards; warns when a shard matches no blocks. Raises on labeled files.
+- **`FLAG_FIELDS`** — `flag byte -> (is_paired, is_read1, is_read2)`, so
+  `blocks()` consumers need not re-derive the bit layout.
+- `decode_block_sequences` on both codec backends.
+- `ZNA_NO_EXTERNAL_GZIP=1` forces gzip input through the Python `gzip` module.
+
+### Changed
+- **The C++ codec no longer copies every base twice around the work that
+  matters.** nanobind was materialising a `std::vector<std::string>` on the way
+  in and a `std::vector<std::tuple<...>>` on the way out. Decode now writes bases
+  straight into each `str`'s own buffer, four at a time from a lookup table, and
+  returns a hand-built list of GC-untracked tuples; encode reads each sequence's
+  buffer in place and folds reverse-complement into the packing loop, so a
+  normalized record needs no intermediate string. The decoder also emits the
+  caller's tuple width and can undo strand normalization itself, which removes
+  the Python-side rebuild of every record. `encode_block` and
+  `encode_block_labeled` were hand-copied duplicates and now share one core.
+
+  Verified byte-identical to 0.3.3 across 90 encode/decode configurations,
+  including `npolicy="random"` and every reverse-complement path.
+
+- Gzip FASTQ input is decompressed by `pigz`/`gzip` when available, so it runs
+  in its own process rather than contending for the GIL. Falls back to the
+  `gzip` module. A truncated or corrupt `.gz` is now an error rather than a
+  silently short input — previously the partial stream was indistinguishable
+  from a small file, and `zna encode` would write a truncated ZNA and report
+  success.
+- `shuffle`'s counting pass reads flag columns instead of decoding every
+  sequence, and its bucket files are written at zstd level 1 rather than the
+  source file's level.
+- `CMakeLists.txt` no longer passes `STABLE_ABI`. It was silently a no-op —
+  nanobind honours it only when CMake finds `Development.SABIModule`, and the
+  `find_package` asks for `Development.Module` — and the module could never have
+  been limited-API anyway.
+
+### Performance
+
+Measured interleaved, min-of-N, in-process (see `scripts/bench_ab.py`); the C++
+figures are cross-process, since the two arms are different builds.
+
+| path | change |
+|---|---|
+| `shuffle` counting pass | +2899% |
+| raw `encode_block`, reverse-complementing | +163% |
+| gzip FASTQ input | +123% |
+| raw `encode_block` | +113% |
+| raw `decode_block` | +109% |
+| `records(restore_strand=True)` | +147% |
+| `records()` | +97% |
+| one sharded worker of 16, via `blocks()` | +837% |
+| single-end encode loop | +52% |
+| gzip module read-ahead | +51% |
+| FASTQ sequence-line trimming | +31% |
+| `reverse_complement` | +31% |
+| interleaved pairing, bytes-native | +29% |
+| N-drop filter | +26% |
+| decode output f-strings | +19% |
+| `_flags_from_ends` in a write loop | +11% |
+
 ## [0.3.3] - 2026-08-11
 
 ### Fixed

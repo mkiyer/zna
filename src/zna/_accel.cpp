@@ -816,6 +816,68 @@ nb::object decode_block_columnar(
 }
 
 
+/**
+ * Decode a block's sequences only, as a plain list of str.
+ *
+ * The columnar batch path.  A caller that reads flags off the flags column
+ * itself has no use for the per-record tuple, and not building one removes a
+ * PyTuple allocation, four bool increfs and a GC untrack per record — all of
+ * which is pure overhead once the sequence itself is this cheap to produce.
+ */
+nb::object decode_block_sequences(
+    nb::bytes flags_data,
+    nb::bytes lengths_data,
+    nb::bytes seqs_data,
+    int len_bytes,
+    int count,
+    bool restore_strand
+) {
+    if (count < 0) {
+        throw std::invalid_argument("count must be non-negative");
+    }
+    if (len_bytes != 1 && len_bytes != 2 && len_bytes != 4) {
+        throw std::invalid_argument("len_bytes must be 1, 2, or 4");
+    }
+    if (lengths_data.size() < static_cast<size_t>(count) * len_bytes) {
+        throw std::runtime_error("Block truncated: lengths column too short");
+    }
+    // Only consulted when undoing strand normalization.
+    if (restore_strand && flags_data.size() < static_cast<size_t>(count)) {
+        throw std::runtime_error("Block truncated: flags column too short");
+    }
+
+    const uint8_t* flags_ptr = reinterpret_cast<const uint8_t*>(flags_data.c_str());
+    const uint8_t* lengths_ptr = reinterpret_cast<const uint8_t*>(lengths_data.c_str());
+    const uint8_t* seqs_ptr = reinterpret_cast<const uint8_t*>(seqs_data.c_str());
+    const size_t seqs_size = seqs_data.size();
+
+    nb::object result = nb::steal(PyList_New(count));
+    if (!result.is_valid()) {
+        throw nb::python_error();
+    }
+    PyObject* list = result.ptr();
+
+    size_t seq_offset = 0;
+    for (int rec = 0; rec < count; rec++) {
+        const size_t seq_len = read_len(lengths_ptr, len_bytes, rec);
+        const size_t enc_len = (seq_len + 3) / 4;
+        if (seq_offset + enc_len > seqs_size) {
+            throw std::runtime_error("Block truncated: cannot read sequence data");
+        }
+        PyObject* seq = make_seq_object(
+            seqs_ptr + seq_offset, seq_len,
+            restore_strand && (flags_ptr[rec] & 0x08));
+        if (seq == nullptr) {
+            throw nb::python_error();
+        }
+        seq_offset += enc_len;
+        PyList_SET_ITEM(list, rec, seq);  // steals
+    }
+
+    return result;
+}
+
+
 // ---------------------------------------------------------------------------
 // Label-aware decoder
 // ---------------------------------------------------------------------------
@@ -1189,6 +1251,16 @@ NB_MODULE(_accel, m) {
           nb::arg("with_rc") = true,
           nb::arg("restore_strand") = false,
           "Decode block streams into records (no labels).");
+
+    m.def("decode_block_sequences", &decode_block_sequences,
+          nb::arg("flags_data"),
+          nb::arg("lengths_data"),
+          nb::arg("seqs_data"),
+          nb::arg("len_bytes"),
+          nb::arg("count"),
+          nb::arg("restore_strand") = false,
+          "Decode a block's sequences only, as a list of str.\n"
+          "For callers that read the flags column themselves.");
 
     m.def("decode_block_labeled", &decode_block_labeled,
           nb::arg("flags_data"),

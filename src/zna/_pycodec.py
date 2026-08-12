@@ -222,6 +222,44 @@ def _apply_npolicy(seq: str, npolicy: str) -> str:
     return seq
 
 
+def decode_block_sequences(
+    flags_data: bytes,
+    lengths_data: bytes,
+    seqs_data: bytes,
+    len_bytes: int,
+    count: int,
+    restore_strand: bool = False,
+) -> list[str]:
+    """Decode a block's sequences only, as a plain list of ``str``.
+
+    The columnar counterpart to :func:`decode_block`, for callers that read the
+    flags column themselves and have no use for a per-record tuple.
+    """
+    import struct as _struct
+
+    if len_bytes == 1:
+        lengths: list[int] | tuple[int, ...] = list(lengths_data[:count])
+    elif len_bytes == 2:
+        lengths = _struct.unpack(f"<{count}H", lengths_data[: count * 2])
+    else:
+        lengths = _struct.unpack(f"<{count}I", lengths_data[: count * 4])
+
+    decode_table = _DECODE_TABLE
+    all_decoded = "".join(decode_table[b] for b in seqs_data)
+
+    out: list[str] = []
+    append = out.append
+    char_offset = 0
+    for i in range(count):
+        seq_len = lengths[i]
+        seq = all_decoded[char_offset : char_offset + seq_len]
+        char_offset += ((seq_len + 3) >> 2) * 4
+        if restore_strand and (flags_data[i] & 8):
+            seq = reverse_complement(seq)
+        append(seq)
+    return out
+
+
 def decode_block(
     flags_data: bytes,
     lengths_data: bytes,
