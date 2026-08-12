@@ -40,9 +40,10 @@ cmp cpp.fq py.fq        # must be silent
 ## `proto_merge.cpp` is a prototype, not the implementation
 
 It is the artifact that proves the design lands where it claims: on 200,000 real pairs
-it emits a byte-identical file to `zna merge` at 2.79 µs/pair against 8.34. It now carries the byte-wise
-SIMD kernel the design settled on (`neq16` + a 32-base bail), and was re-verified
-byte-identical after that kernel replaced the 2-bit packed one.
+it emits a byte-identical file to `zna merge` at **2.67 µs/pair against 8.34**. It
+carries the byte-wise SIMD kernel the design settled on (`neq16` + a 32-base bail), and
+was re-verified byte-identical after that kernel replaced the 2-bit packed one — which
+is the check that matters when swapping a kernel.
 
 Do **not** read it as a model for the real backend. It is single-threaded, its
 `popen("pigz -dc")` reader is a stand-in for the chunk protocol in design §7.3, it
