@@ -63,6 +63,12 @@ file needs re-encoding.
   opening the data files.
 - **`FLAG_FIELDS`** — `flag byte -> (is_paired, is_read1, is_read2)`, so
   `blocks()` consumers need not re-derive the bit layout.
+- **`ENDS_BY_FLAG`** — `flag byte -> (has_start, has_end)`, now public. This is
+  the only correct way to recover fragment geometry from the raw flags column:
+  under unstranded normalization ZNA reverse-complements *one mate per pair, at
+  random*, so which edge is a true fragment boundary is a per-record fact
+  carried by `IS_RC`, not a property of R1 versus R2. A consumer that assigns
+  endpoints by mate number instead is right about half the time.
 - `decode_block_sequences` on both codec backends.
 - `ZNA_NO_EXTERNAL_GZIP=1` forces gzip input through the Python `gzip` module.
 

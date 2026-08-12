@@ -118,12 +118,22 @@ def _ends_from_flags(is_rc: bool, is_full_fragment: bool) -> tuple[bool, bool]:
     return (not is_rc), bool(is_rc)
 
 
-#: ``flag byte -> (has_start, has_end)``, precomputed so the decode hot loop is a
-#: single index instead of a branch and a function call.
-_ENDS_BY_FLAG = tuple(
+#: ``flag byte -> (has_start, has_end)`` — whether the left and right edge of the
+#: stored sequence is a true fragment boundary.  Precomputed so the decode hot
+#: loop is a single index instead of a branch and a function call.
+#:
+#: Public because it is the only correct way for a :meth:`ZnaReader.blocks`
+#: consumer to recover fragment geometry from the raw flags column.  It cannot be
+#: inferred from the mate number: under unstranded normalization ZNA picks *one
+#: mate per pair at random* to reverse-complement, so which edge is the real
+#: boundary is a per-record fact carried by ``IS_RC``, not a property of R1 vs R2.
+ENDS_BY_FLAG = tuple(
     (True, True) if (f & 16) else (not (f & 8), bool(f & 8))
     for f in range(256)
 )
+
+#: Back-compat alias for the private name used before 0.3.4.
+_ENDS_BY_FLAG = ENDS_BY_FLAG
 
 
 def _flags_from_ends(has_start: bool, has_end: bool) -> tuple[bool, bool]:

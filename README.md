@@ -346,6 +346,12 @@ with open("sample.zna", "rb") as fh:
             ...
 ```
 
+`ENDS_BY_FLAG[fl]` gives `(has_start, has_end)` from the same byte — whether each
+edge of the stored sequence is a true fragment boundary. Use it rather than
+inferring from the mate number: under unstranded normalization ZNA
+reverse-complements one mate per pair *at random*, so the boundary edge is a
+per-record fact, not a property of R1 versus R2.
+
 `stride`/`offset` shard **by block**, and — the point — seek past the blocks
 this shard does not want instead of decoding and discarding them:
 
