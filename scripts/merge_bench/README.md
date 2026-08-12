@@ -40,16 +40,21 @@ cmp cpp.fq py.fq        # must be silent
 ## `proto_merge.cpp` is a prototype, not the implementation
 
 It is the artifact that proves the design lands where it claims: on 200,000 real pairs
-it emits a byte-identical file to `zna merge` at **2.67 µs/pair against 8.34**. It
-carries the byte-wise SIMD kernel the design settled on (`neq16` + a 32-base bail), and
-was re-verified byte-identical after that kernel replaced the 2-bit packed one — which
-is the check that matters when swapping a kernel.
+it emits a byte-identical file to `zna merge` at **2.32 µs/pair against 8.34**. It
+carries the byte-wise SIMD kernel the design settled on (`neq16` + a 32-base bail) and
+the self-sizing `Scratch` arena of design §7.4, and was re-verified byte-identical after
+each of those replaced its predecessor — which is the check that matters when swapping a
+kernel or an allocation strategy.
 
 Do **not** read it as a model for the real backend. It is single-threaded, its
-`popen("pigz -dc")` reader is a stand-in for the chunk protocol in design §7.3, it
-builds the consensus table in C++ (design §4 says build it once in Python and pass it
-across), and it copies several per-pair buffers naively (design §7.4). It also has no
-error handling worth the name.
+`popen("pigz -dc")` reader is a stand-in for the chunk protocol in design §7.3, and it
+builds the consensus table in C++ where design §4 says to build it once in Python and
+pass it across. It also has no error handling worth the name.
+
+`/tmp/proto_v1.cpp`-style comparisons are how §7.4's arena numbers were taken: the
+same program with per-pair `std::vector` `.assign()`/`.resize()` and unconditional
+consensus copies runs at 2.71 µs/pair end to end and 1.38 µs/pair of compute, against
+the arena's 2.32 and 1.00.
 
 ## One number that is easy to get wrong
 

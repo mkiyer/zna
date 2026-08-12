@@ -4,6 +4,39 @@
 
 ---
 
+## x86 tuning for the merge kernel (`0.4.1`)
+
+**Scheduled, not speculative.** 0.4.0 ships `zna merge` with a byte-wise vector
+comparison kernel ([MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) §6) built on 16-byte
+vectors, which are baseline on every target: NEON on aarch64, **SSE2 on x86-64, which
+needs no `-march` flag and no runtime check.** That is deliberate — it makes one kernel
+correct and fast everywhere without ISA dispatch.
+
+Every measurement behind that design was taken on **aarch64/NEON**. Three things are
+therefore unmeasured and belong in 0.4.1, on a Linux/x86 box:
+
+1. **Confirm the SSE2 path.** It is written (`neq16` under `#ifdef`) and has never been
+   executed. `scripts/merge_bench/bench_simd.cpp` builds it.
+2. **Evaluate AVX2 (32-byte vectors), and only then decide on runtime dispatch.** Do not
+   assume it wins. The design's §6.1 finding is that the scan is *rejection-dominated* —
+   roughly 0.32·n comparisons per rejected shift — so the variable that matters is the
+   bail interval, not raw width: on NEON, bail-every-32-bases beat both 16 and 64, and
+   the packed kernel's 128-base bail was measurably *worse* than its 64. A 32-byte
+   vector may well need bail-every-one-vector to compete. Measure before writing any
+   `__builtin_cpu_supports` machinery.
+3. **Re-tune the bail granularity.** It is a hardware property, not an algorithm
+   property. 32 bases won on Apple silicon; Zen and Sapphire Rapids may differ.
+
+Beyond the kernel, if the gzip inflate floor (measured at 0.80 µs/pair, and the binding
+constraint once compute is native) is still what limits the tool, evaluate **libdeflate
+or ISA-L** inflate inside the extension instead of `pigz` subprocesses. Note this may be
+mooted first by `zna encode --merge-pairs`, which deletes the FASTQ intermediate
+entirely and with it most of the I/O.
+
+Reproduce everything with `scripts/merge_bench/README.md`.
+
+---
+
 ## Static Subsampled Files (`zna sample --fraction`)
 
 A CLI that writes a new ZNA holding a random fraction of an input's blocks or

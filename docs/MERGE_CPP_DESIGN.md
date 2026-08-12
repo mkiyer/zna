@@ -14,6 +14,12 @@ pure-Python implementation as the **reference oracle** rather than a fallback, t
 > over-generalisation from a sound measurement, and is retracted in §6.1. The tie-break
 > rule is simplified and now proved rather than asserted (§5). §15 records what else was
 > adopted, and which review items were factually wrong for this codebase.
+>
+> **Revision 3, 2026-08-12.** `--max-read-length` is **gone** — buffers size themselves
+> and the fixed-point spec needs no cap (§4, §7.4); measured, the adaptive arena is 27%
+> *faster* than fixed-size per-pair vectors. Everything kept for backwards
+> compatibility is **deleted**: `--processes`, `--length-required`, `--allow-slow`, the
+> `njit` shim (§7.5). x86/AVX2 tuning moves to 0.4.1 (`docs/FUTURE.md`).
 
 Every number below was measured on this repo, on 200,000 simulated 2×150 pairs with
 insert ~ N(200, 70) truncated to [50, 400] and 0.5% per-base error. That library merges
@@ -76,9 +82,8 @@ bound at production settings. Say so up front rather than discovering it after.
 |---|---:|
 | gzip inflate floor — 2 × `pigz -dc -p1`, concurrent, to `/dev/null` | **0.80** |
 | same with `-p4` each (pigz cannot parallelise *inflate*) | 0.95 |
-| C++ prototype: gz in → file out, single thread | 2.67 |
-| C++ prototype: gz in → `/dev/null` | 2.69 |
-| C++ prototype: **plain** in → `/dev/null` (compute only) | **1.43** |
+| C++ prototype: gz in → file out, single thread | **2.32** |
+| C++ prototype: **plain** in → `/dev/null` (compute only) | **1.00** |
 | `zna merge -p1` (numba) | 8.34 |
 | `zna merge -p8` (numba) | 1.97 |
 
@@ -86,11 +91,12 @@ The writer is free (pigz level 1 in a subprocess keeps up). Decompression is not
 **0.80 µs/pair is the floor of the current architecture**, and `-p4` makes it *worse*
 because pigz threads only the CRC and read-ahead, not the inflate.
 
-So the target is: single-threaded C++ at ~2.7 µs/pair (**3.1x** over p1, on one core
-instead of eight), and with a GIL-releasing chunk kernel plus 2–3 threads, compute drops
-under the decompression floor and the tool lands at **~0.9–1.1 µs/pair — about 8x over
-p1 and 2x over today's p8, on far fewer cores.** Beyond that, gzip is the wall, and the
-answer to gzip is to stop writing the intermediate at all (§11).
+So the target is: single-threaded C++ at **2.32 µs/pair (3.6x over p1, on one core
+instead of eight)**, and since compute is 1.00 µs/pair against a 0.80 µs/pair
+decompression floor, **two worker threads are enough to make the tool purely I/O bound
+at ~0.85–1.0 µs/pair — about 9x over p1 and 2x over today's p8, on a quarter of the
+cores.** Beyond that, gzip is the wall, and the answer to gzip is to stop writing the
+intermediate at all (§11).
 
 ---
 
@@ -102,7 +108,7 @@ write) is committed at
 every benchmark behind the numbers in this document beside it and a
 [README](../scripts/merge_bench/README.md) that reproduces them. On the 200,000-pair
 library it emits **a byte-identical file to `zna merge`** — 177,296 merged, 5,391
-trimmed, 17,313 kept, 222,704 records, `cmp` clean — at **2.67 µs/pair against 8.34**.
+trimmed, 17,313 kept, 222,704 records, `cmp` clean — at **2.32 µs/pair against 8.34**.
 
 That single equality simultaneously validates:
 
@@ -162,20 +168,33 @@ threshold, over integer `(n, d)`. Enumerated for `n ≤ 4000, d ≤ 1200`:
 | 2^30 | 0 | 0 |
 
 The closest any reachable `(n, d)` gets to a threshold is 7.2×10⁻⁵ bits (T=28) and
-3.6×10⁻⁴ bits (T=8). **2^24 is provably decision-identical to float over the whole
-enumerated domain**, and 2^20 — the obvious "millionths of a bit" choice, and what the
-prototype first used — is not.
+3.6×10⁻⁴ bits (T=8). 2^20 — the obvious "millionths of a bit" choice, and what the
+prototype first used — is not good enough; 2^24 is.
 
-Two consequences:
+**No `--max-read-length`, and no cap of any kind.** Revision 1 proposed one to make the
+enumerated domain the reachable domain. It is not needed, for three separate reasons:
 
-- **Add `--max-read-length` (default 4000, hard error above).** The audit already wanted
-  it as a fail-fast for the O(L²) scan. Here it does more: it makes the enumerated
-  domain the *reachable* domain, turning the table above from an empirical range check
-  into a guarantee. `n*M ≤ 4000 × 2^25 ≈ 2^37`, nowhere near `int64` overflow.
-- **Derive `M`/`STEP` in Python only, and pass the integers across.** `log2` is not
-  correctly rounded and libm differs between platforms; computing them on both sides
-  invites a 1-ULP disagreement that changes a corpus. One call site, integers over the
-  boundary, and the values recorded in the JSON stats so any corpus can be audited.
+- **`int64` cannot overflow on any input that fits in memory.** `n*M` overflows at
+  n = 2.8×10¹¹ bases and `d*STEP` at d = 6.7×10¹⁰. A FASTQ record that long cannot be
+  read.
+- **Fixed point is the specification, not an approximation of float.** It is exact and
+  deterministic at every read length; there is no domain in which it becomes
+  "unreliable". The enumeration is not a safety guard — it is a *characterisation* of
+  where adopting the spec perturbs the behaviour being replaced.
+- **And that domain is unreachable anyway.** Extending the enumeration with no cap: at
+  2^24 the first `(n, d)` on which fixed point and float disagree is
+  **n = 32,830 (T=28)** and n = 34,632 (T=8). That is an *overlap* of 32,830 bases,
+  needing reads at least that long — two orders of magnitude beyond any Illumina read,
+  and the O(L²) scan makes such input impractical for unrelated reasons (the audit
+  measured 40 ms/pair at L = 20,000).
+
+So the tool has **three parameters**, as the redesign intended, and read length is not
+one of them. Buffers size themselves (§7.4).
+
+**Derive `M`/`STEP` in Python only, and pass the integers across.** `log2` is not
+correctly rounded and libm differs between platforms; computing them on both sides
+invites a 1-ULP disagreement that changes a corpus. One call site, integers over the
+boundary, and the values recorded in the JSON stats so any corpus can be audited.
 
 The same argument applies to `_DISAGREE_Q`, which is built with `pow`/`log10`: **build
 it in Python and pass the 94×94 byte table into the backend.** The prototype builds it
@@ -424,20 +443,106 @@ parser cases with named tests (§9).
 raises as `zna.merge.fastqio.InputError`, so `except InputError` in `cli.py` and the
 existing tests keep working unchanged, with the same messages.
 
-### 7.4 Allocation
+### 7.4 Allocation: a self-sizing arena, measured
 
-The prototype's 1.43 µs/pair of compute is ~0.47 scan + ~0.96 everything else, and the
-"everything else" is dominated by avoidable copies: it unconditionally copies `s1`/`q1`
-into mutable buffers (needed only for the 43.5% of pairs the consensus actually
-changes), builds `s2rc` byte-at-a-time, reverses `q2` byte-at-a-time, and appends the
-merged quality one `push_back` at a time.
+**One thread-local `Scratch` arena per worker**, holding `s2rc`, the reversed `q2`, the
+consensus copies and the record staging buffer. It **starts at 1024 bases and doubles
+whenever a longer read appears**, so nothing needs to know the read length up front:
 
-The design: **one thread-local `Scratch` arena per worker, sized from
-`--max-read-length` at startup and never freed**, holding `s2rc`, the reversed `q2`, the
-consensus copies and the record staging buffer. Copy-on-write for the consensus, a
-vectorised revcomp, and `memcpy`-based record assembly. No allocation in the per-pair
-path at all. **The target is under 1 µs/pair of total compute; that is an estimate, not
-a measurement**, and it is the first thing to check once L3 exists.
+```cpp
+inline void ensure(size_t n) {                 // one predictable, never-taken branch
+    if (n <= cap) return;
+    size_t c = cap ? cap : 1024;
+    while (c < n) c <<= 1;
+    s2rc.resize(c); q2r.resize(c); s1b.resize(c); q1b.resize(c);
+    seq.resize(2*c); qual.resize(2*c);         // a merged record is at most len1+len2
+    cap = c;
+}
+```
+
+Plus **copy-on-write for the consensus** — 56.5% of pairs have a clean winning overlap
+and need no mutable copy of `s1`/`q1` at all — and `memcpy`-based record assembly
+instead of per-byte appends.
+
+Measured on the 200k library, both variants byte-identical:
+
+| | per-pair `std::vector` (`.assign`/`.resize`) | **adaptive arena + copy-on-write** |
+|---|---:|---:|
+| end to end, gz in → file out | 2.71 µs/pair | **2.32** |
+| compute only | 1.38 µs/pair | **1.00** |
+| arena growths over 200,000 pairs | — | **1** |
+
+So growing on demand is not a speed compromise — it is **27% faster** than the
+fixed-size version, because dropping the fixed-size assumption is what made
+copy-on-write natural. The capacity check costs nothing measurable: it is taken once
+per run, and the branch predictor sees it never taken thereafter. Revision 1's estimate
+("under 1 µs/pair, unmeasured") is now a measurement: **1.00 µs/pair**, of which 0.47 is
+the scan.
+
+The one real downside is inherent to the algorithm rather than to the arena: the scan is
+O(L²), so a 20 kb read costs ~40 ms (audit). The tool logs one INFO line the first time
+a read exceeds 1024 bases, naming the quadratic cost, so an accidental long-read FASTQ
+is diagnosable instead of looking like a hang. It is not an error and there is no flag.
+
+---
+
+### 7.5 The CLI, with nothing kept for compatibility
+
+zna is alpha and forward-only. Every flag that exists to keep something older working is
+deleted rather than deprecated:
+
+| deleted | why it existed | replacement |
+|---|---|---|
+| `--processes` | the process pool | `--threads` |
+| `--length-required` | a fastp alias | `--min-read-length` |
+| `--allow-slow` | the numba escape hatch | `--backend python` |
+| `--max-read-length` | never shipped; §4 | nothing — buffers self-size |
+| the `njit` no-op shim in `overlap.py` | numba absence | deleted with numba; `legacy_scan` in the parity test becomes plain Python |
+| sparse per-chunk histograms | pickling cost across processes | dense arrays; threads do not pickle |
+
+`--threads` now means **merge worker threads**, which is what a user expects it to mean;
+it previously meant pigz threads. Gzip threading becomes `--io-threads`, used for the
+*output* only — the reader is always `-p1` because pigz cannot parallelise inflate, and
+§2 measures `-p4` as actively worse. Both changes land together, so nothing silently
+reinterprets an existing invocation.
+
+The resulting surface, three scoring parameters and no read-length knob:
+
+```
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz [options]
+
+  --threshold-merge BITS    28.0    score >= this merges the pair
+  --threshold-trim  BITS     8.0    ...trims R2's redundant 3' end
+  --min-read-length N         40    drop emitted reads shorter than this
+
+  --threads N          min(4,ncpu) merge worker threads; 2-3 saturates (§2)
+  --io-threads N                 4  pigz threads for the gzipped output
+  --chunk-size N              2000  read pairs per work unit
+  --compress-level N             1  output is an intermediate; speed beats ratio
+  --backend {auto,accel,python}     auto = accel, hard error if unavailable
+
+  --json FILE   --no-sync-check   --allow-empty   -q/--quiet
+```
+
+`--backend` replaces `--allow-slow` and does more: it is the supported way to force the
+reference implementation, mirrors `get_backend(name)` for the codec, and gives the test
+suite a first-class way to run either side.
+
+**Two cross-repo interfaces change, and neither is "backwards compatibility" — they are
+live contracts with other repos, so they need coordinated edits:**
+
+- **The JSON stats.** `"numba": bool` becomes `"backend": "accel"|"python"`, and the
+  `params` block gains `score_scale`, `match_q`, `step_q`, `threshold_merge_q`,
+  `threshold_trim_q` so a corpus can be audited against the exact integers that produced
+  it (§4). hulkrna's `gather/tools/read_merge.py` takes whatever scalars it finds, so the
+  only breakage is a vanished `numba` cohort field; the new string key needs the
+  `(int, float, str)` filter that R5 already widened. Do it now, while nothing has
+  shipped.
+- **The merged-read name token** `<id> merged_<n1>_<n2>` stays, because khorana's
+  `parse_merged_fastq` requires the last token to start with `merged`. It disappears on
+  its own when `--merge-pairs` deletes the FASTQ intermediate.
+
+---
 
 ---
 
@@ -473,11 +578,6 @@ window, not a lock-free ring buffer. A ring buffer would mean moving the pool in
 which trades testable Python orchestration for a concurrency primitive to get right; and
 the head-of-line blocking it avoids is bounded by the *variance* in chunk compute time,
 which for fixed-size chunks of Illumina reads is a few percent.
-
-`--processes` stays as a **deprecated alias for `--threads`** so the pipeline's existing
-rule keeps working, with a one-line deprecation notice and a note in the JSON stats.
-
----
 
 ## 9. Testing
 
@@ -528,7 +628,7 @@ tuning as post-0.4.0 work on a Linux box.
 | item | resolution |
 |---|---|
 | vector compare | 16-byte vectors are the baseline everywhere: NEON on aarch64, **SSE2 on x86-64 — which is part of the x86-64 baseline and needs no `-march` flag and no runtime check**. One `neq16` behind two `#ifdef`s. |
-| AVX2 (32 B) | Not baseline. Deliberately **out of scope for 0.4.0**: the 16-byte path is already 5.6x, and §6.1 shows the optimum is set by bail granularity rather than width, so a 32-byte vector may well need bail-every-1 to compete. Measure on x86 first (`bench_simd.cpp` builds the variants), then decide whether a runtime-dispatched AVX2 path earns its complexity. |
+| AVX2 (32 B) | Not baseline. **Deferred to 0.4.1** — see `docs/FUTURE.md`. The 16-byte path is already 5.6x, and §6.1 shows the optimum is set by bail granularity rather than width, so a 32-byte vector may well need bail-every-1 to compete. `bench_simd.cpp` builds the variants; measure on x86 before writing any dispatch. |
 | `popcount` | Only needed for the x86 `movemask` result — a 16-bit value. Use a 256-entry table or `__builtin_popcount`; either is fine for 16 bits. The NEON path uses `vaddvq_u8` and needs no popcount at all. This is much smaller than revision 1 implied, because the packed kernel is gone. |
 | **`__builtin_popcountll` and SIGILL** | The review warns of `SIGILL` on old hardware. That is not the failure mode: without `-mpopcnt` the compiler emits a software fallback, not the POPCNT instruction. `SIGILL` requires compiling *with* an ISA flag the host lacks — which this design never does. The real risk was only a slow libcall, and it is now moot. |
 | endianness | Byte comparison is endian-independent, so the packed kernel's little-endian assumption is gone. `static_assert` retained for the length fields only. |
@@ -546,10 +646,10 @@ Every phase ends green, with byte-identical output to the phase before it, so a
 regression bisects to one change.
 
 - **A — fixed point, in Python.** Introduce `params.py`, `SCALE = 2^24`, integer
-  scoring, the exact `dmax`, `--max-read-length`, and the tie-break spec written down
-  and tested. Still numba. *Acceptance: byte-identical output on the 200k library, and
-  the §4 enumeration as a test.* This isolates "did fixed point change anything?" from
-  "did C++ change anything?".
+  scoring, the exact `dmax`, and the tie-break spec written down and tested. Still
+  numba. *Acceptance: byte-identical output on the 200k library, and the §4 enumeration
+  as a test.* This isolates "did fixed point change anything?" from "did C++ change
+  anything?".
 - **B — backend seam.** Add `backend.py` and `_pymerge.py`; make `overlap.py`/`pairs.py`
   dispatch. *Acceptance: suite green on both backends.*
 - **C — C++ L1.** The scan only. *Acceptance: L1 differential on the 200k library + fuzz;
@@ -557,18 +657,18 @@ regression bisects to one change.
   2.63 → 0.47 µs/pair.
 - **D — C++ L2.** Consensus, construction, naming, the `Scratch` arena. *Acceptance:
   identical record tuples.* Expected: p1 8.34 → ~4 µs/pair.
-- **E — C++ L3 + threads + ordered output.** Parser, formatting, histograms, GIL
-  release, `ThreadPoolExecutor`, `--processes` → alias. *Acceptance: whole-file equality
+- **E — C++ L3 + threads + ordered output.** Parser, formatting, dense histograms, GIL
+  release, `ThreadPoolExecutor`, and the §7.5 CLI. *Acceptance: whole-file equality
   across backends and thread counts; the four IPC defects each have a named test.*
-  Expected: ~2.7 µs/pair at 1 thread, ~0.9–1.1 at 2–4.
-- **F — remove numba.** Drop the dependency, the `merge` extra, and the numba-specific
-  refusal; `zna merge` now refuses without the *accel backend* unless `--allow-slow`,
-  exactly parallel to `is_accelerated()` for the codec. Keep the `njit` no-op shim, which
-  the tests import.
-- **G — post-0.4.0, on Linux/x86.** Re-run `scripts/merge_bench/` on x86: confirm the
-  SSE2 path, evaluate AVX2 with a runtime dispatch, and re-tune the bail granularity,
-  which is hardware-dependent. Then, if the gzip floor is still binding, evaluate
-  libdeflate or ISA-L inflate inside the extension.
+  Expected: **2.32 µs/pair at 1 thread, ~0.85–1.0 at 2–3.**
+- **F — remove numba, and the rest of the legacy.** Drop the dependency, the `merge`
+  extra, the `njit` shim and `legacy_scan`'s use of it; `zna merge` refuses without the
+  accel backend unless `--backend python`, exactly parallel to `is_accelerated()` for
+  the codec. Release 0.4.0.
+- **G — 0.4.1, on Linux/x86.** Re-run `scripts/merge_bench/` on x86: confirm the SSE2
+  path, evaluate AVX2 with a runtime dispatch, and re-tune the bail granularity, which
+  is hardware-dependent. Then, if the gzip floor is still binding, evaluate libdeflate
+  or ISA-L inflate inside the extension. Tracked in `docs/FUTURE.md`.
 
 **Then** `zna encode --merge-pairs`, which feeds merged records straight into the
 existing `(seq, is_paired, is_read1, is_read2, has_start, has_end)` ingest path via the
@@ -587,10 +687,11 @@ churn — a `pip install zna[merge]` and a conda `run_constrained` that stop mea
 anything — bought for nothing.
 
 0.4.0 rather than 0.3.6 because it adds a subcommand, adds a second compiled extension,
-changes the parallelism model from processes to threads, changes `--processes` to a
-deprecated alias, and removes an optional dependency. On a 0.x project that is
-minor-version material. `src/zna/__init__.py` and the CHANGELOG heading are renumbered
-when phase F lands, not before.
+changes the parallelism model from processes to threads, removes an optional dependency,
+and deletes `--processes`, `--length-required` and `--allow-slow` outright (§7.5).
+zna is alpha and forward-only, so those are deletions rather than deprecations — but
+they are still the reason this is a minor bump rather than a patch. `src/zna/__init__.py`
+and the CHANGELOG heading are renumbered when phase F lands, not before.
 
 ---
 
@@ -602,7 +703,8 @@ the rest; check it before proposing an improvement.
 | idea | why not |
 |---|---|
 | **2-bit packing + popcount** | 0.535 vs 0.470 µs/pair for byte-wise vectors, and it needs a SWAR packer, cross-word bit realignment, a guard word, and a purity dispatch to keep N/IUPAC semantics. Slower *and* more machinery. |
-| **AVX2 in 0.4.0** | Not baseline on manylinux2014, and §6.1 shows bail granularity dominates width. Measure on x86 first (phase G). |
+| **AVX2 in 0.4.0** | Not baseline on manylinux2014, and §6.1 shows bail granularity dominates width. Deferred to 0.4.1; measure on x86 first (phase G). |
+| **A `--max-read-length` cap** | Three independent reasons it is unnecessary (§4): `int64` cannot overflow on any readable input, fixed point is exact at every length, and the first fixed-point/float disagreement needs a 32,830-base *overlap*. Buffers self-size, and doing so measured 27% faster (§7.4). |
 | **Fusing the two flank shifts** | Helps the packed kernel 1.08x, hurts the byte kernel (0.555 vs 0.470). |
 | **byte-SWAR in a 64-bit word** | 1.040 vs 1.075 µs/pair — **1.03x**. Same bail granularity, and the compare was never the cost. |
 | **Google Highway or another SIMD library** | A new third-party dependency for a project whose runtime deps are `zstandard` and `pyyaml`. One `neq16` behind two `#ifdef`s is ~10 lines. |
@@ -621,14 +723,17 @@ the rest; check it before proposing an improvement.
    written but unmeasured, the AVX2 variants are unmeasured, and the optimal bail
    granularity is hardware-dependent — 32 bases won here, and there is no reason to
    assume it wins on Zen or Sapphire Rapids. `scripts/merge_bench/bench_simd.cpp` builds
-   all of it. This is phase G and the user's post-release work.
-2. **How much of §7.4's ~0.96 µs/pair of non-scan compute survives the `Scratch`
-   arena?** Target under 1 µs/pair total; unmeasured.
-3. **Does ordered output cost measurable throughput** at 4 threads? Ship it
+   all of it. This is 0.4.1.
+2. **Does ordered output cost measurable throughput** at 4 threads? Ship it
    unconditionally unless it exceeds ~5%.
-4. **Is `--max-read-length 4000` right?** It must exceed any real read and stay inside
-   the enumerated domain of §4. A long-read chemistry would need the enumeration re-run,
-   not just the flag raised.
+3. **Does the thread count want a smarter default than `min(4, ncpu)`?** Compute is
+   1.00 µs/pair against a 0.80 µs/pair decompression floor, so 2 threads should
+   saturate; 4 is a margin for slower machines and higher `--compress-level`. Confirm
+   once phase E exists.
+
+*Closed since revision 2:* how much non-scan compute survives the arena — **measured at
+1.00 µs/pair total, 0.47 of it the scan** (§7.4); and whether `--max-read-length` is
+needed — **no** (§4).
 
 ---
 
@@ -667,4 +772,5 @@ since 0.3.x); a documented tie-break.
 - **zna targets manylinux2014, not `manylinux_2_28`** (§10), pinned deliberately in
   0.3.5 to keep RHEL7-era HPC clusters. SSE2 is guaranteed there; AVX2 is not.
 - **§14.4 of revision 1 was about the fixed-point proof domain**, not stack vs heap
-  allocation. The allocation point was still worth taking, and is now §7.4.
+  allocation. The allocation point was still worth taking, and is now §7.4 — where it
+  turned out to be worth 27%, and to remove the need for the cap entirely.
