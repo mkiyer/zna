@@ -5,6 +5,76 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-08-12
+
+Adds `zna merge`, an overlap merger for paired-end reads, ported in from the
+pipeline that was using it. No on-disk format change, and nothing existing
+changes behaviour.
+
+### Added
+- **`zna merge` — overlap-merge paired-end reads into one mixed interleaved
+  FASTQ**, ready for `zna encode --interleaved`. Replaces fastp's PE-merge step.
+
+  Every pair is scored **once**: R1 is slid against `revcomp(R2)` over the single
+  axis of candidate fragment lengths, and each shift is scored as a
+  log-likelihood ratio in **bits** against chance alignment — `+1.9855` per
+  matching base (`log2 4`, the information in agreeing on one of four bases),
+  `-6.2288` per mismatch at a 1% error rate. Both weights fall out of the error
+  rate; neither is tuned. The `argmax` shift (not fastp's first-accept) is then
+  read at two thresholds: at or above `--threshold-merge` (28 bits) the pair
+  becomes one full-fragment record; between that and `--threshold-trim` (8 bits)
+  both reads are kept and the redundant overlap is cut off R2's **3'** end; below
+  it both are kept untouched. Three parameters in total, all with units.
+
+  Measured against the fastp-derived rule it replaces: spurious detection on
+  genuinely unrelated pairs **5.17% → 0.26%**, zero spurious merges in 20,000
+  uniform-random pairs at 28 bits, merge rate **85.7% → 88.8%**.
+
+  Where the mates overlap and disagree, the consensus takes the better-supported
+  call by posterior from the two Phred scores and derates its quality, because a
+  contested base is less certain than an uncontested one. On 167,784 real pairs
+  that is **35.2% fewer expected residual errors** than fastp's Q14/Q30 cutoffs,
+  entirely in the quality band those cutoffs never reach.
+
+  Why it belongs here: base 0 of every emitted read is a true fragment boundary
+  (nothing is ever cut from a 5' end), a merged record *is* its fragment exactly,
+  and unmerged pairs are emitted all-or-nothing so a lone mate never becomes a
+  spurious "full molecule with both endpoints". Those are precisely the
+  properties `IS_RC`, `IS_FULL_FRAGMENT` and `--treat-unpaired-as-merged` rest
+  on, and they were previously asserted across a repo boundary. See
+  [docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation,
+  [docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for the measured-and-rejected
+  list, and [docs/READ_MERGE_PORT_TO_ZNA.md](docs/READ_MERGE_PORT_TO_ZNA.md) §4
+  for the contract.
+
+  Also available in-process as `zna.merge.process_pair` / `zna.merge.find_overlap`,
+  and as `python -m zna.merge`.
+
+### Packaging
+- **`numba` is a new optional extra, `pip install zna[merge]`.** It is *not* a
+  core dependency: it drags llvmlite and hard Python-version pins, and zna should
+  stay light to install. `import zna` and `import zna.merge` both work without it
+  — the overlap scan falls back to identical pure Python, which is also the
+  reference implementation a future C++ backend will be differentially tested
+  against.
+
+  **`zna merge` refuses to run without numba** unless given `--allow-slow`. The
+  fallback is correct and about 50x slower, and a silently-correct 50x slowdown
+  at cluster scale is indistinguishable from a slow node — it burns the whole
+  allocation without ever failing. The in-process `run()` does not refuse.
+- The conda recipe carries numba as a `run_constrained` entry rather than a
+  separate output: it installs nothing, but states the `>=0.61` floor so an
+  environment that does pull numba in cannot solve to a version too old for it.
+
+### Internal
+- `zna/cli.py` registers the `merge` subparser from `zna/merge/args.py`, which
+  imports nothing but `argparse`, and `zna/merge/__init__.py` resolves its
+  exports lazily. Both exist so that adding the subcommand costs nothing at
+  startup: `zna/merge/overlap.py` imports numba, and registering it eagerly took
+  `import zna.cli` from 40 ms to 210 ms — which `zna inspect --json`, advertised
+  as fast enough to catalogue a corpus, should not pay. Measured after: 40 ms
+  unchanged, and `import zna.merge` is 5.7 ms without loading numba at all.
+
 ## [0.3.5] - 2026-08-12
 
 Two fixes found by reviewing the pipelines that write and read ZNA files

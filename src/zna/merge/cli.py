@@ -195,7 +195,18 @@ def _run_parallel(args, params):
     # Warm the JIT in the parent so forked workers inherit the compiled kernel.
     process_pair(b"w", b"ACGT" * 10, b"I" * 40, b"w", b"ACGT" * 10, b"I" * 40, params)
     acc = _new_acc()
-    ctx = mp.get_context("fork")
+    # fork is deliberate: the workers inherit the parent's already-JIT-compiled kernel
+    # (warmed just above) instead of each paying the numba compile. Windows has no fork
+    # at all, so fall back rather than crash on --processes > 1 -- the kernels pass
+    # cache=True, so after the first run each worker loads the compiled artifact from
+    # the numba cache instead of rebuilding it.
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        ctx = mp.get_context()
+        logger.info("no fork on this platform: using %r, so each worker compiles the "
+                    "overlap kernel once (set NUMBA_CACHE_DIR to a writable path if "
+                    "that repeats every run)", ctx.get_start_method())
     # One decompression thread per reader: with N workers already resident, extra
     # pigz threads only contend for the same allocation (measured 1.13x).
     chunks = _iter_chunks(read_pairs(args.in1, args.in2, 1), args.chunk_size)

@@ -20,6 +20,16 @@ raw FASTQ -> fastp (trim, UMI, adapter) -> dedup -> STAR/rigel -> BAM
           -> samtools fastq -> hulkrna-merge -> zna encode -> ZNA -> khorana
 ```
 
+> **Note (2026-08-12).** `hulkrna-merge` has since moved into this repo and is now the
+> `zna merge` subcommand (`src/zna/merge/`); read every mention of it below as that.
+> Its own documents are [READ_MERGE_REDESIGN.md](READ_MERGE_REDESIGN.md) (the design),
+> [MERGE_TOOL_AUDIT.md](MERGE_TOOL_AUDIT.md) (what was measured and rejected) and
+> [READ_MERGE_ROADMAP.md](READ_MERGE_ROADMAP.md) (status). The §4 properties this plan
+> verified by inspection are now stated as a contract, C1–C7, in
+> [READ_MERGE_PORT_TO_ZNA.md](READ_MERGE_PORT_TO_ZNA.md) §4, and pinned by
+> `tests/test_merge.py` and `tests/test_merge_encode.py`. Line references into
+> `pairs.py` throughout this document predate the geometry rewrite and have moved.
+
 ---
 
 ## 1. The contract

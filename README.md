@@ -15,6 +15,7 @@
 - **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
 - **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
 - **Flexible**: Single-end, paired-end, and interleaved reads
+- **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
 - **Metadata Rich**: Read groups, descriptions, and custom flags
@@ -28,6 +29,9 @@
 git clone https://github.com/mkiyer/zna.git
 cd zna
 pip install -e .
+
+# With `zna merge` at full speed (adds numba; see the `zna merge` reference)
+pip install -e ".[merge]"
 
 # Check if C++ acceleration is available
 python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_accelerated()}')"
@@ -58,6 +62,10 @@ zna decode sample.zna -o sample.fasta
 
 # Inspect file statistics
 zna inspect sample.zna
+
+# Overlap-merge paired-end reads before encoding (needs the `merge` extra)
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
+zna encode --interleaved --treat-unpaired-as-merged merged.fq.gz -o sample.zna
 
 # Pipe-friendly workflows
 cat reads.fastq | zna encode -o reads.zna
@@ -96,6 +104,10 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 
 - **[docs/RELEASING.md](docs/RELEASING.md)** - Publishing to PyPI and Bioconda
 - **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Benchmarks and tuning
+- **[docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md)** - `zna merge`: why the scoring rule is what it is
+- **[docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md)** - `zna merge`: what was measured and rejected
+- **[docs/READ_MERGE_ROADMAP.md](docs/READ_MERGE_ROADMAP.md)** - `zna merge`: status board
+- **[docs/SOS_EOS_ENCODING_PLAN.md](docs/SOS_EOS_ENCODING_PLAN.md)** - Fragment-boundary supervision, end to end
 
 ---
 
@@ -637,6 +649,92 @@ zna shuffle paired.zna -o shuffled_paired.zna
 ```
 
 **Note**: Paired-end reads (R1+R2) are kept together as a single shuffle unit.
+
+### `zna merge`
+
+Overlap-merge paired-end reads into one mixed interleaved FASTQ, ready for
+`zna encode --interleaved`. Replaces fastp's PE-merge step.
+
+Each pair is scored **once**: R1 is slid against `revcomp(R2)` over the single axis of
+candidate fragment lengths, and every shift gets a log-likelihood ratio in **bits** —
+`+1.99` per matching base (that is `log2 4`, the information in agreeing on one of four
+bases), `-6.23` per mismatch at a 1% error rate. Both weights fall out of the error
+rate; neither is tuned. The best-scoring shift (`argmax`, not fastp's first-accept) is
+then read at two thresholds:
+
+| | condition | action |
+|---|---|---|
+| **merge** | `score ≥ --threshold-merge` | emit one full-fragment record |
+| **trim** | `--threshold-trim ≤ score < merge` | keep both; cut the redundant overlap off R2's **3'** end |
+| **keep** | `score < --threshold-trim` | keep both, untouched |
+
+Three parameters, all with units. Both thresholds read one calibrated scale, so `T` bits
+tolerates a spurious rate of about `N · 2^-T` over the `N ≈ 2 · readlen` candidate
+shifts — the default 28 is one spurious merge in 10⁶ pairs *against chance alignment*
+(measured: 0 in 40,000 uniform-random pairs, at every read length from 50 to 300). It is
+not a bound against real sequence, where reads share genuine homology and repeat
+content. Trim sits far lower only because a wrong trim costs a few real bases while a
+wrong merge is a chimera.
+
+**Usage:**
+
+```
+zna merge --in1 R1.fq --in2 R2.fq --out OUT.fq [OPTIONS]
+
+Required:
+  --in1 FILE             R1 FASTQ (optionally .gz)
+  --in2 FILE             R2 FASTQ (optionally .gz), positionally synced with --in1
+  --out FILE             Output mixed interleaved FASTQ (.gz to gzip)
+
+Options:
+  --json FILE            Write run statistics as JSON (counts, histograms, provenance)
+  --threshold-merge BITS Score at or above this merges the pair (default: 28.0)
+  --threshold-trim BITS  Score at or above this (but below merge) trims R2 (default: 8.0)
+  --min-read-length N    Drop emitted reads shorter than this (default: 40)
+                         --length-required is an alias
+  --processes N          Worker processes for the merge scan (default: 1)
+  --threads N            pigz threads for gzip I/O (default: 4)
+  --chunk-size N         Read pairs per work unit (default: 2000)
+  --compress-level N     pigz level for --out (default: 1 — it is an intermediate)
+  --no-sync-check        Skip the per-pair R1/R2 read-name consistency check
+  --allow-empty          Exit 0 on an input with no read pairs
+  --allow-slow           Run without numba (~50x slower)
+  -q, --quiet            Suppress progress logging
+```
+
+**Requires numba** (`pip install zna[merge]`). Without it the identical scan runs as
+pure Python — correct, but about 50x slower — so the command refuses to start rather
+than turn a fast job into a silently slow one. Pass `--allow-slow` if you mean it.
+`pigz` is used for gzip I/O when it is on `PATH`, falling back to stdlib `gzip`.
+
+**Output** is one stream mixing both shapes: merged reads as single records with the
+`/1`,`/2` suffix stripped, unmerged pairs as adjacent `/1`,`/2` records. Feed it to
+`zna encode --interleaved --treat-unpaired-as-merged`, which is exact here because
+merged records span their fragment and unmerged pairs are emitted all-or-nothing —
+never a lone mate.
+
+**Examples:**
+
+```bash
+# Defaults suit 2x150 bp data; you normally set nothing
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
+
+# Production: one worker per allocated core, plus run statistics
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz \
+          --json merge.json --threads 8 --processes 8
+
+# Straight into a training corpus
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
+zna encode --interleaved --treat-unpaired-as-merged --strand-normalize \
+           --shuffle merged.fq.gz -o reads.zna
+```
+
+**Boundary guarantee.** Base 0 of every emitted read is a true fragment boundary —
+nothing is ever removed from a read's 5' end, and trimming only ever cuts R2's 3' end.
+A merged record *is* its fragment, exactly. This is what makes `IS_RC` and
+`IS_FULL_FRAGMENT` honest for merged input; see
+[docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation and
+[docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for what was measured and rejected.
 
 ---
 

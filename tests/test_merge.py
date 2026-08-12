@@ -1221,6 +1221,67 @@ cli.run(args)
 '''
 
 
+_NO_FORK_DRIVER = r'''
+import multiprocessing as mp
+
+# Exactly what Windows does: no fork context is registered at all.
+_real = mp.get_context
+def _no_fork(method=None):
+    if method == "fork":
+        raise ValueError("cannot find context for 'fork'")
+    return _real(method)
+mp.get_context = _no_fork
+
+if __name__ == "__main__":          # spawn re-imports this module in each child
+    from zna.merge import cli
+
+    def run(procs, out):
+        stats = cli.run(cli.build_parser().parse_args(
+            ["--in1", {in1!r}, "--in2", {in2!r}, "--out", out,
+             "--processes", str(procs), "--chunk-size", "9", "-q"]))
+        for k in ("elapsed_s", "pairs_per_second"):
+            stats.pop(k, None)
+        lines = open(out, "rb").read().splitlines()
+        recs = frozenset((lines[i], lines[i + 1], lines[i + 3])
+                         for i in range(0, len(lines), 4))
+        return stats, recs
+
+    one = run(1, {out1!r})
+    many = run(2, {out2!r})
+    assert one == many, "no-fork parallel path diverged from single-process"
+    assert one[1], "no records emitted"
+    print("OK", len(one[1]))
+'''
+
+
+def test_the_parallel_path_survives_a_platform_without_fork(tmp_path):
+    """`_run_parallel` asks for a fork context so the workers inherit the parent's
+    already-JIT-compiled kernel. Windows has no fork at all, so without the fallback
+    `--processes 2` is a hard ValueError there — and no test on a POSIX box would ever
+    see it. Under the fallback each worker compiles the kernel itself (the kernels pass
+    `cache=True`, so that is a first-run cost), and the output must be unchanged.
+
+    Driven out of process because spawn re-imports the parent's `__main__`, which under
+    pytest is pytest itself.
+    """
+    import subprocess
+    in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
+    r1s, r2s = [], []
+    for i in range(30):
+        frag = rand_seq(260, 900 + i)[:100 + 30 + (i % 31)]
+        (h1, s1, _), (h2, s2, _) = make_pair(frag, 100, name=f"N{i}".encode())
+        r1s.append((h1, s1)); r2s.append((h2, s2))
+    _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+    driver = tmp_path / "nofork.py"
+    driver.write_text(_NO_FORK_DRIVER.format(
+        in1=str(in1), in2=str(in2),
+        out1=str(tmp_path / "one.fastq"), out2=str(tmp_path / "many.fastq")))
+    proc = subprocess.run([sys.executable, str(driver)],
+                          capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("OK"), proc.stdout
+
+
 def test_a_killed_worker_fails_the_run_instead_of_hanging(tmp_path):
     """`multiprocessing.Pool` cannot detect abrupt worker death: it respawns the
     process while `IMapUnorderedIterator.next()` blocks on a result that will never

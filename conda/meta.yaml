@@ -33,14 +33,29 @@ requirements:
     - python
     - zstandard
     - pyyaml
+  # `zna merge` JIT-compiles its overlap scan with numba. Deliberately a constraint and
+  # NOT a dependency, and NOT a separate `zna-merge` output: numba drags llvmlite and
+  # hard Python-version pins, and zna is a format library that should install lightly.
+  # `import zna.merge` works without it (the identical scan runs as pure Python, ~50x
+  # slower), and `zna merge` refuses to run that way unless given --allow-slow. This
+  # entry installs nothing; it states the floor so that an environment which DOES pull
+  # numba in cannot solve to a version that is too old.
+  run_constrained:
+    - numba >=0.61
 
 test:
   imports:
     - zna
     - zna.core
     - zna.cli
+    # numba is not in this environment, so this also asserts that the pure-Python
+    # fallback in zna/merge/overlap.py still imports cleanly.
+    - zna.merge
   commands:
     - zna --help
+    # Exercises the subcommand registration. It resolves through zna/merge/args.py,
+    # which imports nothing but argparse, so --help works with numba absent.
+    - zna merge --help
     - python -c "import zna; print('ZNA version:', zna.__version__)"
     # Assert, do not merely print: the whole point of this package is the
     # compiled extension, and a build that silently fell back to the pure-Python
