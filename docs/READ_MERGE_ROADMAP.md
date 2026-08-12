@@ -28,8 +28,15 @@ ranked against those two, and (1) beats (2) whenever they conflict.
 | M3 — statistics reach the cohort; provenance recorded | **done** (2026-08-12) |
 | M4 — intermediate size and pool scaling | **done**; raw-blob IPC deferred, see R7 |
 | M5 — freeze, then MOVE to the zna package | **done** (2026-08-12) |
-| M6 — `zna encode --merge-pairs` | **next** |
-| M7 — numba → C++ | after M6 |
+| M6 — numba → C++ | **next**; designed, see [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) |
+| M7 — `zna encode --merge-pairs` | after M6 |
+
+**M6 and M7 swapped order (2026-08-12).** The C++ design was measured first and the
+measurement changed the sequencing: at `--processes 8` the merge computation already
+contributes almost nothing to wall time, so the win from native code is *collapsing
+eight cores into one*, and the remaining time is gzip I/O — which is exactly what
+`--merge-pairs` deletes. Doing C++ first also means `--merge-pairs` is written once,
+against the final backend, instead of twice.
 
 Historical paths: everything below `lib/hulkrna/merge/` is now `src/zna/merge/`, and
 `tests/test_read_merge.py` / `tests/test_merge_zna_e2e.py` are `tests/test_merge.py` /

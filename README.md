@@ -107,6 +107,7 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 - **[docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md)** - `zna merge`: why the scoring rule is what it is
 - **[docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md)** - `zna merge`: what was measured and rejected
 - **[docs/READ_MERGE_ROADMAP.md](docs/READ_MERGE_ROADMAP.md)** - `zna merge`: status board
+- **[docs/MERGE_CPP_DESIGN.md](docs/MERGE_CPP_DESIGN.md)** - `zna merge`: design for the native backend
 - **[docs/SOS_EOS_ENCODING_PLAN.md](docs/SOS_EOS_ENCODING_PLAN.md)** - Fragment-boundary supervision, end to end
 
 ---
