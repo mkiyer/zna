@@ -1,4 +1,4 @@
-"""Overlap detection kernel — the performance-critical core.
+"""Overlap detection: the public interface over a selectable kernel backend.
 
 One axis, one scan, one score. Write R1 and revcomp(R2) on a common coordinate axis:
 revcomp(R2)'s fragment portion always ends at its own end, so its offset relative to
@@ -36,33 +36,19 @@ between shifts of *equal* overlap length: a tie across different ``n`` would nee
 step_q)`` and that gcd is 1, so ``dn`` would have to exceed 1.3e8. See
 ``docs/MERGE_CPP_DESIGN.md`` §5.
 
-A single ``@njit`` kernel operates directly on ``bytes`` (indexing yields ints). When
-numba is installed it JIT-compiles to C speed; when absent the identical function runs
-as pure Python (correct, ~50x slower — install numba for production). Operating on
-``bytes`` avoids per-pair ``np.frombuffer`` and is ~2.5x faster than the ndarray path.
+**This module is the public interface, not the kernel.** The scan itself lives in a
+backend — :mod:`zna.merge._pymerge` (the reference oracle) or the accelerated
+extension — selected by :mod:`zna.merge.backend` and resolved on first use, so importing
+this module costs nothing. Backends operate directly on ``bytes`` (indexing yields
+ints), which avoids a per-pair ``np.frombuffer`` and is ~2.5x faster than an ndarray
+path.
 """
-from __future__ import annotations
 
+
+from .backend import get_merge_backend, get_merge_backend_name
 from .params import (  # noqa: F401  (score_weights/threshold_bits are re-exported API)
     MergeParams, P_NULL, SCALE, score_weights, threshold_bits, to_bits, to_q,
 )
-
-try:  # numba JIT-compiles the scan; without it the same code runs as pure Python.
-    from numba import njit
-    HAVE_NUMBA = True
-except ImportError:  # pragma: no cover - exercised only when numba is missing
-    HAVE_NUMBA = False
-
-    def njit(*args, **kwargs):
-        """No-op stand-in for numba.njit supporting both @njit and @njit(...)."""
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-
-        def _decorate(func):
-            return func
-
-        return _decorate
-
 
 # Complement table for A/C/G/T/N (both cases). Bytes outside that set are reversed but
 # NOT complemented — `maketrans` passes anything unlisted through — so an IUPAC ambiguity
@@ -77,130 +63,37 @@ NO_OVERLAP = 0
 FORWARD = 1
 REVERSE = -1
 
-# Sentinel for "this shift cannot beat the incumbent". A finite int64 keeps numba's
-# typing simple and stays far below any reachable score.
-_REJECT = -(1 << 62)
-
-#: Default parameters, so ``find_overlap(s1, s2rc)`` needs no ceremony.
-_DEFAULTS = MergeParams()
-
 
 def reverse_complement(seq: bytes) -> bytes:
     """Reverse-complement a nucleotide sequence (bytes in, bytes out)."""
     return seq.translate(_COMPLEMENT)[::-1]
 
 
-@njit(cache=True)
-def _shift_score(s1, s2rc, s, n, match_q, step_q, best):
-    """Score one candidate shift. Returns ``(score_q, mismatches)``.
+#: Default parameters, so ``find_overlap(s1, s2rc)`` needs no ceremony.
+_DEFAULTS = MergeParams()
 
-    ``step_q = match_q + mismatch_q`` is the score given up per mismatch relative to an
-    all-match overlap, so ``score_q = n * match_q - d * step_q``. That is monotone in
-    ``d`` alone, so the largest mismatch count that could still beat ``best`` is known
-    up front and the loop bails the moment it is exceeded. Returns ``_REJECT`` when the
-    shift cannot beat ``best``.
+#: The selected backend's scan, resolved on first use so that importing this module
+#: costs nothing (the Python backend pulls in numba; the accel one, an extension).
+_SCAN = None
+_BACKEND_NAME = None
 
-    ``dmax`` is the largest ``d`` that can still *strictly* beat ``best``, and in
-    integers it is exact: ``score_q > best`` iff ``d * step_q < ceiling - best`` iff
-    ``d <= (ceiling - best - 1) // step_q``. The float version of this line truncated,
-    which let a shift that could only tie survive to be rejected one comparison later —
-    same answer, more work, and the one place a float decided control flow.
 
-    Mismatches are accumulated **branchlessly in blocks of 8**, with the bail tested
-    once per block. On a wrong shift the comparison is a coin flip, so a per-position
-    ``if`` mispredicts constantly; hoisting the branch out of the block is worth 3.7x
-    on the whole scan (measured) and costs at most 7 extra comparisons per rejected
-    shift. The result is bit-for-bit identical either way: overshooting ``dmax`` inside
-    a block still rejects, and a surviving shift has its exact ``d``.
+def use_backend(name=None) -> str:
+    """Select the scan backend (``"accel"``, ``"python"``, or ``None``/``"auto"``).
+
+    Returns its canonical name. Raises ``ImportError`` if it cannot be loaded.
     """
-    ceiling = n * match_q
-    if ceiling <= best:
-        return _REJECT, 0
-    dmax = (ceiling - best - 1) // step_q
-    i1 = s if s > 0 else 0          # overlap start in R1
-    i2 = -s if s < 0 else 0         # ...and in revcomp(R2)
-    d = 0
-    k = 0
-    lim = n - 7
-    while k < lim:
-        d += ((s1[i1 + k] != s2rc[i2 + k])
-              + (s1[i1 + k + 1] != s2rc[i2 + k + 1])
-              + (s1[i1 + k + 2] != s2rc[i2 + k + 2])
-              + (s1[i1 + k + 3] != s2rc[i2 + k + 3])
-              + (s1[i1 + k + 4] != s2rc[i2 + k + 4])
-              + (s1[i1 + k + 5] != s2rc[i2 + k + 5])
-              + (s1[i1 + k + 6] != s2rc[i2 + k + 6])
-              + (s1[i1 + k + 7] != s2rc[i2 + k + 7]))
-        if d > dmax:
-            return _REJECT, d
-        k += 8
-    while k < n:
-        d += s1[i1 + k] != s2rc[i2 + k]
-        k += 1
-    if d > dmax:
-        return _REJECT, d
-    return ceiling - d * step_q, d
+    global _SCAN, _BACKEND_NAME
+    _SCAN = get_merge_backend(name).scan
+    _BACKEND_NAME = get_merge_backend_name(name)
+    return _BACKEND_NAME
 
 
-@njit(cache=True)
-def _scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
-    """Best-scoring shift over ``s in [-(len2-1), len1-1]``.
-
-    Returns ``(shift, score_q, overlap_len, mismatches)`` on the signed single axis
-    (``shift < 0`` is read-through). ``overlap_len == 0`` means no shift reached
-    ``floor_q``. Shifts are visited in decreasing overlap length, so the scan can stop
-    outright once the remaining ceiling cannot beat the incumbent.
-
-    The visiting order — plateau first at maximal ``n`` and ascending ``s``, then the
-    flanks at decreasing ``n``, read-through side (the smaller ``s``) before the normal
-    side — combined with strict ``>`` is what realises the specified argmax order
-    (maximise score, then minimise ``s``). Do not reorder these loops.
-    """
-    best = floor_q - 1             # a score exactly equal to `floor_q` must win
-    best_s = 0
-    best_n = 0
-    best_d = 0
-    nmax = len1 if len1 < len2 else len2
-    if nmax <= 0:
-        return 0, 0, 0, 0
-
-    # Shifts achieving the maximal overlap: a plateau of width |len1 - len2| + 1.
-    plo = 0 if len1 >= len2 else len1 - len2
-    phi = len1 - len2 if len1 >= len2 else 0
-    s = plo
-    while s <= phi:
-        sc, d = _shift_score(s1, s2rc, s, nmax, match_q, step_q, best)
-        if sc > best:
-            best = sc
-            best_s = s
-            best_n = nmax
-            best_d = d
-        s += 1
-
-    # Then both flanks, in lockstep, at decreasing overlap length.
-    n = nmax - 1
-    while n > 0:
-        if n * match_q <= best:
-            break
-        s = n - len2                       # read-through flank (s < plo)
-        sc, d = _shift_score(s1, s2rc, s, n, match_q, step_q, best)
-        if sc > best:
-            best = sc
-            best_s = s
-            best_n = n
-            best_d = d
-        s = len1 - n                       # normal-overlap flank (s > phi)
-        sc, d = _shift_score(s1, s2rc, s, n, match_q, step_q, best)
-        if sc > best:
-            best = sc
-            best_s = s
-            best_n = n
-            best_d = d
-        n -= 1
-
-    if best_n == 0:
-        return 0, 0, 0, 0
-    return best_s, best, best_n, best_d
+def backend_name() -> str:
+    """Canonical name of the backend in use, selecting the default if none is yet."""
+    if _SCAN is None:
+        use_backend()
+    return _BACKEND_NAME
 
 
 def find_overlap(seq1: bytes, seq2rc: bytes, params: MergeParams = _DEFAULTS):
@@ -220,7 +113,9 @@ def find_overlap(seq1: bytes, seq2rc: bytes, params: MergeParams = _DEFAULTS):
     ``params.t_trim`` is the lower of the two decision thresholds: overlaps that cannot
     reach it are of no interest to any caller, so it doubles as the pruning floor.
     """
-    s, score_q, olen, diff = _scan(seq1, seq2rc, len(seq1), len(seq2rc),
+    if _SCAN is None:
+        use_backend()
+    s, score_q, olen, diff = _SCAN(seq1, seq2rc, len(seq1), len(seq2rc),
                                    params.match_q, params.step_q, params.t_trim_q)
     if olen == 0:
         return NO_OVERLAP, 0, 0, 0, 0

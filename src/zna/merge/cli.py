@@ -19,7 +19,7 @@ import time
 
 from .args import add_merge_arguments, add_merge_parser, build_parser  # noqa: F401
 from .fastqio import FastqWriter, InputError, read_pairs
-from .overlap import HAVE_NUMBA
+from ._pymerge import HAVE_NUMBA
 from .params import SCALE, score_weights, threshold_bits
 from .pairs import MergeParams, PairOutcome, base_name, process_pair
 

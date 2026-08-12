@@ -18,9 +18,9 @@ import sys
 
 import pytest
 
+from zna.merge._pymerge import HAVE_NUMBA, njit
 from zna.merge.overlap import (
-    FORWARD, HAVE_NUMBA, NO_OVERLAP, REVERSE, find_overlap, njit,
-    reverse_complement,
+    FORWARD, NO_OVERLAP, REVERSE, find_overlap, reverse_complement,
 )
 from zna.merge.params import (
     SCALE, MergeParams, score_weights, threshold_bits, to_bits, to_q,
@@ -217,6 +217,45 @@ class TestScoreArithmetic:
         """
         assert score_bits(4) < 8.0 < score_bits(5)
         assert score_of(4) < T_TRIM_Q < score_of(5)      # ...and in fixed point too
+
+
+# --------------------------------------------------------------------------- #
+# backend selection
+# --------------------------------------------------------------------------- #
+
+class TestBackendSelection:
+    """The kernel is selectable, the same way the codec's is.
+
+    The Python backend is the reference oracle rather than a fallback, so it must be
+    available unconditionally — an environment where only the accelerated one loads
+    would have nothing to check the accelerated one against.
+    """
+
+    def test_the_reference_backend_is_always_available(self):
+        from zna.merge.backend import available_merge_backends
+        assert "python" in available_merge_backends()
+
+    def test_auto_prefers_accel_when_it_is_built(self):
+        from zna.merge.backend import available_merge_backends, get_merge_backend_name
+        expected = "accel" if "accel" in available_merge_backends() else "python"
+        assert get_merge_backend_name() == expected
+
+    def test_an_unknown_backend_is_a_loud_error(self):
+        from zna.merge.backend import get_merge_backend
+        with pytest.raises(ImportError, match="unknown merge backend"):
+            get_merge_backend("hopeful")
+
+    def test_selection_round_trips_and_restores(self):
+        from zna.merge import overlap
+        original = overlap.backend_name()
+        try:
+            assert overlap.use_backend("python") == "python"
+            frag = rand_seq(40, 3)
+            (_, s1, _), (_, s2, _) = make_pair(frag, 30)
+            assert find_overlap(s1, rc(s2))[0] == FORWARD
+        finally:
+            overlap.use_backend(original)
+        assert overlap.backend_name() == original
 
 
 # --------------------------------------------------------------------------- #
