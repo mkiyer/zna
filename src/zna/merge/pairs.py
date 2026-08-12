@@ -16,25 +16,8 @@ fastp's tuning knobs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from .overlap import FORWARD, NO_OVERLAP, REVERSE, find_overlap, reverse_complement
-
-
-@dataclass
-class MergeParams:
-    """Decision thresholds, in **bits** of log-likelihood ratio against chance.
-
-    ``t_merge`` and ``t_trim`` are two readings of one calibrated scale: a threshold
-    ``T`` tolerates a spurious rate of about ``alpha = N * 2**-T`` over the ``N ~ 2 *
-    readlen`` candidate shifts, so ``T = 28`` is ``alpha = 1e-6`` at 2x150. ``err_rate``
-    is the probability that two aligned *real* overlap bases disagree (~2x the per-base
-    sequencing error); it sets the two score weights and is not a tuning knob.
-    """
-    t_merge: float = 28.0        # score >= this -> merge into one full-fragment read
-    t_trim: float = 8.0          # [t_trim, t_merge) -> keep both, trim R2's redundant 3'
-    err_rate: float = 0.01       # per-position mismatch rate under "real overlap"
-    min_read_length: int = 40    # drop emitted reads shorter than this (post merge/trim)
+from .params import MergeParams  # noqa: F401  (re-exported: this is where callers look)
 
 
 # --------------------------------------------------------------------------- #
@@ -221,17 +204,17 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
       is a two-record mate pair.
     * ``outcome`` — a :class:`PairOutcome` value (the classification).
     * ``n_dropped`` — reads removed by the length filter.
-    * ``score`` — the winning shift's log-likelihood ratio in bits (0.0 if nothing
-      reached ``t_trim``).
+    * ``score`` — the winning shift's log-likelihood ratio, as a fixed-point integer
+      (0 if nothing reached ``t_trim``). See :mod:`zna.merge.params`.
     * ``olen``/``diff`` — the winning overlap's length and mismatch count (0 if none).
       Their ratio, accumulated over a library, is a direct calibration check on
       ``err_rate``: it should sit near it, and a chance-alignment regime drives it up.
 
     **The decision** is a single ``argmax`` shift read at two thresholds::
 
-        score >= t_merge            -> merge (one full-fragment record)
-        t_trim <= score < t_merge   -> keep both, trim the redundant overlap off R2's 3'
-        score <  t_trim             -> keep both unchanged
+        score >= t_merge_q            -> merge (one full-fragment record)
+        t_trim_q <= score < t_merge_q -> keep both, trim the redundant overlap off R2's 3'
+        score <  t_trim_q             -> keep both unchanged
 
     Trimming applies only to the normal (``FORWARD``) geometry: in a read-through the
     redundant bases are R2's *5'* fragment copy and its 3' end is adapter, so there is
@@ -251,7 +234,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
     """
     len1, len2 = len(s1), len(s2)
     s2rc = reverse_complement(s2)
-    direction, shift, olen, diff, score = find_overlap(s1, s2rc, p.t_trim, p.err_rate)
+    direction, shift, olen, diff, score = find_overlap(s1, s2rc, p)
     # Resolve overlap disagreements by posterior. Nothing to do when the overlap is
     # clean, so this costs nothing on the majority of pairs. Applies in the trim band
     # too: there R2's overlap copy is discarded, so folding its evidence into R1 is the
@@ -262,7 +245,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
             counters[0] += _nc
     lr = p.min_read_length
 
-    if direction != NO_OVERLAP and score >= p.t_merge:
+    if direction != NO_OVERLAP and score >= p.t_merge_q:
         # Enough evidence to assert the fragment: collapse to one read.
         seq, qual, n1, n2 = _build_merged(direction, shift, s1, q1, s2rc, q2, len1, len2)
         # fastp-style merged name: "<id> merged_<n1>_<n2>" (pair suffix stripped, tags
@@ -270,7 +253,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
         name = _strip_pair_suffix(h1) + b" merged_%d_%d" % (n1, n2)
         cand = [(name, seq, qual)]
         paired, outcome = False, PairOutcome.MERGED
-    elif direction == FORWARD and score >= p.t_trim and len2 - olen >= lr:
+    elif direction == FORWARD and score >= p.t_trim_q and len2 - olen >= lr:
         # Real overlap, but not enough evidence to risk a chimera: keep both reads and
         # trim the redundant ``olen`` bp off R2's 3' end so it is not counted twice.
         # R1 (full) + R2[:keep2] tile the fragment exactly once. Only R2's 3' end is
@@ -281,7 +264,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
     else:
         # No detectable overlap, an unmergeable read-through, or a trim blocked by the
         # guard: keep both reads exactly as they are.
-        if counters is not None and direction == FORWARD and score >= p.t_trim:
+        if counters is not None and direction == FORWARD and score >= p.t_trim_q:
             counters[1] += 1                                # trim guard fired
         cand = [(h1, s1, q1), (h2, s2, q2)]
         paired, outcome = True, PairOutcome.KEPT

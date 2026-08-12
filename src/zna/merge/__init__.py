@@ -38,16 +38,22 @@ __all__ = [
     "reverse_complement",
     "score_weights",
     "threshold_bits",
+    "SCALE",
+    "to_bits",
+    "to_q",
 ]
 
 _LAZY = {
-    "MergeParams": ".pairs",
+    "MergeParams": ".params",
     "PairOutcome": ".pairs",
     "process_pair": ".pairs",
     "find_overlap": ".overlap",
     "reverse_complement": ".overlap",
-    "score_weights": ".overlap",
-    "threshold_bits": ".overlap",
+    "score_weights": ".params",
+    "threshold_bits": ".params",
+    "SCALE": ".params",
+    "to_bits": ".params",
+    "to_q": ".params",
 }
 
 

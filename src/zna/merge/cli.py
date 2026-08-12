@@ -19,7 +19,8 @@ import time
 
 from .args import add_merge_arguments, add_merge_parser, build_parser  # noqa: F401
 from .fastqio import FastqWriter, InputError, read_pairs
-from .overlap import HAVE_NUMBA, score_weights, threshold_bits
+from .overlap import HAVE_NUMBA
+from .params import SCALE, score_weights, threshold_bits
 from .pairs import MergeParams, PairOutcome, base_name, process_pair
 
 logger = logging.getLogger("zna.merge")
@@ -288,6 +289,14 @@ def _assemble_stats(acc, params, elapsed=None):
             "match_bits": round(match_w, 4),
             "mismatch_bits": round(-mismatch_w, 4),
             "min_read_length": params.min_read_length,
+            # The exact integers the scan actually used. Recorded so a corpus can be
+            # audited against them rather than against a float that was re-derived
+            # somewhere else with a different libm. See zna/merge/params.py.
+            "score_scale": SCALE,
+            "match_q": params.match_q,
+            "step_q": params.step_q,
+            "threshold_merge_q": params.t_merge_q,
+            "threshold_trim_q": params.t_trim_q,
         },
         "length_histogram": {str(i): c for i, c in enumerate(hist) if c},
         # Detected overlap length per pair. This replaced a score histogram whose
@@ -305,7 +314,7 @@ def _assemble_stats(acc, params, elapsed=None):
         "insert_size_histogram": {str(i): c for i, c in enumerate(ihist) if c},
         "insert_size_censoring": {
             "floor": params.min_read_length,
-            "min_mergeable_overlap": int(-(-params.t_merge // match_w)),
+            "min_mergeable_overlap": -(-params.t_merge_q // params.match_q),
         },
     }
     if elapsed is not None:

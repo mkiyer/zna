@@ -20,9 +20,12 @@ import pytest
 
 from zna.merge.overlap import (
     FORWARD, HAVE_NUMBA, NO_OVERLAP, REVERSE, find_overlap, njit,
-    reverse_complement, score_weights, threshold_bits,
+    reverse_complement,
 )
-from zna.merge.pairs import MergeParams, PairOutcome, base_name, process_pair
+from zna.merge.params import (
+    SCALE, MergeParams, score_weights, threshold_bits, to_bits, to_q,
+)
+from zna.merge.pairs import PairOutcome, base_name, process_pair
 from zna.merge import cli
 
 
@@ -35,6 +38,11 @@ ADAPTER2 = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
 
 # Score weights at the default error rate, used to build exact expectations.
 MATCH_W, MISMATCH_W = score_weights(0.01)
+
+# The kernel scores in fixed point (zna/merge/params.py), so every expectation here is
+# an exact integer -- no pytest.approx, and no float anywhere near a decision.
+_P = MergeParams()
+T_MERGE_Q, T_TRIM_Q = _P.t_merge_q, _P.t_trim_q
 
 
 def rc(seq: bytes) -> bytes:
@@ -80,14 +88,20 @@ def mutate(seq: bytes, rng, err: float) -> bytes:
     return bytes(b)
 
 
-def score_of(matches: int, mismatches: int = 0) -> float:
+def score_of(matches: int, mismatches: int = 0) -> int:
+    """The exact fixed-point score of an overlap with these match/mismatch counts."""
+    return (matches + mismatches) * _P.match_q - mismatches * _P.step_q
+
+
+def score_bits(matches: int, mismatches: int = 0) -> float:
+    """The same score in bits, for the arithmetic tests that pin the weights."""
     return matches * MATCH_W - mismatches * MISMATCH_W
 
 
-def min_matches(threshold: float, mismatches: int) -> int:
-    """Fewest matching bases that reach `threshold` with `mismatches` mismatches."""
+def min_matches(threshold_q: int, mismatches: int) -> int:
+    """Fewest matching bases that reach `threshold_q` with `mismatches` mismatches."""
     m = 0
-    while score_of(m, mismatches) < threshold:
+    while score_of(m, mismatches) < threshold_q:
         m += 1
     return m
 
@@ -176,7 +190,7 @@ class TestScoreArithmetic:
         (28.0, [15, 18, 21, 24]),
     ])
     def test_matches_needed(self, threshold, expected):
-        assert [min_matches(threshold, d) for d in range(4)] == expected
+        assert [min_matches(to_q(threshold), d) for d in range(4)] == expected
 
     def test_threshold_is_derived_not_chosen(self):
         """T = log2(N / alpha) over N ~ 2*readlen shifts: 2x150 at alpha=1e-6 -> 28."""
@@ -192,7 +206,7 @@ class TestScoreArithmetic:
         r2[-1] = ord("A") if r2[-1] != ord("A") else ord("C")   # 1 mismatch in overlap
         direction, shift, olen, diff, score = find_overlap(r1, rc(bytes(r2)))
         assert (direction, shift, olen, diff) == (FORWARD, 20, 20, 1)
-        assert score == pytest.approx(score_of(19, 1))
+        assert score == score_of(19, 1)
 
     def test_four_perfect_bases_falls_just_under_the_trim_threshold(self):
         """4 matches = 7.94 bits, just below the 8-bit default; 5 = 9.93, above.
@@ -201,7 +215,134 @@ class TestScoreArithmetic:
         (1.9855, the value its own §5b arithmetic table requires) 4 bases fall 0.06
         bits short. Pinned so the boundary is a decision, not an accident.
         """
-        assert score_of(4) < 8.0 < score_of(5)
+        assert score_bits(4) < 8.0 < score_bits(5)
+        assert score_of(4) < T_TRIM_Q < score_of(5)      # ...and in fixed point too
+
+
+# --------------------------------------------------------------------------- #
+# the fixed-point scale, and the argmax total order
+# --------------------------------------------------------------------------- #
+
+class TestFixedPointScale:
+    """The score is computed in integers so the argmax is reproducible everywhere.
+
+    Two things have to hold for that to be worth anything: the integers must be the
+    same integers on every platform, and quantising must not move a decision.
+    """
+
+    def test_the_default_weights_are_exactly_these_integers(self):
+        """Pin them. They are derived from `log2`, which is not correctly rounded and
+        differs between libm implementations — so a platform where this fails would
+        silently produce a different corpus from the same FASTQ. Fail loudly instead."""
+        p = MergeParams()
+        assert (SCALE, p.match_q, p.step_q) == (1 << 24, 33_311_170, 137_813_407)
+        assert (p.t_merge_q, p.t_trim_q) == (469_762_048, 134_217_728)
+
+    def test_step_is_the_sum_of_the_two_quantised_weights(self):
+        """`score = n*match - d*step` and `score = (n-d)*match - d*mismatch` must agree,
+        which they only do if `step` is quantised as the sum rather than separately."""
+        p = MergeParams()
+        assert p.step_q == to_q(MATCH_W) + to_q(MISMATCH_W)
+        for n, d in ((40, 0), (40, 1), (150, 7), (19, 2)):
+            assert n * p.match_q - d * p.step_q == score_of(n - d, d)
+
+    def test_quantisation_flips_no_decision_over_the_reachable_domain(self):
+        """The §4 enumeration, as a test.
+
+        A decision flips only where the true float score sits within the quantisation
+        error of a threshold, and over integer (n, d) that is exhaustively checkable.
+        At SCALE = 2**24 the first disagreement is at an *overlap* of 32,830 bases; this
+        sweeps everything up to 4,000, which is an order of magnitude past any read the
+        tool will see. At 2**20 this test fails at n = 2,575, which is why the scale is
+        not 2**20.
+        """
+        p = MergeParams()
+        for threshold, tq in ((8.0, p.t_trim_q), (28.0, p.t_merge_q)):
+            for n in range(1, 4001):
+                # only d values that put the score anywhere near the threshold matter
+                lo = max(0, int((n * MATCH_W - threshold - 5) / (MATCH_W + MISMATCH_W)) - 1)
+                hi = min(n, int((n * MATCH_W - threshold + 5) / (MATCH_W + MISMATCH_W)) + 1)
+                for d in range(lo, hi + 1):
+                    exact = (n - d) * MATCH_W - d * MISMATCH_W
+                    quant = n * p.match_q - d * p.step_q
+                    assert (exact >= threshold) == (quant >= tq), (n, d, threshold)
+
+
+class TestArgmaxTotalOrder:
+    """`maximise score, then minimise s` — a specification, not an iteration artifact.
+
+    This is what lets a rewritten kernel be tested for byte-exact equality instead of
+    the weaker "returned *an* argmax". Random sequence essentially never ties, so the
+    ties here are built deliberately.
+    """
+
+    @staticmethod
+    def _exhaustive(s1, s2rc, floor_q):
+        """Every shift, no pruning, no early exit."""
+        out = []
+        for s in range(-(len(s2rc) - 1), len(s1)):
+            lo, hi = max(s, 0), min(len(s1), s + len(s2rc))
+            n = hi - lo
+            if n <= 0:
+                continue
+            off = lo - s
+            d = sum(s1[lo + k] != s2rc[off + k] for k in range(n))
+            sc = score_of(n - d, d)
+            if sc >= floor_q:
+                out.append((s, n, d, sc))
+        return out
+
+    def _check(self, s1, s2rc, label):
+        p = MergeParams()
+        direction, shift, olen, diff, score = find_overlap(s1, s2rc, p)
+        got = None if direction == NO_OVERLAP else (
+            (shift if direction == FORWARD else -shift), olen, diff)
+        allsc = self._exhaustive(s1, s2rc, p.t_trim_q)
+        if not allsc:
+            assert got is None, label
+            return 0
+        top = max(t[3] for t in allsc)
+        ties = [t for t in allsc if t[3] == top]
+        want = min(ties, key=lambda t: t[0])           # ...among ties, the smallest s
+        assert got == (want[0], want[1], want[2]), (label, got, want, len(ties))
+        assert score == top, label
+        return len(ties) - 1
+
+    def test_matches_an_unpruned_scan_on_real_reads(self):
+        rng = random.Random(9)
+        for i in range(300):
+            frag = draw(rng, rng.randrange(40, 110))
+            l1, l2 = rng.randrange(20, 60), rng.randrange(20, 60)
+            r1 = (frag + ADAPTER1 + draw(rng, 60))[:l1]
+            r2 = (rc(frag) + ADAPTER2 + draw(rng, 60))[:l2]
+            self._check(r1, rc(r2), f"real{i}")
+
+    def test_ties_are_broken_towards_the_smallest_shift(self):
+        """Periodic content on unequal-length mates makes the plateau tie exactly.
+
+        Without this the tie-break is untested: an earlier sweep over 7,000 random and
+        adversarial pairs produced *zero* ties and proved nothing about it.
+        """
+        tied = 0
+        for period in (b"CA", b"ACG", b"AT"):
+            for l1 in range(20, 46, 3):
+                for l2 in range(20, 46, 3):
+                    seq = period * 40
+                    tied += self._check(seq[:l1], seq[:l2], f"{period}-{l1}x{l2}")
+        assert tied >= 100, f"only {tied} ties exercised; the tie-break is untested"
+
+    def test_a_tie_across_different_overlap_lengths_is_unreachable(self):
+        """Why the rule needs no `n` key.
+
+        Two shifts tie iff `dn * match_q == dd * step_q`, whose minimal solution is
+        `dn = step_q / gcd(match_q, step_q)`. That gcd is 1, so `dn` would have to be
+        larger than any conceivable read — ties can only ever occur at equal `n`.
+        """
+        from math import gcd
+        for err in (0.001, 0.005, 0.01, 0.02, 0.05):
+            p = MergeParams(err_rate=err)
+            dn = p.step_q // gcd(p.match_q, p.step_q)
+            assert dn > 10_000_000, (err, dn)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +356,7 @@ class TestFindOverlap:
         direction, shift, olen, diff, score = find_overlap(r1, rc(r2))
         assert direction == FORWARD
         assert shift == 10 and olen == 20 and diff == 0
-        assert score == pytest.approx(score_of(20))
+        assert score == score_of(20)
 
     def test_full_overlap(self):
         frag = rand_seq(30, 2)          # insert == read len -> full overlap, shift 0
@@ -227,7 +368,7 @@ class TestFindOverlap:
         r1 = rand_seq(50, 3)
         r2 = rand_seq(50, 4)
         direction, _, _, _, score = find_overlap(r1, rc(r2))
-        assert direction == NO_OVERLAP and score == 0.0
+        assert direction == NO_OVERLAP and score == 0
 
     def test_mismatch_within_budget_is_accepted(self):
         frag = rand_seq(40, 5)
@@ -267,7 +408,7 @@ class TestFindOverlap:
             (_, r1, _), (_, r2, _) = make_pair(frag, 100)
             direction, shift, olen, _, score = find_overlap(r1, rc(r2))
             assert (direction, shift, olen) == (FORWARD, 60, 40)
-            assert score == pytest.approx(score_of(40))
+            assert score == score_of(40)
 
     def test_block_loop_sees_every_position(self):
         """Sweep a single mismatch across every position of a 40 bp overlap.
@@ -287,7 +428,7 @@ class TestFindOverlap:
             r1[i] = ord("A") if r1[i] != ord("A") else ord("C")
             direction, shift, olen, diff, score = find_overlap(bytes(r1), r2rc)
             assert (direction, shift, olen, diff) == (FORWARD, 0, 40, 1), i
-            assert score == pytest.approx(score_of(39, 1)), i
+            assert score == score_of(39, 1), i
 
     def test_unequal_read_lengths_need_no_special_case(self):
         """s is defined by the offset; the compared region is just the intersection."""
@@ -306,12 +447,12 @@ class TestDegenerateInputs:
         (b"", b"ACGTACGTAC"), (b"ACGTACGTAC", b""), (b"", b""), (b"A", b"T"),
     ])
     def test_no_overlap_and_no_crash(self, s1, s2):
-        assert find_overlap(s1, rc(s2)) == (NO_OVERLAP, 0, 0, 0, 0.0)
+        assert find_overlap(s1, rc(s2)) == (NO_OVERLAP, 0, 0, 0, 0)
 
     def test_empty_pair_is_kept_not_merged(self):
         recs, outcome, _d, score, _olen, _diff = process_pair(
             b"z/1", b"", b"", b"z/2", b"", b"", MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.KEPT and score == 0.0 and recs == []
+        assert outcome == PairOutcome.KEPT and score == 0 and recs == []
 
     def test_n_is_scored_as_an_ordinary_base(self):
         """N vs N counts as a 2-bit match — inherited from the old kernel and left
@@ -320,7 +461,7 @@ class TestDegenerateInputs:
         should stop earning evidence."""
         _d, _s, olen, diff, score = find_overlap(b"N" * 20 + b"ACGT" * 20,
                                                  rc(b"N" * 20 + b"ACGT" * 20))
-        assert diff == 0 and score == pytest.approx(score_of(olen))
+        assert diff == 0 and score == score_of(olen)
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +486,7 @@ class TestSpuriousDetection:
             direction, _, _, _, score = find_overlap(r1, rc(r2))
             if direction != NO_OVERLAP:
                 detected += 1
-                if score >= 28.0:
+                if score >= T_MERGE_Q:
                     merged += 1
         assert detected / n < 0.005, f"spurious detection {detected / n:.4%} (was 5.17%)"
         # A spurious *merge* is the expensive error — a chimera — and 28 bits prices
@@ -366,7 +507,7 @@ class TestSpuriousDetection:
             r1 = core1 + b"A" * 20                    # polyA tail on both mates
             r2 = core2 + b"A" * 20
             _d, _s, _o, _df, score = find_overlap(r1, rc(r2))
-            merged += score >= 28.0
+            merged += score >= T_MERGE_Q
         assert merged == 0
 
 
@@ -418,7 +559,7 @@ class TestDetection:
             frag = draw(rng, 200 - olen)
             (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 100)
             recs, outcome, _dropped, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-            assert score == pytest.approx(score_of(olen))
+            assert score == score_of(olen)
             assert (outcome == PairOutcome.MERGED) is want_merge
             if not want_merge:
                 assert outcome == PairOutcome.TRIMMED
@@ -478,7 +619,7 @@ class TestBoundaryInvariant:
         (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
         recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2,
                                                 MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED and 8.0 <= score < 28.0
+        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
         assert recs[0][1] + rc(recs[1][1]) == frag
         assert len(recs[1][1]) == len(recs[1][2])     # quality trimmed alongside
 
@@ -512,7 +653,7 @@ class TestTrimGuard:
         p = MergeParams(min_read_length=50)
         recs, outcome, dropped, score, _olen, _diff = process_pair(
             b"g/1", r1, qual(r1), b"g/2", r2, qual(r2), p, counters)
-        assert 8.0 <= score < 28.0
+        assert T_TRIM_Q <= score < T_MERGE_Q
         assert outcome == PairOutcome.KEPT
         assert [r[1] for r in recs] == [r1, r2]       # both intact, fragment not lost
         assert dropped == 0
@@ -560,7 +701,7 @@ class TestParityWithLegacyRule:
                                                          3, 3, 0.20)
                 new_dir, new_shift, _ol, _df, score = find_overlap(r1, r2rc)
                 assert (old_dir, old_shift) == (new_dir, new_shift) == (FORWARD, L - olen)
-                assert score >= 28.0
+                assert score >= T_MERGE_Q
 
     def test_legacy_rule_accepts_chance_four_mers_and_the_new_one_does_not(self):
         """Pins WHY the rules differ: same 20k unrelated pairs, 5.17% vs ~0.2%."""
@@ -688,7 +829,7 @@ class TestProcessPair:
         frag = rand_seq(48, 13)
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
         recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.TRIMMED and 8.0 <= score < 28.0
+        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
         assert len(recs) == 2
         r1_out, r2_out = recs[0], recs[1]
         assert r1_out[1] == s1 and r1_out[0] == h1                 # R1 full, /1 kept
@@ -712,7 +853,7 @@ class TestProcessPair:
         recs, outcome, _d, score, _olen, _diff = process_pair(b"m/1", r1, qual(r1), b"m/2", r2, qual(r2),
                                                 MergeParams(min_read_length=1))
         assert outcome == PairOutcome.TRIMMED
-        assert score == pytest.approx(score_of(17, 2))
+        assert score == score_of(17, 2)
         assert len(recs[1][1]) == L - 19                    # ALL 19 overlap bp trimmed off R2
         assert r1 + rc(recs[1][1]) == frag                  # clean tail retained; tiles once
 
@@ -735,7 +876,7 @@ class TestProcessPair:
         s2 = rand_seq(50, 15)
         h1, h2 = b"x/1", b"x/2"
         recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, qual(s1), h2, s2, qual(s2), P)
-        assert outcome == PairOutcome.KEPT and score == 0.0
+        assert outcome == PairOutcome.KEPT and score == 0
         assert [r[1] for r in recs] == [s1, s2]
         assert [r[0] for r in recs] == [h1, h2]                    # /1,/2 preserved
 
@@ -879,10 +1020,10 @@ class TestProperty:
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, L)
         recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
         overlap = 2 * L - insert
-        if overlap >= min_matches(28.0, 0):     # 15 clean bases reach the merge threshold
+        if overlap >= min_matches(T_MERGE_Q, 0):  # 15 clean bases reach the merge threshold
             assert outcome == PairOutcome.MERGED
             assert recs[0][1] == frag           # reconstructs the molecule
-        elif overlap >= min_matches(8.0, 0):    # 5..14 -> trim band
+        elif overlap >= min_matches(T_TRIM_Q, 0):  # 5..14 -> trim band
             assert outcome == PairOutcome.TRIMMED
             r1_out, r2_out = recs[0], recs[1]
             assert r1_out[1] + rc(r2_out[1]) == frag       # tile exactly once
