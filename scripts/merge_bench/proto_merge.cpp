@@ -14,6 +14,11 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#  include <arm_neon.h>
+#else
+#  include <immintrin.h>
+#endif
 
 // --------------------------------------------------------------------------- params
 static const int64_t SCALE = 1 << 24;
@@ -121,6 +126,34 @@ static inline int64_t sc_packed(const uint64_t* p1, const uint64_t* p2,
     if (d > dmax) return INT64_MIN;
     *out_d = (int)d; return ceiling - d * STEP;
 }
+
+static inline int neq16(const uint8_t* a, const uint8_t* b) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    uint8x16_t eq = vceqq_u8(vld1q_u8(a), vld1q_u8(b));
+    return 16 - (int)vaddvq_u8(vandq_u8(eq, vdupq_n_u8(1)));
+#else
+    __m128i va = _mm_loadu_si128((const __m128i*)a);
+    __m128i vb = _mm_loadu_si128((const __m128i*)b);
+    return 16 - __builtin_popcount((unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(va, vb)));
+#endif
+}
+static inline int64_t sc_simd(const uint8_t* s1, const uint8_t* s2rc,
+                              int s, int n, int64_t best, int* out_d) {
+    const int64_t ceiling = (int64_t)n * M_W;
+    if (ceiling <= best) return INT64_MIN;
+    const int64_t dmax = (ceiling - best - 1) / STEP;
+    const uint8_t* a = s1   + (s > 0 ?  s : 0);
+    const uint8_t* b = s2rc + (s < 0 ? -s : 0);
+    int64_t d = 0; int k = 0;
+    for (; k + 32 <= n; k += 32) {
+        d += neq16(a + k, b + k) + neq16(a + k + 16, b + k + 16);
+        if (d > dmax) return INT64_MIN;
+    }
+    for (; k < n; ++k) d += (a[k] != b[k]);
+    if (d > dmax) return INT64_MIN;
+    *out_d = (int)d; return ceiling - d * STEP;
+}
+
 /// exact byte semantics, for reads carrying non-ACGT
 static inline int64_t sc_bytes(const uint8_t* s1, const uint8_t* s2rc,
                                int s, int n, int64_t best, int* out_d) {
@@ -146,7 +179,8 @@ static Res scan(const uint8_t* s1, int len1, const uint8_t* s2rc, int len2,
     int64_t best = FLOOR_Q - 1;
     int best_s = 0, best_n = 0, best_d = 0;
     auto one = [&](int s, int n, int* dd) -> int64_t {
-        return packed ? sc_packed(p1,p2,s,n,best,dd) : sc_bytes(s1,s2rc,s,n,best,dd);
+        (void)packed; (void)p1; (void)p2;
+        return sc_simd(s1, s2rc, s, n, best, dd);
     };
     const int plo = (len1 >= len2) ? 0 : len1 - len2;
     const int phi = (len1 >= len2) ? len1 - len2 : 0;
