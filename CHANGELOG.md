@@ -39,6 +39,26 @@ Two fixes found by reviewing the pipelines that write and read ZNA files
   a single zstd frame holding all four columns — it avoids unpacking them into
   Python objects, which is where the cost is.
 
+### Packaging
+- **CPython 3.14 wheels are now built.** `CIBW_BUILD` had listed `cp314-*` since
+  0.3.3, but the workflow pinned `pypa/cibuildwheel@v2.23`, which predates 3.14
+  entirely — the entry matched nothing and was silently dropped, so 0.3.3 and
+  0.3.4 shipped no cp314 wheels despite asking for them. Verified: cibuildwheel
+  2.23.3 selects cp310-cp313 for this project, 4.2.0 selects cp310-cp314.
+- **The manylinux baseline is pinned to `manylinux2014`.** cibuildwheel 3.0
+  changed the default image to `manylinux_2_28`, which would have raised the
+  glibc floor from 2.17 to 2.28 and dropped RHEL/CentOS 7-era HPC clusters as a
+  side effect of adding 3.14. `manylinux2014` still builds 3.14, and `zstandard`
+  — zna's own runtime dependency — publishes its cp314 wheel as
+  `manylinux_2_17`, so taking the new default would have made zna harder to
+  install than the package it depends on.
+- **Wheels are now smoke-tested before publication.** They were previously
+  uploaded without ever being imported. `scripts/wheel_smoketest.py` runs as
+  `CIBW_TEST_COMMAND` on every wheel: it asserts the compiled extension actually
+  loaded (a wheel that silently falls back to the pure-Python backend is a
+  broken wheel) and exercises `records()`, `blocks()` with and without labels,
+  `block_index()`, `restore_strand`, and the N-policy error path.
+
 ### Fixed (latent)
 - `blocks()` split the block payload as `flags | lengths | sequences`, which is
   only correct without labels. It never ran on a labeled file because of the

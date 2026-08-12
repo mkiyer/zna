@@ -17,15 +17,30 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Build wheels
-      uses: pypa/cibuildwheel@v2.23
+      # v2.23 predates CPython 3.14 entirely, so the cp314-* entry below matched
+      # nothing and was silently dropped -- 0.3.3 and 0.3.4 shipped no cp314
+      # wheels despite asking for them. cibuildwheel builds 3.14 by default from
+      # 3.1.0 onward.
+      uses: pypa/cibuildwheel@v4.2
       env:
         CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
         CIBW_SKIP: "*-musllinux_*"
         CIBW_ARCHS_MACOS: "x86_64 arm64"
         CIBW_ARCHS_LINUX: "x86_64"
         CIBW_ARCHS_WINDOWS: "AMD64"
+        # cibuildwheel 3.0 changed the default manylinux image from manylinux2014
+        # to manylinux_2_28, which would raise the glibc floor from 2.17 to 2.28
+        # and drop RHEL/CentOS 7-era HPC clusters. Pin the old baseline: it still
+        # builds 3.14, and zstandard -- our own runtime dependency -- publishes
+        # cp314 as manylinux_2_17, so defaulting to 2_28 would make zna harder to
+        # install than the thing it depends on.
+        CIBW_MANYLINUX_X86_64_IMAGE: "manylinux2014"
         # macOS 11.0+ required for macos-14 runner
         MACOSX_DEPLOYMENT_TARGET: "11.0"
+        # Wheels were previously published without ever being imported. This
+        # loads the compiled extension on the interpreter the wheel claims and
+        # exercises records()/blocks()/block_index() before anything is uploaded.
+        CIBW_TEST_COMMAND: "python {project}/scripts/wheel_smoketest.py"
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
