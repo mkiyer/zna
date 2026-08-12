@@ -126,8 +126,26 @@ _ENDS_BY_FLAG = tuple(
 
 def _flags_from_ends(has_start: bool, has_end: bool) -> tuple[bool, bool]:
     """Inverse of :func:`_ends_from_flags` — the mapping is a bijection over the
-    three reachable states, so ``(has_start, has_end)`` round-trips losslessly."""
+    three reachable states, so ``(has_start, has_end)`` round-trips losslessly.
+
+    This is the readable reference form.  The write loops that run it on every
+    record index :data:`_RC_FULL_BY_ENDS` or :data:`_FLAG_BITS_BY_ENDS` instead,
+    to avoid a Python call frame per record; the tables are generated from this
+    function below, so the three cannot drift apart.
+    """
     return (bool(has_end) and not has_start), (bool(has_start) and bool(has_end))
+
+
+#: ``(has_start << 1 | has_end) -> (is_rc, is_full_fragment)``.
+_RC_FULL_BY_ENDS = tuple(
+    _flags_from_ends(bool(i & 2), bool(i & 1)) for i in range(4)
+)
+
+#: ``(has_start << 1 | has_end) -> IS_RC|IS_FULL_FRAGMENT flag bits``, for the
+#: write paths that want the packed byte rather than the pair.
+_FLAG_BITS_BY_ENDS = tuple(
+    (8 if is_rc else 0) | (16 if is_full else 0) for is_rc, is_full in _RC_FULL_BY_ENDS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +411,16 @@ class ZnaWriter:
             # accepting it would clear every IS_RC bit and lose the orientation
             # silently.
             require_rc = self._header.strand_normalized
+            flag_bits_by_ends = _FLAG_BITS_BY_ENDS
             for rec in records:
                 seq = rec[0]
                 is_paired = rec[1]
                 is_read1 = rec[2]
                 n_fields = len(rec)
                 if n_fields > 5:
-                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
-                    rc_bit = (8 if is_rc else 0) | (16 if is_full else 0)
+                    rc_bit = flag_bits_by_ends[
+                        (2 if rec[4] else 0) | (1 if rec[5] else 0)
+                    ]
                 elif n_fields > 4:
                     rc_bit = 8 if rec[4] else 0
                 elif require_rc:

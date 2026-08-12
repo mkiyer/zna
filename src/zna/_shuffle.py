@@ -30,7 +30,7 @@ import sys
 import tempfile
 from typing import List, Tuple
 
-from .core import ZnaHeader, ZnaWriter, ZnaReader, _flags_from_ends
+from .core import ZnaHeader, ZnaWriter, ZnaReader, _RC_FULL_BY_ENDS
 
 
 # Type alias for a single record tuple (without or with labels).
@@ -129,6 +129,9 @@ def shuffle_zna(
     )
 
     has_labels = len(in_header.labels) > 0
+    # Bound once: both write passes below index this per record, and a global
+    # lookup plus a function call per record is what it replaces.
+    rc_full_by_ends = _RC_FULL_BY_ENDS
 
     with tempfile.TemporaryDirectory(dir=tmp_dir, prefix="zna_shuffle_") as tmp_path:
         bucket_paths = [
@@ -152,7 +155,9 @@ def shuffle_zna(
                     is_paired = rec[1]
                     is_read1 = rec[2]
                     is_read2 = rec[3]
-                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
+                    is_rc, is_full = rc_full_by_ends[
+                        (2 if rec[4] else 0) | (1 if rec[5] else 0)
+                    ]
                     labels = rec[6] if has_labels else None
 
                     if is_paired and is_read1:
@@ -259,7 +264,9 @@ def shuffle_zna(
                             is_paired = rec[1]
                             is_read1 = rec[2]
                             is_read2 = rec[3]
-                            is_rc, is_full = _flags_from_ends(rec[4], rec[5])
+                            is_rc, is_full = rc_full_by_ends[
+                                (2 if rec[4] else 0) | (1 if rec[5] else 0)
+                            ]
                             if has_labels:
                                 labels = rec[6]
                                 out_writer.write_record(

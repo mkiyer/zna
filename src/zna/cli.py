@@ -17,7 +17,7 @@ from .core import (
     _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
     ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
-    _flags_from_ends,
+    _flags_from_ends, _RC_FULL_BY_ENDS,
 )
 from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
 from ._shuffle import shuffle_zna
@@ -110,6 +110,39 @@ def get_read_suffix_number(full_name: str) -> int:
     return 0
 
 
+def _read_key(raw_header: bytes) -> Tuple[bytes, int]:
+    """``(base_name, suffix_number)`` from a raw FASTQ header line, as bytes.
+
+    The bytes-native equivalent of ``get_base_name`` + ``get_read_suffix_number``,
+    computed in one pass and without decoding.  Those two helpers each ran
+    ``full_name.split()[0]``, which tokenizes the *entire* header — comments and
+    all — and they ran twice per record between them, on a string that had
+    already been decoded from ASCII for no other reason.
+
+    *base_name* is the ID up to the first whitespace with any ``/suffix``
+    removed; *suffix_number* is 1 for ``/1``, 2 for ``/2``, else 0.
+    """
+    sp = raw_header.find(b" ")
+    tab = raw_header.find(b"\t")
+    if sp < 0:
+        end = tab
+    elif tab < 0:
+        end = sp
+    else:
+        end = sp if sp < tab else tab
+    read_id = raw_header if end < 0 else raw_header[:end]
+
+    slash = read_id.rfind(b"/")
+    if slash < 0:
+        return read_id, 0
+    suffix = read_id[slash + 1:]
+    if suffix == b"1":
+        return read_id[:slash], 1
+    if suffix == b"2":
+        return read_id[:slash], 2
+    return read_id[:slash], 0
+
+
 def parse_fastq(fh: BinaryIO) -> Iterator[str]:
     """Yields sequence only from FASTQ stream.
     
@@ -169,6 +202,41 @@ def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
             if end > 0 and seq_line[end-1] == 13:
                 end -= 1
             yield read_name, seq_line[:end].decode('ascii')
+
+
+def parse_fastq_keyed(fh: BinaryIO) -> Iterator[Tuple[bytes, int, str]]:
+    """Yields ``(base_name_bytes, suffix_number, sequence)`` from FASTQ.
+
+    The pairing rule only ever compares base names for equality and reads the
+    ``/1``,``/2`` suffix, so neither needs to be a ``str``.  Producing the key
+    here — once, from the raw header bytes — keeps the interleaved path from
+    decoding a name it never prints and re-deriving it per comparison.
+    """
+    readline = fh.readline
+    while True:
+        header = readline()
+        if not header:
+            break
+        if header[0] != 64:  # ord('@')
+            continue
+        end = len(header)
+        if end > 1 and header[-1] == 10:  # \n
+            end -= 1
+        if end > 1 and header[end - 1] == 13:  # \r
+            end -= 1
+        base, suffix = _read_key(header[1:end])
+
+        seq_line = readline()
+        readline()  # + line
+        readline()  # quality line
+
+        if seq_line:
+            end = len(seq_line)
+            if end > 0 and seq_line[-1] == 10:
+                end -= 1
+            if end > 0 and seq_line[end - 1] == 13:
+                end -= 1
+            yield base, suffix, seq_line[:end].decode('ascii')
 
 
 def parse_fastq_with_headers(fh: BinaryIO) -> Iterator[Tuple[bytes, str]]:
@@ -638,8 +706,15 @@ def _stream_paired_files(f1: BinaryIO, f2: BinaryIO,
         yield s2, True, False, True
 
 
+def _describe_read(base: bytes, suffix: int) -> str:
+    """Render a keyed read name for a warning message."""
+    name = base.decode('ascii', errors='replace')
+    return f"{name}/{suffix}" if suffix else name
+
+
 def _pair_interleaved(records) -> Iterator[Tuple[object, bool, bool, bool]]:
-    """Assign pairing flags to an interleaved stream of ``(read_name, payload)``.
+    """Assign pairing flags to an interleaved stream of
+    ``(base_name, suffix_number, payload)``.
 
     Consecutive records whose base names match are emitted as an R1/R2 pair;
     a record whose neighbour has a different base name is a single (e.g. a
@@ -649,34 +724,43 @@ def _pair_interleaved(records) -> Iterator[Tuple[object, bool, bool, bool]]:
     the sequence for unlabeled input, or ``(sequence, labels)`` for labeled —
     so that labeled and unlabeled encoding share one implementation of the
     pairing rule instead of drifting apart.
+
+    The base name and suffix arrive pre-computed (see :func:`_read_key`) because
+    this comparison is the whole per-record cost of interleaved input: deriving
+    them here meant tokenizing each header twice and decoding a name that is only
+    ever compared, never printed.
     """
-    prev = None
-    for name, payload in records:
-        if prev is None:
-            prev = (name, payload)
+    prev_base = None
+    prev_suffix = 0
+    prev_payload = None
+    have_prev = False
+
+    for base, suffix, payload in records:
+        if not have_prev:
+            prev_base, prev_suffix, prev_payload = base, suffix, payload
+            have_prev = True
             continue
 
-        prev_name, prev_payload = prev
-
-        if get_base_name(prev_name) == get_base_name(name):
-            n1 = get_read_suffix_number(prev_name)
-            n2 = get_read_suffix_number(name)
-
-            if n1 == 2:
-                print(f"[Warning] Found Read 2 before Read 1: {prev_name} -> {name}", file=sys.stderr)
-            if n2 == 1:
-                print(f"[Warning] Found Read 1 after Read 1: {prev_name} -> {name}", file=sys.stderr)
+        if prev_base == base:
+            if prev_suffix == 2:
+                print(f"[Warning] Found Read 2 before Read 1: "
+                      f"{_describe_read(prev_base, prev_suffix)} -> "
+                      f"{_describe_read(base, suffix)}", file=sys.stderr)
+            if suffix == 1:
+                print(f"[Warning] Found Read 1 after Read 1: "
+                      f"{_describe_read(prev_base, prev_suffix)} -> "
+                      f"{_describe_read(base, suffix)}", file=sys.stderr)
 
             yield prev_payload, True, True, False   # R1
             yield payload, True, False, True        # R2
-            prev = None
+            have_prev = False
         else:
             # prev was a singleton (single-end or merged read)
             yield prev_payload, False, False, False
-            prev = (name, payload)
+            prev_base, prev_suffix, prev_payload = base, suffix, payload
 
-    if prev is not None:
-        yield prev[1], False, False, False
+    if have_prev:
+        yield prev_payload, False, False, False
 
 
 def _stream_interleaved_fastq(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
@@ -686,7 +770,7 @@ def _stream_interleaved_fastq(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bo
     unlabeled input the payload *is* the sequence, so the shapes already match and
     a wrapper layer would cost a generator resume per record.
     """
-    return _pair_interleaved(parse_fastq_with_names(f))
+    return _pair_interleaved(parse_fastq_keyed(f))
 
 
 def _stream_interleaved_fasta(f: BinaryIO) -> Iterator[Tuple[str, bool, bool, bool]]:
@@ -880,11 +964,15 @@ def _labeled_seqs(f: BinaryIO, extract) -> Iterator[Tuple[str, tuple]]:
         yield seq, extract(raw_header)
 
 
-def _labeled_named(f: BinaryIO, extract) -> Iterator[Tuple[str, Tuple[str, tuple]]]:
-    """Yield ``(read_name, (sequence, labels))`` — for interleaved pairing only."""
+def _labeled_named(f: BinaryIO, extract) -> Iterator[Tuple[bytes, int, Tuple[str, tuple]]]:
+    """Yield ``(base_name, suffix_number, (sequence, labels))``.
+
+    For interleaved pairing only, and keyed the same way as
+    :func:`parse_fastq_keyed` so both feed one :func:`_pair_interleaved`.
+    """
     for raw_header, seq in parse_fastq_with_headers(f):
-        name = raw_header.split(None, 1)[0].decode('ascii') if raw_header else ""
-        yield name, (seq, extract(raw_header))
+        base, suffix = _read_key(raw_header)
+        yield base, suffix, (seq, extract(raw_header))
 
 
 def stream_inputs_labeled(
@@ -1136,28 +1224,63 @@ def encode_command(args):
         else:
             stream = stream_inputs(args)
 
-        for unit in _fragment_units(stream):
-            if drop_n and any('N' in rec[0].upper() for rec in unit):
-                continue
-            if preserve_normalization:
-                # Orientation and fragment span are copied from the source.
-                for rec in unit:
-                    is_rc, is_full = _flags_from_ends(rec[4], rec[5])
-                    writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                        is_rc=is_rc, is_full_fragment=is_full)
-            else:
-                full = _full_fragment_flags(unit, treat_unpaired_as_merged)
+        # Single-end input can never yield a paired record: only two-file,
+        # interleaved, and ZNA re-encode modes set IS_PAIRED.  Fragment grouping
+        # would then wrap every record in its own one-element list — a generator
+        # resume and a list allocation per read — to decide something already
+        # known, and every full-fragment decision would return the same constant.
+        single_end_input = not (len(files) == 2
+                                or getattr(args, 'interleaved', False)
+                                or is_reencoding)
+        show_progress = not is_stdout and not quiet
+
+        if single_end_input:
+            is_full = treat_unpaired_as_merged
+            write_record = writer.write_record
+            for rec in stream:
+                seq = rec[0]
+                # Membership on the sequence itself: the old test uppercased a
+                # copy of every read (150 bytes each) purely to look for one
+                # character.
+                if drop_n and ('N' in seq or 'n' in seq):
+                    continue
                 if label_defs:
-                    for rec, is_full in zip(unit, full):
-                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                            labels=rec[4], is_full_fragment=is_full)
+                    write_record(seq, rec[1], rec[2], rec[3],
+                                 labels=rec[4], is_full_fragment=is_full)
                 else:
-                    for rec, is_full in zip(unit, full):
+                    write_record(seq, rec[1], rec[2], rec[3],
+                                 is_full_fragment=is_full)
+                count += 1
+                if show_progress and count % 1_000_000 == 0:
+                    print(f"      Processed {count//1_000_000}M records...",
+                          end='\r', file=sys.stderr)
+        else:
+            for unit in _fragment_units(stream):
+                if drop_n and any(('N' in rec[0] or 'n' in rec[0]) for rec in unit):
+                    continue
+                if preserve_normalization:
+                    # Orientation and fragment span are copied from the source.
+                    for rec in unit:
+                        is_rc, is_full = _RC_FULL_BY_ENDS[
+                            (2 if rec[4] else 0) | (1 if rec[5] else 0)
+                        ]
                         writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                            is_full_fragment=is_full)
-            count += len(unit)
-            if count % 1_000_000 < len(unit) and count >= 1_000_000 and not is_stdout and not quiet:
-                print(f"      Processed {count//1_000_000}M records...", end='\r', file=sys.stderr)
+                                            is_rc=is_rc, is_full_fragment=is_full)
+                else:
+                    full = _full_fragment_flags(unit, treat_unpaired_as_merged)
+                    if label_defs:
+                        for rec, is_full in zip(unit, full):
+                            writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                                labels=rec[4], is_full_fragment=is_full)
+                    else:
+                        for rec, is_full in zip(unit, full):
+                            writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                                is_full_fragment=is_full)
+                count += len(unit)
+                if (count % 1_000_000 < len(unit) and count >= 1_000_000
+                        and show_progress):
+                    print(f"      Processed {count//1_000_000}M records...",
+                          end='\r', file=sys.stderr)
 
     # ── Optional shuffle pass ─────────────────────────────────────────
     if getattr(args, 'shuffle', False) and not is_stdout:

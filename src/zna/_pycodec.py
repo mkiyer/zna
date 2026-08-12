@@ -57,6 +57,20 @@ def encode_sequence(seq: str) -> bytes:
     mapped = bseq.translate(_TRANS_TABLE)
     length = len(mapped)
 
+    # Validate the whole sequence up front, in one C-level scan.
+    #
+    # This replaces a per-group ``val > 255`` test applied *after* OR-ing the
+    # four 2-bit values together.  That test silently missed an invalid base in
+    # the last slot of a group: 255 there ORs to exactly 255 and never exceeds
+    # it, so the group was packed as 0xFF and decoded back as "TTTT" — losing
+    # the three valid bases alongside it.  Every character at an index
+    # congruent to 3 mod 4 was affected, which includes the IUPAC ambiguity
+    # codes that occur in real FASTQ.  Checking once here is both correct and
+    # cheaper than checking per group, and it leaves the packing loops
+    # branch-free.
+    if 255 in mapped:
+        raise ValueError("Invalid character in sequence")
+
     out = bytearray((length + 3) // 4)
 
     i = 0
@@ -64,11 +78,10 @@ def encode_sequence(seq: str) -> bytes:
     full_chunks = length // 4
 
     while idx < full_chunks:
-        val = (mapped[i] << 6) | (mapped[i + 1] << 4) | (mapped[i + 2] << 2) | mapped[i + 3]
-        if val > 255:
-            # One of the mapped values was 255 (invalid character)
-            raise ValueError("Invalid character in sequence")
-        out[idx] = val
+        out[idx] = (
+            (mapped[i] << 6) | (mapped[i + 1] << 4)
+            | (mapped[i + 2] << 2) | mapped[i + 3]
+        )
         idx += 1
         i += 4
 
@@ -76,8 +89,6 @@ def encode_sequence(seq: str) -> bytes:
         val = 0
         shift = 6
         while i < length:
-            if mapped[i] == 255:
-                raise ValueError("Invalid character in sequence")
             val |= mapped[i] << shift
             i += 1
             shift -= 2
