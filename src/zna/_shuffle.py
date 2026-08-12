@@ -26,17 +26,72 @@ from __future__ import annotations
 
 import os
 import random
+import struct
 import sys
 import tempfile
 from dataclasses import replace
 from typing import List, Tuple
 
+import zstandard
+
 from .core import (
     COMPRESSION_ZSTD, ZnaHeader, ZnaWriter, ZnaReader, _RC_FULL_BY_ENDS,
+    _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
 )
 
 #: ZSTD level for the throwaway bucket files.  They exist for one read.
 BUCKET_ZSTD_LEVEL = 1
+
+#: ``flag byte -> 1 if the record starts a shuffle unit``.  A unit is an unpaired
+#: record or a paired R1; a paired R2 continues the unit its R1 opened.
+_IS_UNIT_START = bytes(
+    0 if (f & 0x05) == 0x04 else 1 for f in range(256)
+)
+
+
+def _scan_counts(fh, header) -> Tuple[int, int]:
+    """Return ``(n_units, n_records)`` without decoding a single base.
+
+    *fh* must be positioned at the first block.
+
+    The counting pass only needs each record's flag byte.  Flags are the first
+    column in the block payload, and a zstd frame can be read as a prefix, so
+    this decompresses ``flags_size`` bytes per block and stops — rather than
+    inflating the whole payload and building a Python string and tuple for every
+    record just to look at three bits of each.  Record counts come free from the
+    block headers.
+
+    Translating the flag column through a 256-entry table and counting the
+    result keeps the per-record work in C as well.
+    """
+    dctx = (zstandard.ZstdDecompressor()
+            if header.compression_method == COMPRESSION_ZSTD else None)
+    n_units = 0
+    n_records = 0
+
+    while True:
+        block_header = fh.read(_BLOCK_HEADER_SIZE)
+        if not block_header or len(block_header) < _BLOCK_HEADER_SIZE:
+            break
+        comp_size, _uncomp_size, count, flags_size, _lengths_size = struct.unpack(
+            _BLOCK_HEADER_FMT, block_header
+        )
+        n_records += count
+
+        if dctx is not None:
+            payload = fh.read(comp_size)
+            if len(payload) != comp_size:
+                raise EOFError("Unexpected EOF while scanning ZNA blocks")
+            flags = dctx.stream_reader(payload).read(flags_size)
+        else:
+            flags = fh.read(flags_size)
+            fh.seek(comp_size - flags_size, 1)
+
+        if len(flags) != flags_size:
+            raise EOFError("Unexpected EOF while reading a block's flags column")
+        n_units += flags.translate(_IS_UNIT_START).count(1)
+
+    return n_units, n_records
 
 
 # Type alias for a single record tuple (without or with labels).
@@ -87,15 +142,8 @@ def shuffle_zna(
     with open(input_path, "rb") as f:
         reader = ZnaReader(f)
         in_header = reader.header
-
-        n_units = 0
-        n_records = 0
-        for rec in reader.records():
-            n_records += 1
-            is_paired = rec[1]
-            is_read1 = rec[2]
-            if not (is_paired and not is_read1):
-                n_units += 1
+        # ZnaReader has consumed exactly the file header, so f is at block 0.
+        n_units, n_records = _scan_counts(f, in_header)
 
     if n_units == 0:
         raise ValueError("Input file contains no records.")

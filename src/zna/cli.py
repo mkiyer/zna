@@ -3,6 +3,7 @@ import argparse
 import gzip
 import io
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -31,8 +32,85 @@ except (ImportError, AttributeError):
     pass
 
 
-#: Read-ahead placed in front of gzip input; see :func:`get_input_handle`.
+#: Read-ahead in front of the gzip *module*, whose own readline buffer is small.
 _GZIP_READ_BUFFER = 1 << 20
+
+#: Read-ahead in front of a decompressor pipe.  Measured flat from 32 KiB to
+#: 1 MiB, so this just matches what subprocess would have chosen.
+_PIPE_READ_BUFFER = io.DEFAULT_BUFFER_SIZE
+
+#: External decompressors to try, fastest first.  ``pigz`` is multithreaded.
+_GUNZIP_COMMANDS = (("pigz", "-dc"), ("gzip", "-dc"))
+
+
+class _DecompressPipe(io.BufferedReader):
+    """A read stream fed by an external decompressor.
+
+    :meth:`close` reaps the child and checks its exit status.  That check is the
+    whole reason this exists rather than handing back ``proc.stdout`` directly:
+    a truncated or corrupt ``.gz`` makes the decompressor emit a partial stream
+    and *then* exit non-zero.  Without the check that is indistinguishable from
+    a short input file, and ``zna encode`` would write a silently truncated ZNA
+    and report success.
+
+    The check is not free.  CPython's buffered ``readline`` has a fast path that
+    applies only to an exact ``BufferedReader``, so subclassing costs about 18%
+    of the read (93 ms against 79 ms on 300k records).  Interposing a
+    ``RawIOBase`` below an exact ``BufferedReader`` was measured too, on the
+    theory that a per-buffer-fill ``readinto`` would be cheaper than a
+    per-``readline`` slow path; it is worse, at 114 ms.  So: subclass, and pay
+    18% of a 2.3x win for not silently truncating people's data.
+    """
+
+    def __init__(self, proc, path, buffer_size=None):
+        super().__init__(proc.stdout, buffer_size or _PIPE_READ_BUFFER)
+        self._proc = proc
+        self._path = path
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            super().close()
+        finally:
+            # Reap the child however the close above went, so a failure here can
+            # never leave the process behind.
+            returncode = self._proc.wait()
+        # A negative code is a signal.  SIGPIPE means *we* stopped reading early
+        # (a downstream `head`, a BrokenPipeError), not a decompression failure.
+        if returncode not in (0, -13):
+            raise OSError(
+                f"Decompressing {self._path} failed: "
+                f"{' '.join(self._proc.args)} exited with {returncode}. "
+                f"The file may be truncated or corrupt."
+            )
+
+
+def _open_gzip(filepath: str):
+    """Open a gzip file for reading, preferring an external decompressor.
+
+    Handing decompression to a separate process lets it run in parallel with
+    Python's parsing instead of competing with it for the GIL; measured ~2.75x
+    over the ``gzip`` module on 300k records.  ``pigz`` is tried first because it
+    threads the decompression too.
+
+    Falls back to the ``gzip`` module when no external tool is present, and
+    ``ZNA_NO_EXTERNAL_GZIP=1`` forces that path for debugging.
+    """
+    if not os.environ.get("ZNA_NO_EXTERNAL_GZIP"):
+        for cmd in _GUNZIP_COMMANDS:
+            try:
+                proc = subprocess.Popen(
+                    [*cmd, filepath], stdout=subprocess.PIPE, bufsize=0,
+                )
+            except OSError:
+                # No such binary, or it is not executable — try the next one.
+                continue
+            return _DecompressPipe(proc, filepath)
+    # A FASTQ record is four readline calls, and GzipFile serves each from its
+    # own modest internal buffer; a wide BufferedReader in front amortises that
+    # across many records instead of paying it per line.
+    return io.BufferedReader(gzip.open(filepath, "rb"), buffer_size=_GZIP_READ_BUFFER)
 
 
 def parse_block_size(value) -> int:
@@ -68,10 +146,7 @@ def get_input_handle(filepath: Optional[str]) -> BinaryIO:
     if filepath is None or filepath == "-":
         return sys.stdin.buffer
     if filepath.endswith(".gz"):
-        # A FASTQ record is four readline calls, and GzipFile serves each from
-        # its own modest internal buffer.  A wide BufferedReader in front
-        # amortises that across many records instead of paying it per line.
-        return io.BufferedReader(gzip.open(filepath, "rb"), buffer_size=_GZIP_READ_BUFFER)
+        return _open_gzip(filepath)
     return open(filepath, "rb")
 
 def get_output_handle(filepath: Optional[str]) -> BinaryIO:
@@ -1373,15 +1448,14 @@ def decode_command(args):
                         else:
                             tag_parts.append(f"{ldef.name}:i:{val}")
                     tag_str = "\t".join(tag_parts)
-                    header_str = f">{rg}:{counter}{suffix}\t{tag_str}"
+                    # One f-string, not a header f-string interpolated into a
+                    # second one: this runs on every record.
+                    record = f">{rg}:{counter}{suffix}\t{tag_str}\n{seq}\n"
 
-                    if mode == "split":
-                        if is_r2:
-                            outs[1].write(f"{header_str}\n{seq}\n")
-                        else:
-                            outs[0].write(f"{header_str}\n{seq}\n")
+                    if mode == "split" and is_r2:
+                        outs[1].write(record)
                     else:
-                        outs[0].write(f"{header_str}\n{seq}\n")
+                        outs[0].write(record)
             else:
                 for rec in reader.records(restore_strand=restore_strand):
                     if has_labels:
@@ -1393,15 +1467,12 @@ def decode_command(args):
                     suffix = ""
                     if is_r1: suffix = "/1"
                     elif is_r2: suffix = "/2"
-                    header_str = f">{rg}:{counter}{suffix}"
+                    record = f">{rg}:{counter}{suffix}\n{seq}\n"
 
-                    if mode == "split":
-                        if is_r2:
-                            outs[1].write(f"{header_str}\n{seq}\n")
-                        else:
-                            outs[0].write(f"{header_str}\n{seq}\n")
+                    if mode == "split" and is_r2:
+                        outs[1].write(record)
                     else:
-                        outs[0].write(f"{header_str}\n{seq}\n")
+                        outs[0].write(record)
 
     except BrokenPipeError:
         sys.stderr.close()

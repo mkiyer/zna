@@ -2,6 +2,7 @@
 Unit tests for CLI functionality (encode, decode, inspect).
 """
 import gzip
+import io
 import random
 import tempfile
 import struct
@@ -2159,3 +2160,102 @@ class TestShuffle:
 
         # Order should differ from input
         assert seqs != [r[0] for r in out_records]
+
+
+class TestGzipInput:
+    """Gzip input is served by an external decompressor when one is available,
+    which is worth ~2.2x but puts a second process in the data path.  These pin
+    the properties that matters most: the two paths agree, and a corrupt input
+    is rejected rather than silently truncated."""
+
+    RECORDS = 500
+
+    def _make_gz(self, path):
+        rng = random.Random(4242)
+        seqs = ["".join(rng.choices("ACGT", k=150)) for _ in range(self.RECORDS)]
+        with gzip.open(path, "wb") as f:
+            for i, s in enumerate(seqs):
+                f.write(f"@read{i} comment\n{s}\n+\n{'I' * 150}\n".encode())
+        return seqs
+
+    def test_both_paths_agree(self, monkeypatch):
+        from zna.cli import get_input_handle, parse_fastq
+        with tempfile.TemporaryDirectory() as tmp:
+            p = str(Path(tmp) / "in.fastq.gz")
+            seqs = self._make_gz(p)
+
+            with get_input_handle(p) as fh:
+                via_default = list(parse_fastq(fh))
+
+            monkeypatch.setenv("ZNA_NO_EXTERNAL_GZIP", "1")
+            with get_input_handle(p) as fh:
+                assert isinstance(fh, io.BufferedReader)
+                via_module = list(parse_fastq(fh))
+
+            assert via_default == seqs
+            assert via_module == seqs
+
+    def test_truncated_gzip_is_rejected(self, monkeypatch):
+        """A partial stream plus a non-zero exit must not look like a short file.
+
+        Without the exit-status check this is the worst kind of failure: encode
+        would write a truncated ZNA and report success.
+        """
+        from zna.cli import get_input_handle, parse_fastq
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "in.fastq.gz"
+            self._make_gz(str(p))
+            raw = p.read_bytes()
+            bad = Path(tmp) / "trunc.fastq.gz"
+            bad.write_bytes(raw[: len(raw) // 2])
+
+            with pytest.raises((OSError, EOFError, gzip.BadGzipFile)):
+                fh = get_input_handle(str(bad))
+                try:
+                    list(parse_fastq(fh))
+                finally:
+                    fh.close()
+
+            # ...and the pure-Python path must reject it too.
+            monkeypatch.setenv("ZNA_NO_EXTERNAL_GZIP", "1")
+            with pytest.raises((OSError, EOFError, gzip.BadGzipFile)):
+                fh = get_input_handle(str(bad))
+                try:
+                    list(parse_fastq(fh))
+                finally:
+                    fh.close()
+
+    def test_encode_matches_across_paths(self, monkeypatch):
+        """End to end: the same .gz must encode to the same records either way."""
+        from zna.cli import encode_command
+
+        def run(path, out):
+            class Args:
+                files = [path]
+                output = out
+                interleaved = False
+                read_group = "gz"
+                description = ""
+                seq_len_bytes = 2
+                strand_specific = False
+                strand_normalize = False
+                npolicy = "drop"
+                compress_flag = False
+                level = 3
+                block_size = "64K"
+                quiet = True
+                fasta = False
+                fastq = True
+                shuffle = False
+            encode_command(Args())
+            with open(out, "rb") as f:
+                return [r[0] for r in ZnaReader(f).records()]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = str(Path(tmp) / "in.fastq.gz")
+            seqs = self._make_gz(p)
+            a = run(p, str(Path(tmp) / "a.zna"))
+            monkeypatch.setenv("ZNA_NO_EXTERNAL_GZIP", "1")
+            b = run(p, str(Path(tmp) / "b.zna"))
+            assert a == seqs
+            assert a == b
