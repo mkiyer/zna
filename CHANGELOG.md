@@ -5,11 +5,11 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.6] - 2026-08-12
+## [0.4.0] - 2026-08-12
 
-Adds `zna merge`, an overlap merger for paired-end reads, ported in from the
-pipeline that was using it. No on-disk format change, and nothing existing
-changes behaviour.
+Adds `zna merge`, an overlap merger for paired-end reads, with a compiled
+C++ kernel. No on-disk format change, and nothing existing changes
+behaviour.
 
 ### Added
 - **`zna merge` — overlap-merge paired-end reads into one mixed interleaved
@@ -24,7 +24,8 @@ changes behaviour.
   read at two thresholds: at or above `--threshold-merge` (28 bits) the pair
   becomes one full-fragment record; between that and `--threshold-trim` (8 bits)
   both reads are kept and the redundant overlap is cut off R2's **3'** end; below
-  it both are kept untouched. Three parameters in total, all with units.
+  it both are kept untouched. Three parameters in total, all with units, and read
+  length is not one of them.
 
   Measured against the fastp-derived rule it replaces: spurious detection on
   genuinely unrelated pairs **5.17% → 0.26%**, zero spurious merges in 20,000
@@ -42,38 +43,61 @@ changes behaviour.
   spurious "full molecule with both endpoints". Those are precisely the
   properties `IS_RC`, `IS_FULL_FRAGMENT` and `--treat-unpaired-as-merged` rest
   on, and they were previously asserted across a repo boundary. See
-  [docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation,
-  [docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for the measured-and-rejected
-  list, and [docs/READ_MERGE_PORT_TO_ZNA.md](docs/READ_MERGE_PORT_TO_ZNA.md) §4
-  for the contract.
+  [docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation
+  and [docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for what was measured
+  and rejected.
 
   Also available in-process as `zna.merge.process_pair` / `zna.merge.find_overlap`,
   and as `python -m zna.merge`.
 
+### Performance
+- **A second compiled extension, `zna.merge._accel`**, carries the whole per-pair
+  path: FASTQ parsing, the overlap scan, the posterior consensus, record
+  construction, formatting and the histograms. It releases the GIL, so
+  `--threads` are real worker threads.
+
+  | | µs/pair |
+  |---|---:|
+  | `--threads 1` | 2.78 |
+  | **`--threads 2`** | **1.40** |
+  | `--threads 4` | 1.43 |
+
+  The scan alone went from 2.633 µs/pair (the numba kernel this replaces) to
+  0.470 in C++ — 5.6x — measured on 50,000 real pairs with full pruned scans.
+
+  The tool is now I/O bound, and measurably so: with gzip removed from both ends
+  it runs at **0.42 µs/pair**, while decompression costs 1.42 and compression
+  0.52. Further speed needs a faster inflate or removing the FASTQ intermediate
+  altogether, not a faster kernel.
+
+- **The kernel compares raw bytes, 16 at a time**, through one vector primitive:
+  NEON on aarch64, SSE2 on x86-64. Both are baseline, so there is no `-march`
+  flag, no runtime ISA dispatch, and a scalar fallback everywhere else. Byte
+  comparison is not a concession to portability — it *is* the reference
+  semantics, for ACGT and equally for N, IUPAC codes and lowercase, so no fast
+  path can disagree with the reference on any input. A 2-bit packed kernel
+  measured slower (0.535 vs 0.470) *and* would have needed a purity dispatch to
+  keep those semantics.
+
+### Reproducibility
+- **The score is computed in integers**, at 2²⁴ units per bit. No float takes
+  part in a comparison, a bail bound or the argmax, so a given FASTQ produces
+  byte-identical output on every platform and compiler. The scale is chosen by
+  exhaustive enumeration rather than taste: 2²⁰ first disagrees with float
+  arithmetic at an overlap of 2,575 bases, 2²⁴ at 32,830.
+- **The argmax is a specified total order** — maximise score, then minimise the
+  shift — rather than an artifact of iteration order, verified against an
+  unpruned exhaustive scan including deliberately constructed ties.
+- **Output is written in submission order**, so it is byte-identical at any
+  `--threads`.
+
 ### Packaging
-- **`numba` is a new optional extra, `pip install zna[merge]`.** It is *not* a
-  core dependency: it drags llvmlite and hard Python-version pins, and zna should
-  stay light to install. `import zna` and `import zna.merge` both work without it
-  — the overlap scan falls back to identical pure Python, which is also the
-  reference implementation a future C++ backend will be differentially tested
-  against.
-
-  **`zna merge` refuses to run without numba** unless given `--allow-slow`. The
-  fallback is correct and about 50x slower, and a silently-correct 50x slowdown
-  at cluster scale is indistinguishable from a slow node — it burns the whole
-  allocation without ever failing. The in-process `run()` does not refuse.
-- The conda recipe carries numba as a `run_constrained` entry rather than a
-  separate output: it installs nothing, but states the `>=0.61` floor so an
-  environment that does pull numba in cannot solve to a version too old for it.
-
-### Internal
-- `zna/cli.py` registers the `merge` subparser from `zna/merge/args.py`, which
-  imports nothing but `argparse`, and `zna/merge/__init__.py` resolves its
-  exports lazily. Both exist so that adding the subcommand costs nothing at
-  startup: `zna/merge/overlap.py` imports numba, and registering it eagerly took
-  `import zna.cli` from 40 ms to 210 ms — which `zna inspect --json`, advertised
-  as fast enough to catalogue a corpus, should not pay. Measured after: 40 ms
-  unchanged, and `import zna.merge` is 5.7 ms without loading numba at all.
+- **No new runtime dependencies.** The optional `numba` dependency that the
+  merge tool used before it was ported here is gone; the reference kernel is
+  plain Python and the fast one is compiled with the rest of the package.
+- `zna merge` **refuses to run on the reference kernel** unless asked by name
+  with `--backend python`. It is correct and ~50x slower, and a silently-correct
+  50x slowdown at cluster scale is indistinguishable from a slow node.
 
 ## [0.3.5] - 2026-08-12
 

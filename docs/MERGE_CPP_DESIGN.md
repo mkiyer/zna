@@ -1,7 +1,7 @@
 # Native acceleration for `zna merge`: design
 
-Status: **proposed**, 2026-08-12, against zna at the read-merge port.
-Target release: **0.4.0**, numba-free — see §12.
+Status: **implemented and shipped in 0.4.0**, 2026-08-12. What was built matches this
+document; §16 records where the measurements moved and what that changed.
 
 This is the design for replacing the numba overlap kernel with a C++ backend, keeping a
 pure-Python implementation as the **reference oracle** rather than a fallback, the way
@@ -774,3 +774,64 @@ since 0.3.x); a documented tie-break.
 - **§14.4 of revision 1 was about the fixed-point proof domain**, not stack vs heap
   allocation. The allocation point was still worth taking, and is now §7.4 — where it
   turned out to be worth 27%, and to remove the need for the cap entirely.
+
+
+---
+
+## 16. What shipped, and where the measurements moved
+
+All six phases landed in order, each byte-identical to the one before it on the
+200,000-pair library. Final state:
+
+| | µs/pair |
+|---|---:|
+| original numba tool, `--processes 1` | 8.34 |
+| original numba tool, `--processes 8` | 1.97 |
+| **0.4.0, `--threads 1`** | **2.78** |
+| **0.4.0, `--threads 2`** | **1.40** |
+| 0.4.0, `--threads 4` | 1.43 |
+
+**6.0x single-threaded, and 1.4x faster than the old 8-process configuration on a
+quarter of the cores.** The scan alone went 2.633 → 0.470 µs/pair (5.6x).
+
+The design's predictions held: 2 threads saturate (§8), compute lands near 1 µs/pair
+(§7.4 measured 1.00), and the tool ends up I/O bound (§2). With gzip removed from both
+ends it runs at **0.42 µs/pair**; decompression costs 1.42 and compression 0.52.
+
+**Four things measurement corrected during implementation.**
+
+1. **Dense histograms across the boundary cost 0.004 µs/pair.** §8 budgeted a sparse
+   encoding to replace the one that existed for pickling. Unnecessary — dense lists are
+   free once nothing is pickled.
+2. **Bigger reads made it slower.** 4 MiB blocks measured 2.48 µs/pair against 256
+   KiB's 1.71, because a large blocking read starves the workers while it completes.
+   The fix was not smaller reads but *overlapping* them: each stream prefetches its next
+   block on its own thread, worth 1.71 → 1.40. §7.3's chunk protocol says nothing about
+   read latency and should have.
+3. **The 2^20 scale would have been wrong**, as §4 predicted, and the arena was worth
+   27% rather than the "no downside" §7.4 claimed — dropping the fixed-size assumption
+   is what made copy-on-write natural.
+4. **`process_pair` in C++ was worth more than estimated**: p1 went 5.97 → 3.34 µs/pair
+   at phase D against an estimate of ~4.
+
+**Two defects the work turned up, both caught by tests rather than review.**
+
+- **The two extensions collided.** Both are imported as `_accel`, so both CMake targets
+  emitted `_accel.cpython-*.so` into the same build directory and the merge one
+  overwrote the codec's. `zna._accel` became the merge scan and `zna.is_accelerated()`
+  silently returned False, while the entire merge suite stayed green. Separate
+  `LIBRARY_OUTPUT_DIRECTORY`, pinned by `TestExtensionsAreDistinct`.
+- **Random sequence never ties, and I built the differential tests from random
+  sequence.** Reversing the two flank shifts in the C++ kernel changes the winner on
+  every tied pair and passed all 19 original cross-backend tests. This document already
+  said ties must be constructed deliberately (§5) and the tests did not. `tie_fixtures()`
+  now builds both kinds — plateau ties from unequal-length periodic mates, and *flank*
+  ties from equal-length mates held mutually out of phase, which is the only
+  construction that separates the two flanks. A related gap: `TestArgmaxTotalOrder` was
+  exercising whichever backend was *selected*, so with the extension built the oracle
+  went unchecked, making the suite circular. It is now parametrised over every available
+  backend.
+
+**One mutant survives and should.** `dmax = (ceiling - best)` instead of
+`(ceiling - best - 1)` is equivalent: a tie scores `== best` and `v > best` rejects it
+either way. Recorded so nobody writes a test to chase it.

@@ -108,9 +108,9 @@ def _load(name: str) -> ModuleType:
 # the active backend
 #
 # Held here rather than in each consumer so there is one thing to set and one thing to
-# read. Resolved on FIRST USE, not at import: the Python backend pulls in numba and the
-# accelerated one an extension module, and neither belongs in the import cost of code
-# that only wanted a constant.
+# read. Resolved on FIRST USE, not at import: the accelerated backend is an extension
+# module and the reference one drags in the consensus table, and neither belongs in the
+# import cost of code that only wanted a constant.
 # --------------------------------------------------------------------------- #
 
 _active: Optional[ModuleType] = None

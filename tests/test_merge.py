@@ -1,8 +1,8 @@
 """Tests for src/zna/merge (single-axis LR overlap scoring + merge/trim/keep).
 
-Runs **with or without numba** — the @njit kernels fall back to identical pure Python
-when it is absent, and that fallback is the configuration where a divergence hides
-(production installs numba, CI usually does not). Run the suite both ways.
+Runs with or without the compiled backend. The reference kernel in ``_pymerge`` is the
+oracle the compiled one is defined to agree with, so most of what is checked here is
+checked against both.
 
 The suite mirrors docs/READ_MERGE_REDESIGN.md §8c:
 
@@ -18,7 +18,6 @@ import sys
 
 import pytest
 
-from zna.merge._pymerge import HAVE_NUMBA, njit
 from zna.merge.overlap import (
     FORWARD, NO_OVERLAP, REVERSE, find_overlap, reverse_complement,
 )
@@ -38,6 +37,12 @@ ADAPTER2 = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
 
 # Score weights at the default error rate, used to build exact expectations.
 MATCH_W, MISMATCH_W = score_weights(0.01)
+
+#: The reference backend is ~50x slower than the compiled one, so the statistical
+#: sweeps below size themselves to whichever is running.
+def _fast_backend():
+    from zna.merge.backend import available_merge_backends
+    return "accel" in available_merge_backends()
 
 # The kernel scores in fixed point (zna/merge/params.py), so every expectation here is
 # an exact integer -- no pytest.approx, and no float anywhere near a decision.
@@ -114,7 +119,6 @@ P = MergeParams(min_read_length=1)
 # the pre-redesign rule, kept ONLY to pin parity where parity is expected (§8c.7)
 # --------------------------------------------------------------------------- #
 
-@njit(cache=True)
 def legacy_scan(s1, s2rc, len1, len2, require, diff_limit, diff_pct):
     """fastp's first-accept scan, as this tool shipped it before the LR redesign."""
     off = 0
@@ -813,7 +817,7 @@ class TestSpuriousDetection:
     """
 
     def test_unrelated_pairs_rate(self):
-        n = 20000 if HAVE_NUMBA else 4000     # pure-Python fallback is ~50x slower
+        n = 20000 if _fast_backend() else 2000   # the reference kernel is ~50x slower
         rng = random.Random(20260811)
         detected = merged = 0
         for _ in range(n):
@@ -1041,7 +1045,7 @@ class TestParityWithLegacyRule:
 
     def test_legacy_rule_accepts_chance_four_mers_and_the_new_one_does_not(self):
         """Pins WHY the rules differ: same 20k unrelated pairs, 5.17% vs ~0.2%."""
-        n = 5000 if HAVE_NUMBA else 800
+        n = 5000 if _fast_backend() else 400
         rng = random.Random(2468)
         old_hits = new_hits = 0
         for _ in range(n):
@@ -1637,7 +1641,7 @@ class TestCLI:
 
 
 # --------------------------------------------------------------------------- #
-# numba is an optional extra, and the CLI must not quietly do without it
+# the compiled backend, and the CLI's refusal to quietly do without it
 # --------------------------------------------------------------------------- #
 
 class TestTheCompiledBackendIsRequiredByTheCLI:

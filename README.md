@@ -15,7 +15,7 @@
 - **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
 - **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
 - **Flexible**: Single-end, paired-end, and interleaved reads
-- **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score
+- **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score, with a compiled kernel and byte-identical output on any platform
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
 - **Metadata Rich**: Read groups, descriptions, and custom flags
@@ -29,9 +29,6 @@
 git clone https://github.com/mkiyer/zna.git
 cd zna
 pip install -e .
-
-# With `zna merge` at full speed (adds numba; see the `zna merge` reference)
-pip install -e ".[merge]"
 
 # Check if C++ acceleration is available
 python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_accelerated()}')"
@@ -63,7 +60,7 @@ zna decode sample.zna -o sample.fasta
 # Inspect file statistics
 zna inspect sample.zna
 
-# Overlap-merge paired-end reads before encoding (needs the `merge` extra)
+# Overlap-merge paired-end reads before encoding
 zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
 zna encode --interleaved --treat-unpaired-as-merged merged.fq.gz -o sample.zna
 
@@ -692,21 +689,34 @@ Options:
   --threshold-merge BITS Score at or above this merges the pair (default: 28.0)
   --threshold-trim BITS  Score at or above this (but below merge) trims R2 (default: 8.0)
   --min-read-length N    Drop emitted reads shorter than this (default: 40)
-                         --length-required is an alias
-  --processes N          Worker processes for the merge scan (default: 1)
-  --threads N            pigz threads for gzip I/O (default: 4)
+  --threads N            Merge worker threads (default: min(4, cpu count))
+  --io-threads N         pigz threads for the gzipped output (default: 4)
   --chunk-size N         Read pairs per work unit (default: 2000)
   --compress-level N     pigz level for --out (default: 1 — it is an intermediate)
+  --backend NAME         auto (default), accel, or python
   --no-sync-check        Skip the per-pair R1/R2 read-name consistency check
   --allow-empty          Exit 0 on an input with no read pairs
-  --allow-slow           Run without numba (~50x slower)
   -q, --quiet            Suppress progress logging
 ```
 
-**Requires numba** (`pip install zna[merge]`). Without it the identical scan runs as
-pure Python — correct, but about 50x slower — so the command refuses to start rather
-than turn a fast job into a silently slow one. Pass `--allow-slow` if you mean it.
-`pigz` is used for gzip I/O when it is on `PATH`, falling back to stdlib `gzip`.
+**Speed.** The merge kernel is compiled C++ and releases the GIL, so `--threads` are
+real worker threads. It is not usually the bottleneck — gzip is — so **2 threads
+saturate and more does nothing**:
+
+| | µs/pair |
+|---|---:|
+| `--threads 1` | 2.78 |
+| `--threads 2` | **1.40** |
+| `--threads 4` | 1.43 |
+
+With gzip removed from both ends the tool runs at 0.42 µs/pair, so on compressed input
+it is I/O bound. `pigz` is used when it is on `PATH`, falling back to stdlib `gzip`.
+
+**Determinism.** The score is computed in fixed-point integers and the argmax has a
+specified tie-break, so a given FASTQ produces **byte-identical output on any platform,
+compiler and thread count**. `--backend python` selects the pure-Python reference
+implementation, which exists as an oracle for the compiled one; it is ~50x slower and
+is never chosen for you.
 
 **Output** is one stream mixing both shapes: merged reads as single records with the
 `/1`,`/2` suffix stripped, unmerged pairs as adjacent `/1`,`/2` records. Feed it to
@@ -720,9 +730,8 @@ never a lone mate.
 # Defaults suit 2x150 bp data; you normally set nothing
 zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
 
-# Production: one worker per allocated core, plus run statistics
-zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz \
-          --json merge.json --threads 8 --processes 8
+# With run statistics for a pipeline to collect
+zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz --json merge.json
 
 # Straight into a training corpus
 zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz

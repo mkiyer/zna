@@ -4,11 +4,10 @@ This is the **oracle** the accelerated backend is defined to agree with, not a f
 for when the fast one is missing. It is never deleted and never optimised at the cost of
 clarity — see :mod:`zna.merge.backend`.
 
-It is JIT-compiled by numba when numba is installed, and runs as identical pure Python
-when it is not (correct, ~50x slower). Both are the same source; the ``njit`` decorator
-below degrades to a no-op. When the C++ backend lands, numba goes away entirely and this
-becomes plain Python, which is what a reference implementation should have been all
-along.
+Plain Python: no numba, no JIT, nothing between the reader and the algorithm. It is
+~50x slower than the compiled backend, and that is the correct trade for an oracle --
+speed here would only buy the ability to be wrong in the same way as the thing it
+checks.
 
 Scores are integers throughout — see :mod:`zna.merge.params` for why, and
 ``docs/MERGE_CPP_DESIGN.md`` §5 for the argmax total order the visiting order realises.
@@ -18,25 +17,7 @@ from __future__ import annotations
 from .fastqio import InputError
 from .names import base_name, strip_pair_suffix
 
-try:  # numba JIT-compiles the scan; without it the same code runs as pure Python.
-    from numba import njit
-    HAVE_NUMBA = True
-except ImportError:  # pragma: no cover - exercised only when numba is missing
-    HAVE_NUMBA = False
-
-    def njit(*args, **kwargs):
-        """No-op stand-in for numba.njit supporting both @njit and @njit(...)."""
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-
-        def _decorate(func):
-            return func
-
-        return _decorate
-
-
-# Sentinel for "this shift cannot beat the incumbent". A finite int64 keeps numba's
-# typing simple and stays far below any reachable score.
+# Sentinel for "this shift cannot beat the incumbent"; far below any reachable score.
 _REJECT = -(1 << 62)
 
 # Complement table. A/C/G/T/N in both cases; everything else passes through
@@ -50,7 +31,6 @@ def reverse_complement(seq: bytes) -> bytes:
     return seq.translate(_COMPLEMENT)[::-1]
 
 
-@njit(cache=True)
 def _shift_score(s1, s2rc, s, n, match_q, step_q, best):
     """Score one candidate shift. Returns ``(score_q, mismatches)``.
 
@@ -102,7 +82,6 @@ def _shift_score(s1, s2rc, s, n, match_q, step_q, best):
     return ceiling - d * step_q, d
 
 
-@njit(cache=True)
 def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
     """Best-scoring shift over ``s in [-(len2-1), len1-1]``.
 

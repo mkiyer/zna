@@ -339,8 +339,8 @@ def _assemble_stats(acc, params, elapsed=None):
     }
     if elapsed is not None:
         stats["elapsed_s"] = round(elapsed, 1)
-        # A cohort field that detects, for free, nodes where numba failed to load or
-        # pigz was missing — both of which are silently correct and 10-50x slower.
+        # A cohort field that detects, for free, nodes where the compiled backend or
+        # pigz was missing — both of which are silently correct and much slower.
         stats["pairs_per_second"] = round(n_pairs / elapsed) if elapsed > 0 else 0
     return stats
 

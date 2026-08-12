@@ -44,7 +44,12 @@ def _open_binary_read(path: str, threads: int):
 
 
 def read_fastq(path, threads: int = 1):
-    """Yield ``(header, seq, qual)`` bytes triples from a FASTQ (optionally gzipped)."""
+    """Yield ``(header, seq, qual)`` bytes triples from a FASTQ (optionally gzipped).
+
+    Not on the merge path — the backend parses raw buffers itself (see
+    ``merge_chunk``). This is here for the development tools under
+    ``scripts/merge_bench/``, which want records rather than bytes.
+    """
     path = str(path)
     stream, proc = _open_binary_read(path, threads)
     readline = stream.readline

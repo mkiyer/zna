@@ -28,8 +28,8 @@ ranked against those two, and (1) beats (2) whenever they conflict.
 | M3 — statistics reach the cohort; provenance recorded | **done** (2026-08-12) |
 | M4 — intermediate size and pool scaling | **done**; raw-blob IPC deferred, see R7 |
 | M5 — freeze, then MOVE to the zna package | **done** (2026-08-12) |
-| M6 — numba → C++ | **next**; designed, see [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) |
-| M7 — `zna encode --merge-pairs` | after M6 |
+| M6 — numba → C++ | **done** (0.4.0); [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) |
+| M7 — `zna encode --merge-pairs` | **next** |
 
 **M6 and M7 swapped order (2026-08-12).** The C++ design was measured first and the
 measurement changed the sequencing: at `--processes 8` the merge computation already
@@ -361,6 +361,14 @@ from the port plan, both forced by measurement:
 `lib/hulkrna/merge/` and the two test files. Keep a thin test that the *rule* invokes
 the tool correctly — the seam moves, it does not vanish. A brief period of duplication
 is much cheaper than a pipeline that cannot build its environment.
+
+### M6 — the C++ backend — **done, shipped in 0.4.0**
+
+8.34 -> 1.40 us/pair (2 threads), 6.0x single-threaded and 1.4x faster than the old
+8-process configuration on a quarter of the cores. numba is gone. Output is
+byte-identical to the numba implementation on 200,000 real pairs, from either backend,
+at any thread count. See [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) §16 for what the
+measurements corrected along the way.
 
 ### Next
 

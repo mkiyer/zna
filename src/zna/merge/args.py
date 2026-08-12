@@ -1,11 +1,11 @@
 """Argument definitions for ``zna merge`` — deliberately free of heavy imports.
 
-Split out of :mod:`zna.merge.cli` so that *registering* the subcommand costs nothing.
-``cli.py`` pulls in ``overlap.py``, which imports numba: measured on this repo,
-``import zna.cli`` is 40 ms but ``import zna.cli, zna.merge.cli`` is 210 ms, and
-``zna inspect --json`` advertises itself as fast enough to catalogue a whole corpus.
-So ``zna/cli.py`` imports *this* module to build the parser and only reaches for
-``cli.run`` once the user has actually asked for ``merge``.
+Split out of :mod:`zna.merge.cli` so that *registering* the subcommand costs nothing:
+``cli.py`` reaches the backend, the extension module and the 64 KiB consensus table,
+none of which belong in the startup of ``zna inspect --json``, which advertises itself
+as fast enough to catalogue a whole corpus. So ``zna/cli.py`` imports *this* module to
+build the parser and only reaches for ``cli.run`` once the user has asked for
+``merge``.
 
 This module imports nothing but ``argparse``. Keep it that way.
 """

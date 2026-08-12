@@ -1904,9 +1904,9 @@ def main():
 
     # --- MERGE ---
     # Registered from zna.merge.args, which imports nothing but argparse. The runtime
-    # half (zna.merge.cli) pulls in the overlap kernel and therefore numba, which costs
-    # ~170 ms of import time -- paying that on `zna inspect` would be absurd, so it is
-    # imported below, only once the user has actually asked for `merge`.
+    # half (zna.merge.cli) pulls in the kernel, the extension module and a 64 KiB
+    # lookup table -- paying that on `zna inspect` would be absurd, so it is imported
+    # below, only once the user has actually asked for `merge`.
     from .merge.args import add_merge_parser
     add_merge_parser(subparsers)
 

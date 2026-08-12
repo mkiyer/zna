@@ -17,11 +17,10 @@ pair suffix stripped; unmerged pairs as adjacent ``/1``,``/2`` records) consumed
 
 **The exports below are resolved lazily** (PEP 562). Importing them eagerly would make
 ``import zna.merge.args`` — which ``zna/cli.py`` does on *every* invocation, just to
-register the subcommand — pull in ``overlap.py`` and therefore numba. Measured:
-``import zna.cli`` 40 ms, ``import zna.cli, zna.merge.cli`` 210 ms. ``zna.merge.pairs``
-also builds a 127x127 posterior table at import time (~4 ms). Neither belongs in the
-startup of ``zna inspect``, which advertises itself as fast enough to catalogue a
-corpus. For the same reason ``zna/__init__.py`` does not re-export this package at all.
+register the subcommand — pull in the kernel, the extension module and the 64 KiB
+posterior table of :mod:`zna.merge.params`. None of that belongs in the startup of
+``zna inspect``, which advertises itself as fast enough to catalogue a corpus. For the
+same reason ``zna/__init__.py`` does not re-export this package at all.
 
 Accessing any name here (``from zna.merge import MergeParams``) imports what it needs,
 once, and caches it in the module globals.
