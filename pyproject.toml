@@ -55,6 +55,15 @@ Changelog = "https://github.com/mkiyer/zna/releases"
 zna = "zna.cli:main"
 
 [project.optional-dependencies]
+# `zna merge` JIT-compiles its overlap scan with numba. Deliberately NOT a core
+# dependency: numba drags llvmlite and hard Python-version pins, and zna is a format
+# library people should be able to `pip install` casually. `import zna.merge` works
+# without it (overlap.py falls back to an identical pure-Python scan, ~50x slower and
+# the reference implementation for the planned C++ backend), but the CLI refuses to
+# run that way unless you pass --allow-slow.
+merge = [
+    "numba>=0.61"       # 0.61 is the first release that supports Python 3.13
+]
 dev = [
     "pytest",
     "black",

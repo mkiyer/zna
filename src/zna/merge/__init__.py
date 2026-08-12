@@ -14,11 +14,21 @@ best-scoring shift is then read at two thresholds:
 Output is a single **mixed interleaved** FASTQ stream (merged reads as singles with the
 pair suffix stripped; unmerged pairs as adjacent ``/1``,``/2`` records) consumed by
 ``zna encode --interleaved``. See ``docs/READ_MERGE_REDESIGN.md``.
+
+**The exports below are resolved lazily** (PEP 562). Importing them eagerly would make
+``import zna.merge.args`` — which ``zna/cli.py`` does on *every* invocation, just to
+register the subcommand — pull in ``overlap.py`` and therefore numba. Measured:
+``import zna.cli`` 40 ms, ``import zna.cli, zna.merge.cli`` 210 ms. ``zna.merge.pairs``
+also builds a 127x127 posterior table at import time (~4 ms). Neither belongs in the
+startup of ``zna inspect``, which advertises itself as fast enough to catalogue a
+corpus. For the same reason ``zna/__init__.py`` does not re-export this package at all.
+
+Accessing any name here (``from zna.merge import MergeParams``) imports what it needs,
+once, and caches it in the module globals.
 """
 from __future__ import annotations
 
-from .pairs import MergeParams, PairOutcome, process_pair
-from .overlap import find_overlap, reverse_complement, score_weights, threshold_bits
+from importlib import import_module
 
 __all__ = [
     "MergeParams",
@@ -29,3 +39,27 @@ __all__ = [
     "score_weights",
     "threshold_bits",
 ]
+
+_LAZY = {
+    "MergeParams": ".pairs",
+    "PairOutcome": ".pairs",
+    "process_pair": ".pairs",
+    "find_overlap": ".overlap",
+    "reverse_complement": ".overlap",
+    "score_weights": ".overlap",
+    "threshold_bits": ".overlap",
+}
+
+
+def __getattr__(name):
+    try:
+        where = _LAZY[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(import_module(where, __name__), name)
+    globals()[name] = value          # subsequent lookups skip __getattr__ entirely
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

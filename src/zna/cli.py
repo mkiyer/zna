@@ -1902,6 +1902,14 @@ def main():
                       help="Directory for temporary bucket files (default: system temp)")
     shuf.add_argument("-q", "--quiet", action="store_true", help="Suppress progress messages")
 
+    # --- MERGE ---
+    # Registered from zna.merge.args, which imports nothing but argparse. The runtime
+    # half (zna.merge.cli) pulls in the overlap kernel and therefore numba, which costs
+    # ~170 ms of import time -- paying that on `zna inspect` would be absurd, so it is
+    # imported below, only once the user has actually asked for `merge`.
+    from .merge.args import add_merge_parser
+    add_merge_parser(subparsers)
+
     args = parser.parse_args()
     if args.command == "encode":
         encode_command(args)
@@ -1911,6 +1919,9 @@ def main():
         inspect_command(args)
     elif args.command == "shuffle":
         shuffle_command(args)
+    elif args.command == "merge":
+        from .merge.cli import run_command
+        sys.exit(run_command(args))
 
 
 if __name__ == "__main__":
