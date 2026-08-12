@@ -230,6 +230,8 @@ def decode_block(
     count: int,
     label_columns: list[bytes] | None = None,
     label_defs: list | None = None,
+    with_rc: bool = True,
+    restore_strand: bool = False,
 ) -> list[tuple]:
     """Batch-decode columnar byte streams into record tuples.
 
@@ -238,8 +240,20 @@ def decode_block(
 
     Otherwise returns a list of
     ``(sequence, is_paired, is_read1, is_read2, is_rc)`` tuples.
+
+    *with_rc* controls whether the ``is_rc`` slot is present; the reader's
+    default path drops it immediately, so emitting the caller's width here saves
+    rebuilding every tuple.  *restore_strand* undoes the encoder's
+    reverse-complement and consumes ``is_rc``, so it requires ``with_rc=False``.
+    Both backends accept these, so the reader does not branch on which is active.
     """
     import struct as _struct
+
+    if with_rc and restore_strand:
+        raise ValueError(
+            "with_rc and restore_strand are mutually exclusive: restore_strand "
+            "consumes IS_RC to undo the reverse-complement"
+        )
 
     # Parse lengths
     if len_bytes == 1:
@@ -277,22 +291,19 @@ def decode_block(
         char_offset = char_end
 
         flag = flags_data[i]
+        if restore_strand and (flag & 8):
+            seq = reverse_complement(seq)
+
+        rec = (
+            seq,
+            bool(flag & 4),  # is_paired
+            bool(flag & 1),  # is_read1
+            bool(flag & 2),  # is_read2
+        )
+        if with_rc:
+            rec += (bool(flag & 8),)
         if has_labels:
-            results.append((
-                seq,
-                bool(flag & 4),  # is_paired
-                bool(flag & 1),  # is_read1
-                bool(flag & 2),  # is_read2
-                bool(flag & 8),  # is_rc
-                decoded_labels[i],
-            ))
-        else:
-            results.append((
-                seq,
-                bool(flag & 4),  # is_paired
-                bool(flag & 1),  # is_read1
-                bool(flag & 2),  # is_read2
-                bool(flag & 8),  # is_rc
-            ))
+            rec += (decoded_labels[i],)
+        results.append(rec)
 
     return results

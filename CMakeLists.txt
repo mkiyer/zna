@@ -18,10 +18,21 @@ endif()
 
 find_package(nanobind CONFIG REQUIRED)
 
-# Build the extension module
+# Build the extension module.
+#
+# No STABLE_ABI here.  It was requested before, but silently did nothing:
+# nanobind can only build against the limited API when CMake finds Python's
+# Development.SABIModule component, and the find_package above asks for
+# Development.Module.  The built artefact was always version-tagged
+# (_accel.cpython-3XX-*.so), never abi3.
+#
+# That is not an oversight to correct — the codec cannot be built on the limited
+# API.  It has used PyTuple_SET_ITEM since before the 0.3.4 rewrite, and the
+# rewrite also needs PyUnicode_New, PyUnicode_DATA and PyList_SET_ITEM to keep
+# from copying every base twice.  Asking for a stable ABI here would simply fail
+# to compile, so the request is dropped rather than left misleading.
 nanobind_add_module(
     _accel
-    STABLE_ABI
     NB_STATIC
     src/zna/_accel.cpp
 )

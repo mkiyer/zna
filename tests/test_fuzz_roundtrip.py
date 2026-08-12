@@ -46,6 +46,7 @@ Environment overrides: ``ZNA_FUZZ_SEED``, ``ZNA_FUZZ_ITERS``.
 from __future__ import annotations
 
 import contextlib
+import gc
 import io
 import os
 import random
@@ -702,6 +703,108 @@ class TestInvalidBaseHandling(FuzzCase):
                 got, "ACGAACGT",
                 f"accel should substitute the N-policy base for {ch!r}",
             )
+
+
+class TestDecoderMemory(FuzzCase):
+    """The C++ decoder builds its list, tuples and strings with the raw C API
+    and GC-untracks the record tuples.  That is exactly where a rewrite leaks or
+    over-frees without any test noticing, so check both directly."""
+
+    def setUp(self):
+        if "accel" not in BACKENDS:
+            self.skipTest("C++ accel backend not available")
+
+    def _block(self, n=400, seq_len_bytes=2):
+        from zna import _accel
+        rng = random.Random(SEED + 10)
+        recs = gen_records(rng, "mixed", n, seq_len_bytes,
+                           allow_n=False, allow_lower=False)
+        seqs = [r[0] for r in recs]
+        flags = [(1 if r[2] else 0) | (2 if r[3] else 0) | (4 if r[1] else 0)
+                 for r in recs]
+        fl, ln, sq = _accel.encode_block(seqs, list(flags), seq_len_bytes,
+                                         "", True, False, False)
+        return seqs, fl, ln, sq, len(seqs)
+
+    def test_repeated_decode_does_not_leak(self):
+        from zna import _accel
+        seqs, fl, ln, sq, n = self._block()
+
+        def once(**kw):
+            recs = _accel.decode_block(fl, ln, sq, 2, n, **kw)
+            self.assertEqual(len(recs), n)
+            del recs
+
+        for kw in ({}, {"with_rc": False}, {"with_rc": False, "restore_strand": True}):
+            for _ in range(5):          # settle allocator and caches
+                once(**kw)
+            gc.collect()
+            before = sys.getallocatedblocks()
+            for _ in range(50):
+                once(**kw)
+            gc.collect()
+            after = sys.getallocatedblocks()
+            # A per-record leak over 50 x 400 records would be 20k blocks; a
+            # small drift from caches and free lists is expected and fine.
+            self.assertLess(
+                after - before, 1000,
+                f"decode_block({kw}) leaked {after - before} allocated blocks "
+                f"over 50 iterations of {n} records",
+            )
+
+    def test_records_survive_collection_while_held(self):
+        """Untracked tuples must still be kept alive by the list that holds
+        them: an over-eager untrack shows up as freed memory under GC pressure."""
+        from zna import _accel
+        seqs, fl, ln, sq, n = self._block()
+        recs = _accel.decode_block(fl, ln, sq, 2, n)
+        for _ in range(3):
+            gc.collect()
+            # Churn the heap so a freed object would likely be reused.
+            _ = [bytearray(4096) for _ in range(200)]
+            gc.collect()
+        for i, rec in enumerate(recs):
+            self.assertEqual(len(rec), 5, f"rec{i}: width changed after GC")
+            self.assertIsInstance(rec[0], str, f"rec{i}: sequence is not a str")
+            self.assertEqual(len(rec[0]), len(seqs[i]), f"rec{i}: length changed")
+
+    def test_labeled_decode_does_not_leak(self):
+        from zna import _accel
+        rng = random.Random(SEED + 11)
+        codes = sorted(DTYPE_BY_CODE)
+        n = 300
+        recs = gen_records(rng, "mixed", n, 2, allow_n=False, allow_lower=False)
+        seqs = [r[0] for r in recs]
+        flags = [(1 if r[2] else 0) | (4 if r[1] else 0) for r in recs]
+        col_data, col_sizes = [], []
+        for c in codes:
+            dt = DTYPE_BY_CODE[c]
+            vals = [gen_label_value(rng, c) for _ in range(n)]
+            col_data.append(struct.pack(f"<{n}{dt.struct_ch}", *vals))
+            col_sizes.append(dt.size)
+        fl, lb, ln, sq = _accel.encode_block_labeled(
+            seqs, list(flags), 2, "", False, False, False, col_data, col_sizes)
+        dtype_codes = "".join(codes)
+
+        def once():
+            out = _accel.decode_block_labeled(fl, ln, sq, 2, n, col_data,
+                                              col_sizes, dtype_codes)
+            self.assertEqual(len(out), n)
+            self.assertEqual(len(out[0][5]), len(codes))
+            del out
+
+        for _ in range(5):
+            once()
+        gc.collect()
+        before = sys.getallocatedblocks()
+        for _ in range(30):
+            once()
+        gc.collect()
+        after = sys.getallocatedblocks()
+        self.assertLess(
+            after - before, 1000,
+            f"decode_block_labeled leaked {after - before} allocated blocks",
+        )
 
 
 def _main(argv):

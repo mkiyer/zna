@@ -690,7 +690,17 @@ class ZnaReader:
             total_label_bytes_per_rec = 0
 
         needs_restore = restore_strand and self._header.strand_normalized
-        rc = _codec.reverse_complement
+
+        # What the backend should emit.  The three consumers below want three
+        # different widths, and asking the backend for the right one is much
+        # cheaper than unpacking and rebuilding every record tuple in Python:
+        #   with_rc      -> yield the backend's tuples untouched
+        #   needs_restore-> backend reverse-complements and drops IS_RC
+        #   otherwise    -> backend drops IS_RC
+        # ``with_ends`` reads IS_FULL_FRAGMENT straight off the flags column, so
+        # it needs the narrow width too.
+        want_rc = with_rc
+        decode_kwargs = {"with_rc": want_rc, "restore_strand": needs_restore}
 
         # Choose decode backend
         use_accel_labels = has_labels and _accel_mod is not None
@@ -750,15 +760,18 @@ class ZnaReader:
                     block_records = _accel_mod.decode_block_labeled(
                         flags_stream, lengths_stream, seqs_stream, len_bytes, count,
                         label_columns, label_col_sizes, label_dtype_codes,
+                        **decode_kwargs,
                     )
                 else:
                     block_records = _pycodec_mod.decode_block(
                         flags_stream, lengths_stream, seqs_stream, len_bytes, count,
                         label_columns=label_columns, label_defs=list(label_defs),
+                        **decode_kwargs,
                     )
             else:
                 block_records = decode(
-                    flags_stream, lengths_stream, seqs_stream, len_bytes, count
+                    flags_stream, lengths_stream, seqs_stream, len_bytes, count,
+                    **decode_kwargs,
                 )
 
             if with_ends:
@@ -771,33 +784,16 @@ class ZnaReader:
                 if has_labels:
                     for rec, fl in zip(block_records, flags_stream):
                         has_start, has_end = ends[fl]
-                        yield rec[0], rec[1], rec[2], rec[3], has_start, has_end, rec[5]
+                        yield rec[0], rec[1], rec[2], rec[3], has_start, has_end, rec[4]
                 else:
                     for rec, fl in zip(block_records, flags_stream):
                         has_start, has_end = ends[fl]
                         yield rec[0], rec[1], rec[2], rec[3], has_start, has_end
-            elif with_rc:
-                # Both backends already decode to exactly this shape:
-                # (seq, is_paired, is_read1, is_read2, is_rc[, labels])
-                yield from block_records
-            elif has_labels:
-                if needs_restore:
-                    for seq, is_paired, is_read1, is_read2, is_rc, labels in block_records:
-                        if is_rc:
-                            seq = rc(seq)
-                        yield seq, is_paired, is_read1, is_read2, labels
-                else:
-                    for seq, is_paired, is_read1, is_read2, _is_rc, labels in block_records:
-                        yield seq, is_paired, is_read1, is_read2, labels
             else:
-                if needs_restore:
-                    for seq, is_paired, is_read1, is_read2, is_rc in block_records:
-                        if is_rc:
-                            seq = rc(seq)
-                        yield seq, is_paired, is_read1, is_read2
-                else:
-                    for seq, is_paired, is_read1, is_read2, _is_rc in block_records:
-                        yield seq, is_paired, is_read1, is_read2
+                # The backend was asked for exactly the shape this call yields:
+                # IS_RC present only under with_rc, and the reverse-complement
+                # already undone under restore_strand.  Nothing left to rebuild.
+                yield from block_records
 
     # -- private -------------------------------------------------------------
 
