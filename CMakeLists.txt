@@ -37,6 +37,23 @@ nanobind_add_module(
     src/zna/_accel.cpp
 )
 
+# On macOS, nanobind does not link against libpython.  It instead passes the
+# linker a curated list of CPython symbols that are allowed to be undefined
+# (nanobind/cmake/darwin-ld-cpython.sym), and PyUnicode_New is not on it, so the
+# decoder fails to link without this.
+#
+# The decoder writes bases directly into each str's own buffer; the alternative
+# that links unaided (decode to scratch, then PyUnicode_FromStringAndSize) scans
+# its input as UTF-8 and copies, costing three passes over every sequence
+# instead of one -- measured at a third of the decode win.
+#
+# Linux and Windows resolve PyUnicode_New normally and need no flag.  If a
+# future toolchain rejects -U, this fails as a link error at build time, which
+# is the failure mode to want: loud, and impossible to ship past.
+if(APPLE)
+    target_link_options(_accel PRIVATE "-Wl,-U,_PyUnicode_New")
+endif()
+
 # Set C++ standard
 target_compile_features(_accel PRIVATE cxx_std_17)
 

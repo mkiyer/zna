@@ -109,6 +109,21 @@ def main():
     bench("reverse_complement 1 Mbp x20",
           lambda: [_accel.reverse_complement(big) for _ in range(20)])
 
+    # Raw backend calls.  The end-to-end figures above carry zstd, block framing
+    # and generator overhead in the denominator; the optimization plan quotes
+    # numbers "on the path changed", which is this.  Called positionally so the
+    # pre-rewrite build, which has no with_rc/restore_strand parameters, runs the
+    # identical benchmark.
+    flags = [(1 if i % 2 == 0 else 2) | 4 for i in range(len(seqs))]
+    fl, ln, sq = _accel.encode_block(seqs, list(flags), 2, "", False, False, False)
+    n = len(seqs)
+    bench("raw decode_block (200k records, one block)",
+          lambda: _accel.decode_block(fl, ln, sq, 2, n))
+    bench("raw encode_block (200k records)",
+          lambda: _accel.encode_block(seqs, list(flags), 2, "", False, False, False))
+    bench("raw encode_block, reverse-complementing",
+          lambda: _accel.encode_block(seqs, list(flags), 2, "", True, False, False))
+
     base = json.load(open(args.baseline)) if args.baseline else None
     width = max(len(k) for k in results)
     print(f"\n  {'benchmark':<{width}}  {'time':>10s}" +

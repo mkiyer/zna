@@ -23,10 +23,11 @@
  *     some bools cannot be part of a reference cycle.
  *
  * This costs portability: ``PyUnicode_New``, ``PyUnicode_DATA``,
- * ``PyList_SET_ITEM`` and ``PyTuple_SET_ITEM`` are not in the limited API.  The
- * module was never actually stable-ABI (``PyTuple_SET_ITEM`` predates this
- * rewrite), and ``CMakeLists.txt`` no longer claims otherwise — see the comment
- * there.
+ * ``PyList_SET_ITEM`` and ``PyTuple_SET_ITEM`` are not in the limited API, and
+ * on macOS ``PyUnicode_New`` additionally needs an explicit linker opt-in (see
+ * ``CMakeLists.txt``).  The module was never actually stable-ABI --
+ * ``PyTuple_SET_ITEM`` predates this rewrite -- and ``CMakeLists.txt`` no longer
+ * claims otherwise.
  */
 
 #include <nanobind/nanobind.h>
@@ -176,30 +177,34 @@ static inline void revcomp_inplace(char* s, size_t n) noexcept {
 /// Build a Python ``str`` holding *seq_len* decoded bases.  Returns a new
 /// reference, or nullptr with the error indicator set.
 ///
-/// *scratch* is a buffer reused across every record in the block; it grows to
-/// the longest sequence seen and is then hot in cache for the rest of the block.
+/// The bases are written straight into the string object's own storage.
+/// ``PyUnicode_New(n, 127)`` gives a compact ASCII object with an n+1 byte
+/// buffer, which is exactly what the decoder wants to fill — so decoding is one
+/// pass over the data and nothing is copied afterwards.
 ///
-/// Decoding into the ``str``'s own storage via ``PyUnicode_New`` would save this
-/// last memcpy, but that symbol is absent from nanobind's macOS
-/// allowed-undefined list (``darwin-ld-cpython.sym``) and will not link.  A
-/// memcpy of 150 ASCII bytes out of L1 is not worth a platform-specific linker
-/// flag that a nanobind update could quietly break — the copies that mattered
-/// were the per-record ``std::string`` heap allocation and nanobind's STL
-/// round-trip, and both are gone.
+/// The obvious alternative, decoding into a scratch buffer and calling
+/// ``PyUnicode_FromStringAndSize``, costs three passes rather than one: that
+/// function treats its input as UTF-8, so it scans for non-ASCII and then copies.
+/// Measured on 200k 150 bp records it gave up a third of the win (raw
+/// decode_block +89.8% instead of +120.3%), which is why the linker flag below
+/// is worth carrying.
 static inline PyObject* make_seq_object(const uint8_t* src, size_t seq_len,
-                                        bool rc, std::vector<char>& scratch) {
+                                        bool rc) {
     if (seq_len == 0) {
+        // PyUnicode_New(0, ...) hands back the interned empty string, which must
+        // never be written to.
         return PyUnicode_FromStringAndSize("", 0);
     }
-    if (scratch.size() < seq_len) {
-        scratch.resize(seq_len);
+    PyObject* s = PyUnicode_New(static_cast<Py_ssize_t>(seq_len), 127);
+    if (s == nullptr) {
+        return nullptr;
     }
-    char* buf = scratch.data();
+    char* buf = reinterpret_cast<char*>(PyUnicode_DATA(s));
     decode_into(buf, src, seq_len);
     if (rc) {
         revcomp_inplace(buf, seq_len);
     }
-    return PyUnicode_FromStringAndSize(buf, static_cast<Py_ssize_t>(seq_len));
+    return s;
 }
 
 /// Read record *rec*'s stored sequence length.
@@ -775,8 +780,6 @@ nb::object decode_block_columnar(
     }
     PyObject* list = result.ptr();
 
-    // Reused for every record; grows to the block's longest sequence.
-    std::vector<char> scratch;
     size_t seq_offset = 0;
     for (int rec = 0; rec < count; rec++) {
         const uint8_t flag = flags_ptr[rec];
@@ -788,7 +791,7 @@ nb::object decode_block_columnar(
         }
 
         PyObject* seq = make_seq_object(seqs_ptr + seq_offset, seq_len,
-                                        restore_strand && (flag & 0x08), scratch);
+                                        restore_strand && (flag & 0x08));
         if (seq == nullptr) {
             throw nb::python_error();
         }
@@ -929,8 +932,6 @@ nb::object decode_block_labeled(
     }
     PyObject* list = result.ptr();
 
-    // Reused for every record; grows to the block's longest sequence.
-    std::vector<char> scratch;
     size_t seq_offset = 0;
     for (int rec = 0; rec < count; rec++) {
         const uint8_t flag = flags_ptr[rec];
@@ -942,7 +943,7 @@ nb::object decode_block_labeled(
         }
 
         PyObject* seq = make_seq_object(seqs_ptr + seq_offset, seq_len,
-                                        restore_strand && (flag & 0x08), scratch);
+                                        restore_strand && (flag & 0x08));
         if (seq == nullptr) {
             throw nb::python_error();
         }
