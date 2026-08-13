@@ -153,8 +153,39 @@ on an HTTP error.
 
 ### Test the conda build locally (optional)
 
+**`conda build conda/` on its own does not work, and the error does not say why.**
+
 ```bash
-conda build conda/
+conda activate bioconda-build
+conda build conda/ -m "$CONDA_PREFIX/conda_build_config.yaml"
+```
+
+The `-m` is required. The recipe uses `{{ stdlib('c') }}`, which is not a package name —
+it is resolved through the `c_stdlib` / `c_stdlib_version` variant keys that conda-forge's
+pinning defines (`macosx_deployment_target` on macOS, `sysroot` on Linux). Without that
+pinning the placeholder expands literally and the solve fails with:
+
+```
+c_osx-arm64 =* * does not exist (perhaps a typo or a missing channel)
+```
+
+which reads like a broken channel rather than a missing variant config. Bioconda's CI
+supplies the pinning automatically, so the recipe is correct as written — this is purely
+a local-invocation problem.
+
+Activating the environment is **not** sufficient on its own: conda-build does not read
+`$CONDA_PREFIX/conda_build_config.yaml` automatically, so the `-m` must be explicit even
+with `bioconda-build` active. (Verified: activation alone still fails; `-m` renders clean.)
+
+Do not "fix" this by deleting `{{ stdlib('c') }}` from `conda/meta.yaml`. The published
+bioconda recipe has it, and since this file is copied *over* that one, dropping it here
+silently reverts the stdlib migration for the shipped package.
+
+A faster check than a full build — it runs the same dependency solve, which is where this
+fails, in seconds rather than minutes:
+
+```bash
+conda-render conda/ -m "$CONDA_PREFIX/conda_build_config.yaml"
 ```
 
 ### Commit and push

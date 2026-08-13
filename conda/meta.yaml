@@ -25,6 +25,12 @@ requirements:
     # published recipe -- a PR that drops it regresses that migration. Keep it in step
     # with upstream: this file is the source the bioconda recipe is copied FROM, so
     # anything upstream gained and this did not comes straight back out on the next bump.
+    #
+    # This is NOT a package name. It resolves through the c_stdlib / c_stdlib_version
+    # variant keys in conda-forge's pinning, which bioconda's CI supplies. Building
+    # locally without that pinning fails with "c_osx-arm64 does not exist", which reads
+    # like a broken channel; pass -m "$CONDA_PREFIX/conda_build_config.yaml" from the
+    # bioconda-build env. See docs/RELEASING.md section 2.
     - {{ stdlib('c') }}
     - cmake >=3.15
     - make  # [unix]
