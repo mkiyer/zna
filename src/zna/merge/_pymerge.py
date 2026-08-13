@@ -330,7 +330,7 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
     parts = []
     n_pairs = merged = trimmed = kept = emitted = dropped = 0
     bases_trimmed = frags_short = bases_consensus = trim_guard = 0
-    sum_olen = sum_diff = 0
+    sum_olen = sum_diff = max_read_len = 0
     len_hist = [0] * (HIST_MAX + 1)
     olen_hist = [0] * (HIST_MAX + 1)
     insert_hist = [0] * (HIST_MAX + 1)
@@ -345,6 +345,9 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
             break
         h1, s1, q1, try1 = a
         h2, s2, q2, try2 = b
+        longest = len(s1) if len(s1) > len(s2) else len(s2)
+        if longest > max_read_len:
+            max_read_len = longest
 
         if check_sync and base_name(h1) != base_name(h2):
             raise InputError(
@@ -385,7 +388,8 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
         pos1, pos2 = try1, try2
 
     counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
-                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff)
+                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
+                max_read_len)
     return (b"".join(parts), pos1 - start1, pos2 - start2, counters,
             len_hist, olen_hist, insert_hist)
 

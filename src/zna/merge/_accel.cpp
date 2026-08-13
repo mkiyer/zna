@@ -129,7 +129,8 @@ static nb::tuple merge_chunk(nb::bytes buf1, int64_t start1, int64_t end1,
         nb::bytes(blob.data(), blob.size()), pos1, pos2,
         nb::make_tuple(st.n_pairs, st.merged, st.trimmed, st.kept, st.emitted,
                        st.dropped, st.bases_trimmed, st.frags_short,
-                       st.bases_consensus, st.trim_guard, st.sum_olen, st.sum_diff),
+                       st.bases_consensus, st.trim_guard, st.sum_olen, st.sum_diff,
+                       st.max_read_len),
         hist(st.len_hist), hist(st.olen_hist), hist(st.insert_hist));
 }
 

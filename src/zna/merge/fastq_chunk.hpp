@@ -48,6 +48,9 @@ struct ChunkStats {
     int64_t n_pairs = 0, merged = 0, trimmed = 0, kept = 0;
     int64_t emitted = 0, dropped = 0, bases_trimmed = 0, frags_short = 0;
     int64_t bases_consensus = 0, trim_guard = 0, sum_olen = 0, sum_diff = 0;
+    /// Longest read seen. Reported rather than capped: the scan is O(L^2), so this is
+    /// how an accidental long-read FASTQ becomes diagnosable instead of just slow.
+    int max_read_len = 0;
     uint32_t len_hist[HIST_MAX + 1] = {};      ///< every emitted record's length
     uint32_t olen_hist[HIST_MAX + 1] = {};     ///< detected overlap lengths
     uint32_t insert_hist[HIST_MAX + 1] = {};   ///< inferred fragment length, merged only
@@ -90,13 +93,21 @@ inline Span base_name(const Span& h) noexcept {
     return {h.p, cut};
 }
 
-/// Parse one record starting at *pos*, advancing it. Returns false when no COMPLETE
-/// record remains (which is not an error -- the caller refills and retries).
+/// A located record: spans into the input buffer, nothing copied yet.
+struct RecordSpans {
+    Span h, s, q;
+    size_t next_pos;
+};
+
+/// Locate one record at *pos* and validate it, without copying anything.
 ///
-/// *up* receives the upper-cased sequence, so the returned Read is valid until the next
-/// call that shares the same buffer.
-inline bool next_record(const uint8_t* buf, size_t n, size_t& pos,
-                        uint8_t* up, size_t up_cap, Read& out, const char* which) {
+/// Returns false when no COMPLETE record remains, which is not an error -- the caller
+/// refills and retries. Separated from the upper-casing below so the caller can size
+/// its scratch from the record's ACTUAL length: doing both at once meant a read longer
+/// than the current arena threw instead of growing it, which made the compiled backend
+/// reject reads over 1024 bp while the reference merged them happily.
+inline bool locate_record(const uint8_t* buf, size_t n, size_t pos,
+                          RecordSpans& out, const char* which) {
     if (pos >= n) return false;
     const uint8_t* base = buf + pos;
     const size_t avail = n - pos;
@@ -126,14 +137,10 @@ inline bool next_record(const uint8_t* buf, size_t n, size_t& pos,
                          std::to_string(sl) + " bases but " + std::to_string(ql) +
                          " quality scores (truncated or malformed)");
     }
-    if (static_cast<size_t>(sl) > up_cap) {
-        throw InputError("read longer than the scratch buffer");   // caller sizes it
-    }
-    upper_into(e1 + 1, sl, up);
     out.h = {base + 1, hl};
-    out.s = {up, sl};
+    out.s = {e1 + 1, sl};                 // still pointing at the input, not upper-cased
     out.q = {e3 + 1, ql};
-    pos += static_cast<size_t>(e4 - base) + 1;
+    out.next_pos = pos + static_cast<size_t>(e4 - base) + 1;
     return true;
 }
 
@@ -182,33 +189,32 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
                         const uint8_t* buf2, size_t n2, size_t& pos2,
                         const Params& p, bool check_sync, int64_t base_index,
                         ChunkScratch& sc, std::string& blob, ChunkStats& st) {
+    RecordSpans a, b;
     Read r1, r2;
     for (;;) {
-        // Reserve room before parsing, so `next_record` can bound-check against it.
-        sc.ensure_reads(1024);
-        size_t try1 = pos1, try2 = pos2;
-        if (!next_record(buf1, n1, try1, sc.up1.data(), sc.up1.size(), r1, "R1")) break;
-        if (!next_record(buf2, n2, try2, sc.up2.data(), sc.up2.size(), r2, "R2")) break;
+        if (!locate_record(buf1, n1, pos1, a, "R1")) break;
+        if (!locate_record(buf2, n2, pos2, b, "R2")) break;
 
-        // A read longer than the arena needs a bigger arena and a re-parse; rare enough
-        // to be worth the retry rather than a pre-scan of every record.
-        if (r1.s.n > static_cast<int>(sc.core.cap) ||
-            r2.s.n > static_cast<int>(sc.core.cap)) {
-            sc.ensure_reads(static_cast<size_t>(r1.s.n > r2.s.n ? r1.s.n : r2.s.n));
-            try1 = pos1; try2 = pos2;
-            next_record(buf1, n1, try1, sc.up1.data(), sc.up1.size(), r1, "R1");
-            next_record(buf2, n2, try2, sc.up2.data(), sc.up2.size(), r2, "R2");
-        }
+        // Size the arena from the records we actually have, then copy into it. No cap
+        // and no flag: the arena doubles to whatever the input turns out to need.
+        const int longest = a.s.n > b.s.n ? a.s.n : b.s.n;
+        sc.ensure_reads(static_cast<size_t>(longest));
+        if (longest > st.max_read_len) st.max_read_len = longest;
+
+        upper_into(a.s.p, a.s.n, sc.up1.data());
+        upper_into(b.s.p, b.s.n, sc.up2.data());
+        r1 = {a.h, {sc.up1.data(), a.s.n}, a.q};
+        r2 = {b.h, {sc.up2.data(), b.s.n}, b.q};
 
         if (check_sync) {
-            const Span a = base_name(r1.h), b = base_name(r2.h);
-            if (a.n != b.n || std::memcmp(a.p, b.p, static_cast<size_t>(a.n)) != 0) {
+            const Span an = base_name(r1.h), bn = base_name(r2.h);
+            if (an.n != bn.n || std::memcmp(an.p, bn.p, static_cast<size_t>(an.n)) != 0) {
                 throw InputError(
                     "R1/R2 out of sync at pair " +
                     std::to_string(base_index + st.n_pairs + 1) + ": '" +
-                    std::string(reinterpret_cast<const char*>(a.p), static_cast<size_t>(a.n)) +
+                    std::string(reinterpret_cast<const char*>(an.p), static_cast<size_t>(an.n)) +
                     "' != '" +
-                    std::string(reinterpret_cast<const char*>(b.p), static_cast<size_t>(b.n)) + "'");
+                    std::string(reinterpret_cast<const char*>(bn.p), static_cast<size_t>(bn.n)) + "'");
             }
         }
 
@@ -243,8 +249,8 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
                 st.insert_hist[L <= HIST_MAX ? L : HIST_MAX] += 1;
             }
         }
-        pos1 = try1;
-        pos2 = try2;
+        pos1 = a.next_pos;
+        pos2 = b.next_pos;
     }
 }
 

@@ -832,6 +832,18 @@ ends it runs at **0.42 µs/pair**; decompression costs 1.42 and compression 0.52
   went unchecked, making the suite circular. It is now parametrised over every available
   backend.
 
+**A third defect, found by a question rather than a test.** §4 says there is no
+read-length cap and §7.4 says the arena "doubles when a longer read appears". The
+compiled backend did neither: `next_record` sized its scratch to 1024 bases *before*
+parsing and threw on anything longer, so reads over 1024 bp failed on `accel` and
+merged fine on `python` — the two backends disagreeing on a whole class of input, which
+is exactly what the oracle arrangement exists to prevent. Nothing in the suite fed
+`merge_chunk` a long read. Locating a record is now separate from copying it, so the
+arena is sized from the record's real length; the boundary is swept in both directions
+by `test_reads_longer_than_the_arena`, and `max_read_length` is reported in the JSON
+with a one-line notice past 1024 bp, since the scan is O(L²) and that is what explains
+a slow run.
+
 **One mutant survives and should.** `dmax = (ceiling - best)` instead of
 `(ceiling - best - 1)` is equivalent: a tie scores `== best` and `v > best` rejects it
 either way. Recorded so nobody writes a test to chase it.

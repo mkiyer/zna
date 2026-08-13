@@ -337,6 +337,9 @@ knobs §9 of the redesign wanted gone. The tool now has three: `t_merge`, `t_tri
 
 ### M5 — the port — **done 2026-08-12**
 
+> Superseded by M6: numba, the `merge` extra and `--allow-slow` were all removed in
+> 0.4.0. The account below is what the port itself did, kept for its reasoning.
+
 `lib/hulkrna/merge/` is now `src/zna/merge/`, shipped as `zna merge`, with the six
 modules unmodified apart from the `hulkrna` → `zna` renames. numba is the optional
 `merge` extra; `import zna.merge` works without it and the CLI refuses to run that way

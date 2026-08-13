@@ -26,10 +26,10 @@ def _open_binary_read(path: str, threads: int):
     """Return (stream, proc). ``proc`` is the pigz process to reap, or None.
 
     pigz cannot parallelise inflate (it threads only the CRC and read-ahead), so a
-    reader gains almost nothing from extra threads — while in the parallel path they
-    contend with the workers for the same allocation. The caller therefore passes 1
-    when workers are resident; see ``cli._run_parallel``. ``threads`` still sizes the
-    *writer*, where deflate genuinely parallelises.
+    reader gains almost nothing from extra threads — and measured, ``-p4`` per stream is
+    *worse* than ``-p1`` because the threads contend with the merge workers. The reader
+    therefore always passes 1. ``--io-threads`` sizes the *writer* instead, where
+    deflate genuinely parallelises.
     """
     if path.endswith(".gz"):
         pigz = shutil.which("pigz")

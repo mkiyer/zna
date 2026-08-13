@@ -545,6 +545,48 @@ class TestCrossBackend:
         assert a[0] == b[0] and a[1:4] == b[1:4], (a, b)
         assert b"\r" not in a[0], "CRLF leaked into the output"
 
+    @pytest.mark.parametrize("readlen", [150, 1023, 1024, 1025, 1600, 4100])
+    def test_reads_longer_than_the_arena(self, readlen):
+        """There is no read-length limit, and the arena has to grow to whatever turns up.
+
+        It did not: the compiled backend sized its scratch to 1024 bases *before*
+        parsing and threw "read longer than the scratch buffer" at 1025, while the
+        reference merged the same pair happily — the two backends silently disagreed on
+        an entire class of input. Nothing here fed merge_chunk a long read, so nothing
+        caught it. Sweep the boundary in both directions.
+        """
+        py, cc = _chunk_backends()
+        rng = random.Random(1000 + readlen)
+        frag = draw(rng, readlen * 3 // 2)
+        s1, s2 = frag[:readlen], rc(frag[-readlen:])
+        b1 = b"@x/1\n%b\n+\n%b\n" % (s1, b"I" * len(s1))
+        b2 = b"@x/2\n%b\n+\n%b\n" % (s2, b"I" * len(s2))
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+        a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
+        b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
+        assert a[0] == b[0] and a[3] == b[3], (readlen, a[3], b[3])
+        assert a[3][1] == 1, f"the fixture stopped merging at {readlen}"
+        assert a[3][12] == readlen, "max_read_length is not being reported"
+
+    def test_a_growing_arena_does_not_corrupt_the_pairs_after_it(self):
+        """The arena grows mid-chunk, so everything already merged in that chunk must
+        survive it. Feed a short pair, then a long one, then short ones again."""
+        py, cc = _chunk_backends()
+        rng = random.Random(77)
+        recs1, recs2 = [], []
+        for i, readlen in enumerate((80, 80, 2200, 80, 90, 3000, 100)):
+            frag = draw(rng, readlen * 3 // 2)
+            s1, s2 = frag[:readlen], rc(frag[-readlen:])
+            recs1.append(b"@r%d/1\n%b\n+\n%b\n" % (i, s1, b"I" * len(s1)))
+            recs2.append(b"@r%d/2\n%b\n+\n%b\n" % (i, s2, b"I" * len(s2)))
+        b1, b2 = b"".join(recs1), b"".join(recs2)
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+        a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
+        b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
+        assert a[0] == b[0], "blobs differ once the arena has grown"
+        assert a[3] == b[3]
+        assert a[3][0] == 7 and a[3][1] == 7, a[3]      # all seven merged
+
     def test_split_records_agrees(self):
         py = __import__("zna.merge._pymerge", fromlist=["x"]).split_records
         from zna.merge.backend import available_merge_backends, get_merge_backend

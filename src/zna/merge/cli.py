@@ -38,9 +38,15 @@ _HIST_MAX = 1024   # length/overlap histograms are clamped to this many bins
 # --------------------------------------------------------------------------- #
 
 #: Counter fields, in the order every backend returns them.
-_N_COUNTERS = 12
+_N_COUNTERS = 13
 (_N_PAIRS, _MERGED, _TRIMMED, _KEPT, _EMITTED, _DROPPED, _BASES_TRIMMED,
- _FRAGS_SHORT, _BASES_CONSENSUS, _TRIM_GUARD, _SUM_OLEN, _SUM_DIFF) = range(_N_COUNTERS)
+ _FRAGS_SHORT, _BASES_CONSENSUS, _TRIM_GUARD, _SUM_OLEN, _SUM_DIFF,
+ _MAX_READ_LEN) = range(_N_COUNTERS)
+
+#: Reads longer than this get one informational line. The scan is O(L^2), so a
+#: long-read FASTQ fed here by accident is slow rather than wrong, and saying so once
+#: is the difference between "diagnosable" and "looks hung".
+_LONG_READ_NOTICE = 1024
 
 
 def _new_acc():
@@ -51,8 +57,10 @@ def _new_acc():
 def _fold(counters, len_hist, olen_hist, insert_hist, acc):
     """Fold one chunk's statistics into the accumulator, in place."""
     ac, al, ao, ai = acc
-    for i in range(_N_COUNTERS):
+    for i in range(_MAX_READ_LEN):
         ac[i] += counters[i]
+    if counters[_MAX_READ_LEN] > ac[_MAX_READ_LEN]:      # a maximum, not a sum
+        ac[_MAX_READ_LEN] = counters[_MAX_READ_LEN]
     for src, dst in ((len_hist, al), (olen_hist, ao), (insert_hist, ai)):
         for i, c in enumerate(src):
             if c:
@@ -264,6 +272,7 @@ def _assemble_stats(acc, params, elapsed=None):
     bases_trimmed, frags_short = counters[_BASES_TRIMMED], counters[_FRAGS_SHORT]
     bases_consensus, trim_guard = counters[_BASES_CONSENSUS], counters[_TRIM_GUARD]
     sum_olen, sum_diff = counters[_SUM_OLEN], counters[_SUM_DIFF]
+    max_read_len = counters[_MAX_READ_LEN]
     total_bases = sum(i * c for i, c in enumerate(hist))
     pct = (lambda n: round(100.0 * n / n_pairs, 3) if n_pairs else 0.0)
     match_w, mismatch_w = score_weights(params.err_rate)
@@ -302,6 +311,9 @@ def _assemble_stats(acc, params, elapsed=None):
         # chance alignment: the threshold caps the observable rate at ~0.22.
         "overlap_mismatch_rate": round(sum_diff / sum_olen, 6) if sum_olen else 0.0,
         "overlap_bases_compared": sum_olen,
+        # Longest input read. There is no read-length limit -- buffers size themselves
+        # -- but the scan is O(L^2), so this is what explains an unexpectedly slow run.
+        "max_read_length": max_read_len,
         "params": {
             "threshold_merge_bits": params.t_merge,
             "threshold_trim_bits": params.t_trim,
@@ -406,6 +418,10 @@ def run(args) -> dict:
             f"no read pairs in {args.in1} / {args.in2}. If that is expected, pass "
             f"--allow-empty; otherwise the input is truncated or the wrong file."
         )
+    if acc[0][_MAX_READ_LEN] > _LONG_READ_NOTICE:
+        logger.info(
+            "longest read %d bp: the overlap scan is O(L^2), so expect it to be slow "
+            "in proportion (no limit is imposed)", acc[0][_MAX_READ_LEN])
     stats = _assemble_stats(acc, params, elapsed)
 
     if args.json:
