@@ -1,13 +1,81 @@
-# Evidence for `docs/MERGE_CPP_DESIGN.md`
+# Evidence for `docs/METHODS.md` and `docs/MERGE_BENCHMARK_RESULTS.md`
 
-Every number in the design document comes from these scripts. They are kept so the
-design can be re-argued against measurements rather than recollection, and so the same
-numbers can be taken on a Linux/x86 box — this session's were all aarch64, which matters
-for `popcount` (design §10, §14.1).
+Every number in those documents comes from these scripts. They are kept so the design
+can be re-argued against measurements rather than recollection, and so the same numbers
+can be taken on a Linux/x86 box — this session's were all aarch64, which matters for
+`popcount`. See docs/ROADMAP.md, "0.4.1 — x86 tuning".
 
 Nothing here is part of the zna package or the test suite.
 
-## Reproducing
+Two groups of scripts: `simulate.py` + `compare.py` measure **accuracy** against ground
+truth, and everything else measures **speed** and pins the C++ design.
+
+---
+
+## Accuracy: `simulate.py` and `compare.py`
+
+The head-to-head against fastp on simulated ground truth; results in
+[MERGE_BENCHMARK_RESULTS.md](../../docs/MERGE_BENCHMARK_RESULTS.md).
+
+```bash
+# 1M pairs from hg38, ~12 s, ~200 MB of FASTQ plus a 300 MB truth sidecar.
+# Deterministic in the seed, so regenerate it rather than storing it.
+python simulate.py --genome hg38.fa --out-prefix sim --n-pairs 1000000 \
+                   --read-length 150 --frag-min 60 --frag-max 450 \
+                   --error-rate 0.002 --quality-model novaseq --seed 42
+
+# runs both tools, scores both against the sidecar, ~25 s
+python compare.py --sim-prefix sim --out results/ --threads 4
+```
+
+Writes `results/report.md`, `results/summary.json`, and `results/{zna,fastp}_errors.tsv`
+— one row per pair the tool got wrong, carrying the truth, what was emitted, and the
+evidence the decision was made on. **That file is the point of the exercise**; read it.
+
+Four things that are easy to get wrong here, all of them load-bearing:
+
+- **`--quality-model flat` measures nothing about the consensus.** With a constant
+  quality string every mismatch is a tie and R1 always wins; measured, both tools
+  recover exactly **0.0%** of recoverable overlap errors. Use `novaseq`, which draws the
+  quality first and the error from it at `10^(-Q/10)`.
+- **Uniform fragment lengths are not a library.** They exist to populate every geometric
+  regime at equal density. Quote per-bin sensitivity, never the overall merge rate.
+- **The sidecar is the authority, not the FASTQ comment.** Both tools rewrite headers.
+  The read ID up to the first whitespace is the join key. The sidecar records the
+  substituted base at every injected error, so it reconstructs the reads exactly.
+- **Put the working environment's `bin/` on `PATH`** or `shutil.which("pigz")` returns
+  None and everything silently falls back to stdlib gzip.
+
+`compare.py` re-runs `zna merge`'s own kernel on every pair that merged wrongly, and
+scores the *true* shift alongside the one the tool chose. That is what distinguishes a
+defective search from an ambiguous input, and it is the difference between "fix the
+code" and "the genome repeats here".
+
+**Trimming is scored as its own contract, not as a footnote to merging.** Most pairs in
+a real library do not merge, and an unmerged pair is still encoded, so whether its
+redundant overlap came off matters to the corpus exactly as much as a merge does. Two
+traps worth knowing:
+
+- **Score every kept pair, not just the overlapping ones.** A trim applied to a pair
+  whose mates share nothing deletes real sequence, and an analysis restricted to pairs
+  with a true overlap cannot see it. There are 2,733 of those in 1M pairs.
+- **Report the counterfactual.** "28,074 duplicated bases survived" means nothing without
+  "283,838 would have, untrimmed". `compare.py` emits both, plus the bases deleted, so
+  the trade is legible rather than asserted.
+
+`compare.py --threshold-trim T` passes the value straight through to `zna merge`, which
+is how the band gets priced — the merge decision does not move with it, so a sweep
+isolates the trim cleanly:
+
+```bash
+for T in 8 12 16 20; do
+  python compare.py --sim-prefix sim --out sweep_t$T --threshold-trim $T --threads 4
+done
+```
+
+---
+
+## Speed: reproducing the C++ design
 
 ```bash
 cd scripts/merge_bench
