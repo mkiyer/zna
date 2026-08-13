@@ -57,6 +57,13 @@ The script will:
 3. Show a diff for your review, and prompt before doing anything irreversible
 4. Commit (if there is anything to commit), tag `v0.4.0`, and push both
 
+#### Check CI is green on the branch before you tag
+
+`.github/workflows/ci.yml` builds and tests on Linux, macOS and Windows on every push.
+**Wait for it.** A local test run proves nothing about MSVC: 0.4.0's first tag had to be
+deleted because the Windows wheel failed on a compiler builtin that a macOS developer
+machine never even compiles. The tag is the expensive place to discover that.
+
 #### Verify in both environments first
 
 The compiled merge extension is the thing most likely to be silently absent, and it
@@ -68,7 +75,7 @@ answers, so a broken build looks like a slow node rather than a mistake.
 /path/to/envs/zna_merge/bin/python -m pytest        # expect 0 skips in the merge suite
 
 # extension-less: proves the reference oracle is not silently untested
-/path/to/envs/zna/bin/python -m pytest              # expect ~53 skips
+/path/to/envs/zna/bin/python -m pytest              # expect ~56 skips
 ```
 
 A rebuild is `pip install -e . --no-build-isolation`, and **grep its output for
@@ -253,8 +260,9 @@ git push origin v0.2.0
 ## Release Checklist
 
 ```
+[ ] CI green on the branch, all three platforms  <-- MSVC is only checked here
 [ ] Tests pass in the COMPILED env (0 merge skips)
-[ ] Tests pass in the EXTENSION-LESS env (~53 skips, oracle exercised)
+[ ] Tests pass in the EXTENSION-LESS env (~56 skips, oracle exercised)
 [ ] Rebuild output contained "Successfully built"
 [ ] Merged to main:  git checkout main && git merge <branch>
 [ ] Working directory clean: git status

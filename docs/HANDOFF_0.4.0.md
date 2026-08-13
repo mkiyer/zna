@@ -1,7 +1,7 @@
 # Handoff: 0.4.0 is done; what the next session needs
 
-Updated 2026-08-13. Branch `zna-0.4.0-hardening`, working tree clean, **627 tests green
-compiled / 574 + 53 skipped extension-less**.
+Updated 2026-08-13. Merged to `main`, working tree clean, **630 tests green compiled /
+574 + 56 skipped extension-less**, and CI green on Linux, macOS and Windows.
 
 Sections 3–5 are the durable part — the traps, the ground truth, and the two properties
 worth re-checking after *any* change to the merge or encode path. They cost real time to
@@ -52,10 +52,16 @@ the comment says so.
 
 ## 2. What is next
 
-`docs/MERGE_PAIRS_PLAN.md` is execution-ready and unchanged: `zna encode --merge-pairs`
-for 0.5.0, deferred because the one-step and two-step paths produce the *identical*
-corpus on the 1M library. Its provenance story is already settled — it computes the same
-`PairResult` and writes the same `PROV_*` bits directly, with no FASTQ in between.
+`docs/MERGE_PAIRS_PLAN.md` — `zna encode --merge-pairs` for 0.5.0, deferred because the
+one-step and two-step paths produce the *identical* corpus on the 1M library. Its
+provenance story is already settled: it computes the same `PairResult` and writes the
+same `PROV_*` bits directly, with no FASTQ in between.
+
+**Read its `§0.0` first.** Revision 2 was audited against the code hours before the
+`--npolicy` work landed, so it told the reader to preserve `--npolicy drop` — which no
+longer exists — and asserted that `zna merge` has no N policy, which is now the opposite
+of true. Corrected, but the corrections are worth reading as a set before trusting the
+rest of the document.
 
 Decisions closed by measurement, **not to be reopened without new evidence** — the table
 in `docs/NPOLICY_PLAN.md` §2 and `docs/METHODS.md` carry the reasoning: no `--max-n`; a
@@ -94,7 +100,7 @@ authorised.
    mv "$M" "$M.disabled"
    ```
 
-   Confirm with `available_merge_backends() == ['python']`. Expect ~53 skips. Note
+   Confirm with `available_merge_backends() == ['python']`. Expect ~56 skips. Note
    `zna.is_accelerated()` stays **True** there — that is the *codec* extension, which is
    a different build target and is not what this env disables.
 
@@ -108,6 +114,23 @@ authorised.
    `available_merge_backends`**, so adding a name there against a stale `.so` leaves
    `accel` listed as available while `get_merge_backend()` silently falls back to the
    50x-slower reference kernel.
+
+8. **This machine compiles neither the SSE2 kernel nor MSVC.** `merge_core.hpp` has three
+   `neq16` paths — NEON, SSE2, scalar — and an arm64 Mac only ever builds the first. A
+   green local suite says nothing about the other two, and 0.4.0's first tag was deleted
+   because of exactly that: `__builtin_popcount` in the SSE2 branch, which MSVC does not
+   have.
+
+   CI now covers it (`.github/workflows/ci.yml`, on every push), but when touching the
+   kernel you can check both vector paths in seconds without waiting for it — Rosetta
+   runs the x86 binary:
+
+   ```bash
+   c++ -std=c++17 -arch x86_64 -I. -fsyntax-only <(echo '#include "src/zna/merge/fastq_chunk.hpp"')
+   ```
+
+   Compile the header **standalone** while you are there. It documents itself as
+   dependency-free, and it was silently relying on its includer for `<vector>`.
 
 ---
 

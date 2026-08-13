@@ -42,6 +42,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>     // Scratch's arenas. Included explicitly: this header documents
+                      // itself as standalone, and it was previously relying on the
+                      // translation unit to have pulled <vector> in first.
 
 // 16-byte vectors are baseline on every target we build for: NEON on aarch64, SSE2 on
 // x86-64 (part of the base ISA -- no -march flag, no runtime check). Anything wider is
@@ -57,6 +60,40 @@
 
 namespace zna_merge {
 
+/// Population count of a 16-bit mask, the portable fold.
+///
+/// Always compiled, on every platform, even where `popcount16` below does not call it --
+/// otherwise the only build that exercises it is the only build that cannot test it.
+/// `tests/test_merge.py::TestPopcount` checks it against Python's own bit count over all
+/// 65,536 inputs, from whichever platform the suite happens to run on.
+inline int popcount16_portable(unsigned x) noexcept {
+    x &= 0xFFFFu;
+    x -= (x >> 1) & 0x5555u;                     // pairs
+    x = (x & 0x3333u) + ((x >> 2) & 0x3333u);    // nibbles
+    x = (x + (x >> 4)) & 0x0F0Fu;                // bytes
+    return static_cast<int>((x * 0x0101u) >> 8) & 0xFFu;   // sum the two bytes
+}
+
+/// Population count of a 16-bit mask, with **no ISA requirement**.
+///
+/// `__builtin_popcount` is a GCC/Clang extension. MSVC does not have it, and the first
+/// Windows build of this extension failed on exactly that -- C3861, at the `neq16` line
+/// below -- because `zna merge` is new in 0.4.0 and no MSVC had ever compiled this file.
+///
+/// MSVC's `__popcnt16` is **not** the fix. It compiles to the POPCNT instruction, which
+/// is SSE4.2-era and not baseline x86-64, so the wheel would build cleanly and then
+/// fault with an illegal instruction on an older CPU. A compile error on a machine we
+/// control beats a crash on a machine we do not.
+inline int popcount16(unsigned x) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    // Cheap even without -mpopcnt: the compiler emits a table or a SWAR sequence, and
+    // only emits POPCNT itself when the ISA is enabled explicitly.
+    return __builtin_popcount(x & 0xFFFFu);
+#else
+    return popcount16_portable(x);
+#endif
+}
+
 /// Number of differing bytes in a 16-byte window. Unaligned loads are penalty-free on
 /// every target of interest.
 inline int neq16(const uint8_t* a, const uint8_t* b) noexcept {
@@ -70,10 +107,7 @@ inline int neq16(const uint8_t* a, const uint8_t* b) noexcept {
     std::memcpy(&va, a, 16);
     std::memcpy(&vb, b, 16);
     const int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(va, vb));
-    // popcount of a 16-bit value. __builtin_popcount is cheap even without -mpopcnt:
-    // the compiler emits a table or a SWAR sequence, never an illegal instruction --
-    // POPCNT is only emitted when the ISA is enabled explicitly.
-    return 16 - __builtin_popcount(static_cast<unsigned>(mask) & 0xFFFFu);
+    return 16 - popcount16(static_cast<unsigned>(mask));
 #else
     int d = 0;
     for (int k = 0; k < 16; ++k) d += (a[k] != b[k]);

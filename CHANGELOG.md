@@ -484,6 +484,28 @@ now covered by a test that fails if the defect is reintroduced.
 - `zna merge` **refuses to run on the reference kernel** unless asked by name
   with `--backend python`. It is correct and ~50x slower, and a silently-correct
   50x slowdown at cluster scale is indistinguishable from a slow node.
+- **The Windows wheel did not build.** `neq16`'s SSE2 path counted equal lanes with
+  `__builtin_popcount`, a GCC/Clang extension MSVC does not have, so the first Windows
+  build of the merge extension failed with `C3861`. It survived to a tag for two
+  compounding reasons: `zna merge` is new in 0.4.0, so no MSVC had ever compiled
+  `merge_core.hpp`; and an arm64 developer machine takes the NEON path, where the
+  popcount does not appear at all.
+
+  Replaced with a portable SWAR fold. MSVC's `__popcnt16` is deliberately *not* used —
+  it emits the POPCNT instruction, which is not baseline x86-64, and would have turned a
+  build error into an illegal-instruction fault on an older CPU. The fold is compiled on
+  every platform even where nothing calls it, and `tests/test_merge.py::TestPopcount`
+  checks it over all 65,536 inputs, so the branch is no longer testable only on the one
+  build that cannot run the suite.
+
+  `merge_core.hpp` also now includes `<vector>` itself, which it uses and had been
+  getting from whichever translation unit included it first.
+- **CI now runs on every push, not only on `v*` tags.** The only workflow was
+  `publish.yml`, so nothing compiled this project on Windows or Linux until a release was
+  already tagged — which is the whole reason the above cost a tag. `.github/workflows/ci.yml`
+  builds and tests on Linux, macOS and Windows across the ends of the supported Python
+  range, asserts *both* extensions actually loaded, and does not fail-fast, so one
+  platform's compiler error cannot hide another's.
 - **`scripts/release.sh` had two ways to produce a wrong release**, both found by
   reading it rather than by running it:
   - It pushed a hardcoded `main` and then tagged `HEAD`. Run from a feature

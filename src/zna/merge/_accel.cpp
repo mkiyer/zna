@@ -211,6 +211,15 @@ NB_MODULE(_accel, m) {
           "Absolute byte offset just past max_records complete FASTQ records, and how many\n"
           "were found, as (offset, n_records).");
 
+    // Test hook, not API -- hence the leading underscore, and hence its absence from
+    // backend._REQUIRED_FUNCTIONS. It exists so the SWAR popcount that only MSVC
+    // actually calls is still checked on every platform the suite runs on; the
+    // alternative is a branch whose only build is the one that cannot test it.
+    m.def("_popcount16_portable",
+          [](unsigned x) { return zna_merge::popcount16_portable(x); },
+          nb::arg("x"),
+          "Population count of the low 16 bits, via the portable SWAR fold.");
+
 #ifdef ZNA_MERGE_V16
     m.attr("VECTOR_WIDTH") = 16;
 #else

@@ -386,6 +386,51 @@ def tie_fixtures():
             yield (period * 40)[:L], (rot * 40)[:L], f"flank-{period.decode()}-L{L}"
 
 
+class TestPopcount:
+    """The 16-bit popcount under the SSE2 kernel, and why it is tested from everywhere.
+
+    `neq16`'s x86 path counts equal lanes with a popcount. That used to be
+    `__builtin_popcount`, which is a GCC/Clang extension — MSVC does not have it, and the
+    first Windows build of this extension failed on exactly that line with C3861. It went
+    unnoticed because `zna merge` is new in 0.4.0, so no MSVC had ever compiled the file,
+    and because an arm64 developer machine takes the NEON path, where the popcount does
+    not appear at all.
+
+    So the portable fold is compiled on *every* platform even where nothing calls it, and
+    checked here — otherwise its only build would be the one build that cannot run this
+    suite. MSVC's `__popcnt16` is deliberately not used: it emits the POPCNT instruction,
+    which is not baseline x86-64, and would turn a build error into an illegal-instruction
+    fault on an older CPU.
+    """
+
+    def _fn(self):
+        accel = pytest.importorskip("zna.merge._accel", exc_type=ImportError)
+        if not hasattr(accel, "_popcount16_portable"):
+            pytest.skip("extension predates the portable popcount")
+        return accel._popcount16_portable
+
+    def test_exhaustive_over_every_16_bit_input(self):
+        """65,536 inputs is small enough to check all of them, so check all of them."""
+        fn = self._fn()
+        bad = [x for x in range(1 << 16) if fn(x) != bin(x).count("1")]
+        assert not bad, f"{len(bad)} mismatches, first at {bad[:5]}"
+
+    def test_the_boundaries_it_would_plausibly_get_wrong(self):
+        """A SWAR fold fails at the carry boundaries or nowhere; name them anyway."""
+        fn = self._fn()
+        assert fn(0x0000) == 0 and fn(0xFFFF) == 16
+        assert fn(0x00FF) == 8 and fn(0xFF00) == 8      # the byte-sum step
+        assert fn(0x5555) == 8 and fn(0xAAAA) == 8      # the pair step
+        assert fn(0x8000) == 1 and fn(0x0001) == 1
+
+    def test_bits_above_16_are_ignored(self):
+        """It is documented as a 16-bit count and `neq16` relies on that: the movemask
+        result is 16 bits, but nothing stops a caller passing a wider value."""
+        fn = self._fn()
+        assert fn(0xFFFF0000) == 0
+        assert fn(0xDEAD_FFFF) == 16
+
+
 class TestCrossBackend:
     """The oracle and the accelerated kernel are one algorithm with two implementations.
 
