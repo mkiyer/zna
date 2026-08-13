@@ -12,6 +12,11 @@ name: CI
 on:
   push:
     branches: ['**']
+    # Tags too. publish.yml runs on `v*` and does NOT depend on this workflow, so
+    # without this a tag push builds and uploads wheels while the full test suite runs
+    # nowhere. cibuildwheel's per-wheel smoke test is a real gate but a narrow one --
+    # it imports the extensions, it does not run the 630-test suite.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 

@@ -119,13 +119,37 @@ twine upload dist/*
 
 Do this **after** the PyPI release is live and the GitHub tag exists.
 
+> **The autobump bot gets there first, and its PR is not what you want.**
+> Within a day of the PyPI release, `BiocondaBot` opens "Update zna to X.Y.Z"
+> automatically. It rewrites **only** `version` and `sha256`, on top of the *previously
+> published* recipe body — so every recipe change you made since the last release is
+> absent from it. Merging it, or merely re-hashing it, ships the old recipe under the new
+> version.
+>
+> That is not hypothetical: bioconda's zna 0.3.5 is missing `pyyaml` from `run:`, so
+> `zna encode --label-defs` fails for every conda user, and its test section only
+> *prints* `is_accelerated()` instead of asserting it — a build that lost either compiled
+> extension passes every test in it. Both were fixed in this repo's copy and neither
+> reached bioconda, because the bot's PR carried the old body forward.
+>
+> **Always overwrite `recipes/zna/meta.yaml` wholesale with this repo's
+> `conda/meta.yaml`.** Never hand-edit just the hash.
+
 ### Update the SHA256 hash
 
 ```bash
-./scripts/update-conda-sha.sh 0.2.0
+./scripts/update-conda-sha.sh 0.4.0            # download, hash, rewrite conda/meta.yaml
+./scripts/update-conda-sha.sh 0.4.0 --check    # verify only; exits 1 if stale
 ```
 
-This downloads the release tarball, computes its SHA256, and patches `conda/meta.yaml`.
+`--check` is the one to run before submitting anything, and again if the tag was ever
+re-cut. Nothing else in the release verifies that `conda/meta.yaml`'s hash matches the
+tarball at its own URL — bioconda CI used to be the first thing to notice, which is
+exactly how v0.4.0's recipe went stale after the tag was deleted and re-pushed.
+
+The script refuses to run against a tag that does not exist. It used to hash GitHub's
+14-byte "404: Not Found" page and report success, because `curl -L` without `-f` exits 0
+on an HTTP error.
 
 ### Test the conda build locally (optional)
 
@@ -228,11 +252,26 @@ has its own copy that the release script also updates.
 ### Need to redo a tag
 
 ```bash
-git tag -d v0.2.0
-git push origin :refs/tags/v0.2.0
-git tag -a v0.2.0 -m "Release 0.2.0"
-git push origin v0.2.0
+git tag -d v0.4.0
+git push origin :refs/tags/v0.4.0
+git tag -a v0.4.0 -m "Release 0.4.0"
+git push origin v0.4.0
 ```
+
+**Re-cutting a tag invalidates every SHA256 of it.** GitHub generates the source archive
+from whatever the tag points at, so moving the tag changes the tarball bytes and every
+recipe hash computed from the old one goes stale — including any already copied into
+bioconda-recipes, and any the autobump bot already read. After re-cutting, always:
+
+```bash
+./scripts/update-conda-sha.sh <version>          # re-hash this repo's copy
+./scripts/update-conda-sha.sh <version> --check  # confirm
+```
+
+and then re-copy the recipe to bioconda. (PyPI is unaffected: its artifacts are
+immutable and already uploaded. But note you **cannot** re-upload the same version to
+PyPI, so a re-cut tag after a successful publish means the sdist on PyPI was built from
+the *old* commit.)
 
 ### Conda build fails locally
 - Ensure `cmake >= 3.15`, a C++ compiler, and `conda-build` are installed
