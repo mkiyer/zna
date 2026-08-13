@@ -1,7 +1,8 @@
 """
 Backend selection for ZNA codec operations.
 
-Each backend is a Python module that exposes four functions:
+Each backend is a Python module that exposes the five functions in
+``_REQUIRED_FUNCTIONS`` below, which is what ``_load`` validates at import:
 
     encode_sequence(seq: str) -> bytes
     reverse_complement(seq: str) -> str
@@ -9,6 +10,10 @@ Each backend is a Python module that exposes four functions:
         -> (flags_bytes, lengths_bytes, seqs_bytes)
     decode_block(flags_data, lengths_data, seqs_data, len_bytes, count)
         -> list[(seq, is_paired, is_read1, is_read2, is_rc)]
+    decode_block_sequences(...)  -> list[str], for the columnar blocks() path
+
+(``encode_block``/``decode_block`` take further arguments for labeled files; see
+``core.py``'s call sites, which are the contract in practice.)
 
 Available backends
 ------------------

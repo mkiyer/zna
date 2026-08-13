@@ -5,13 +5,243 @@ All notable changes to the ZNA project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-08-12
+## [0.4.0] - 2026-08-13
 
 Adds `zna merge`, an overlap merger for paired-end reads, with a compiled
-C++ kernel. No on-disk format change, and nothing existing changes
-behaviour.
+C++ kernel, and repairs six defects found while auditing the merge → encode
+seam — one of them a heap overflow, four of them silent. No on-disk format
+change.
+
+**Read the "Fixed (silent)" section before upgrading.** Two of those fixes change
+what a previously-"successful" run does: an encode that swallowed a malformed SAM
+tag now fails, and a ZNA → ZNA copy through `records(with_ends=True)` now raises
+instead of quietly dropping flag bits.
+
+### Changed — `--npolicy` (breaking; affects the corpus)
+
+The policy set is now **`{trim3, random}`**, default `trim3`. `drop` and `A`/`C`/`G`/`T`
+are removed.
+
+- **`trim3`** cuts a read at its first no-call, keeping `[0, first N)`. 3' only, so base 0
+  stays a true fragment boundary however short the read gets. In `zna merge` it runs
+  *after* overlap rescue and is followed by a coverage retry: a pair that still tiles the
+  fragment (`k1 + k2 >= L`) merges anyway, and the reconstruction is the fragment exactly.
+  Measured on 200k pairs with no-calls in 1.5% of reads: **zero N in the output** for 0.22%
+  of bases and 0.31% of merges demoted to pairs.
+- **`drop` is subsumed.** Trimming and letting the length filter discard the remainder is
+  the same outcome for a read that is mostly N, and strictly better for one with an N near
+  its 3' end — which is where instrument no-calls sit. `trim3` also never orphans a mate,
+  so the fragment-atomic machinery `drop` needed is gone.
+- **`A`/`C`/`G`/`T` are removed**: a fixed base injects a composition bias correlated with
+  low quality, and buys nothing `random` does not.
+
+**Reported, not silent.** `--merge-json` and the merge summary now say what the policy
+did, and warn above 1% of emitted bases — because the failure being guarded against is a
+run that eats most of a library and still ends with `done`. On a library with no-calls in
+1.5% of reads the two policies read very differently:
+
+```
+no-calls: 1110 rescued from the mate; --npolicy trim3  then removed     182,477 bases
+no-calls: 1110 rescued from the mate; --npolicy random then substituted   4,844 bases
+```
+
+trim3 discards everything after each surviving no-call, so it costs 37x more sequence than
+random invents. That trade-off was previously invisible.
+
+**Four defects fixed with it.** Measured over all 256 byte values x every policy:
+
+- **`--npolicy drop` — the default — silently wrote `A` on the compiled backend.** One
+  reasoning slip: `has_npolicy = !npolicy.empty()` made `drop` truthy, and the
+  `C`/`G`/`T`/`random` chain did not match it, so it fell to the `A` default. Every
+  unrecognised policy string did the same. The set is now closed and rejects.
+- **`--npolicy` was not an N policy.** `_accel` substituted for *any* unencodable byte, so
+  an IUPAC code became a real base; `_pycodec` raised. Only `N`/`n` is substitutable now,
+  in both, and every other non-ACGT byte raises with the character and offset.
+- **`random` was not reproducible.** `_pycodec` used the unseeded global `random`.
+- **Unstranded strand normalization was not reproducible either** — the same unseeded
+  global chose which mate to reverse-complement, and `_accel`'s per-block xorshift made
+  the choice depend on `--block-size`:
+
+  ```
+  one block of 16 : [13, 6, 5, 14, 5, 14, 13, 6, 5, 14, 13, 6, 5, 14, 13, 6]
+  two blocks of 8 : [13, 6, 5, 14, 5, 14, 13, 6, 13, 6, 5, 14, 5, 14, 13, 6]
+  ```
+
+  Both random decisions are now derived from `(--seed, global record index, offset)`
+  through a shared splitmix64 finalizer written identically in C++ and Python — stateless,
+  so batching cannot shift a draw. Verified reproducible across runs, identical across
+  backends, and unchanged across `--block-size`.
+
+  **This changes every existing unstranded-normalized file**: the orientation assignment
+  is different under the new scheme. Deliberate.
+
+- Also fixed in passing: `_accel` measured a record's length in UTF-8 *bytes*, so a
+  non-ASCII character corrupted the lengths column (`ACGéT` stored as length 6, decoding
+  to `ACGAAT`). Both backends now raise.
+
+### Changed — merge consensus (affects the corpus)
+
+- **The overlap consensus is now written only into records whose construction depends on
+  the overlap being real**: R1 on a merge, both mates on a trim, **neither on a kept
+  pair**. It previously went into R1 on every detected overlap, including kept pairs —
+  where both mates are emitted in full, so the corpus carried one corrected copy of the
+  region beside one uncorrected copy of it.
+
+  The reason given for that asymmetry was circular ("a kept pair emits R2 untouched",
+  offered as the reason for emitting R2 untouched), and measurement says the write was
+  net harmful. A detection that lands in *kept* is spurious almost by construction: at
+  `shift >= 0` the pair is there only because the trim guard refused it, which requires
+  an inferred overlap of more than about 110 bases — and a genuine overlap that long
+  scores ~218 bits and would have merged at 28. Over 1M ground-truth pairs, of the 3,068
+  kept pairs carrying a detected overlap **none found the true shift** and 97.3% had no
+  true overlap at all. Wrong emitted bases in the overlap window: **208** correcting
+  neither, 1,509 correcting R1 only, 17,870 correcting both. The old R1-only write turned
+  1,379 correct bases wrong in order to fix 78.
+
+  Corpus impact: 1,934 of 1,416,630 emitted records differ (0.137%) — 712 sequence lines
+  and 1,934 quality lines. Merge decisions are untouched: the merged / trimmed / kept
+  counts are identical.
+
+  A claim that had propagated into three places is retracted with it: `shift >= 0` does
+  **not** keep the write clear of R2's 5' end. The real bound is
+  `min written R2 index = max(0, len2 - len1 + shift)`, which reaches index 0 at
+  non-negative shifts once the mates differ in length — 9 of the recorded 237 corrupted
+  5' ends are at `shift >= 0`, not read-through at all. What keeps the trim branch clear
+  of that boundary is `trim_is_allowed`, which forces `shift >= min_read_length`.
+
+- **An `N` is now rescued from the mate by design rather than by luck.** An `N` is a
+  no-call: it carries no base information, so a real call on the other mate beats it
+  whatever the two quality scores say, and the rescued base keeps the surviving mate's
+  own quality rather than a contested-base derating — there was no contest. Previously
+  the ordinary posterior decided, which rescued an N only because an instrument usually
+  assigns one a low quality; a **high-quality N beat a real base and survived into the
+  corpus**, where nothing downstream can distinguish it from a genuine ambiguity. Only
+  `N` is rescued — the IUPAC codes carry partial information and are left alone — and the
+  scan is untouched, so merge decisions do not move.
+
+  Worth recording: the first implementation of this was wrong in the compiled backend
+  only, and the cross-backend equality tests passed anyway, because no fixture in the
+  suite had an `N` inside an overlap. There is one now.
+
+### Fixed (silent)
+
+Each of these produced a plausible-looking output and a zero exit status. Each is
+now covered by a test that fails if the defect is reintroduced.
+
+- **Heap buffer overflow in the compiled merge kernel.** `Scratch::name` was sized
+  from the *read-length* arena (minimum 1024 bytes) but written from the *header*:
+  a merged record's name is R1's header plus a `merged_<n1>_<n2>` tag. Any FASTQ
+  whose headers outran its reads wrote past the end of the block. Reproduced with
+  51 bp reads and a 16 KB header: one run aborted under malloc's heap check, an
+  identical rerun returned well-formed output — meaning the quiet runs were
+  corrupting adjacent heap. The reference backend was never affected, so no
+  cross-backend test could catch it without a long-header fixture; there is one
+  now. `name` has its own `ensure_name()`, sized from the header.
+
+- **`--shuffle` and ZNA → ZNA re-encode silently dropped flag bits.** Every copy
+  path routed the flags byte through `(has_start, has_end)`, which has three
+  states where `(IS_RC, IS_FULL_FRAGMENT)` has four: `ENDS_BY_FLAG` maps byte 16
+  and byte 24 alike to `(True, True)` — correctly, since both records do have two
+  real fragment ends — so no inverse exists, and the one that existed cleared
+  `IS_RC` on every full-fragment record. `--shuffle` is in the documented
+  merged-read recipe and passed through the conversion twice. Measured on a
+  200-record normalized file: `IS_RC` on 101 records before a shuffle, **0**
+  after, at which point `--restore-strand` returned half the corpus in the wrong
+  orientation. Fragment *geometry* was never affected, so this cost reversibility
+  rather than supervision. See **Added** for the copy API that replaces it.
+
+- **Re-encoding a non-normalized ZNA dropped `IS_FULL_FRAGMENT` entirely.** The
+  same seam, the other branch: `preserve_normalization` was `is_reencoding and
+  input_header.strand_normalized`, so a file that had never been normalized took
+  the plain 4-tuple path, where the flag has no source at all and was re-derived
+  as `False`. A merged read encoded with `--treat-unpaired-as-merged` read back as
+  ends `(True, True)`; re-encoding that file gave `(True, False)`. ZNA → ZNA is
+  now a copy in both branches.
+
+- **Two independently merged reads sharing a name were encoded as one fragment.**
+  `zna encode --interleaved` infers pairing from read names, so two merged
+  molecules that happen to share one were paired: both lost `IS_FULL_FRAGMENT`,
+  both gained `IS_PAIRED`/`IS_READ1`/`IS_READ2`, and two different molecules were
+  written as each other's mate. Duplicate read names are ordinary in real data
+  (concatenated lanes, some SRA dumps, UMI-collapsed files). A merged read is now
+  never a mate: `_read_key` reports it from the `merged_<n1>_<n2>` token that
+  `zna merge`, fastp and khorana's `parse_merged_fastq` already agree on, and
+  pairing skips it. Nothing errors — the records simply come out right.
+
+- **Two-file input with unequal record counts truncated the library.** The loop
+  was `zip(p1, p2)`, which stops at the shorter file: every remaining R1 read was
+  dropped, at exit 0. (`zip` also made it unfixable from outside — it has already
+  pulled and discarded the extra value by the time it stops, so the off-by-one
+  case looks like a clean finish.) Both files must now hold the same number of
+  records, and the error names the one that ended early. Pairing remains
+  positional; use `zna merge` or `--interleaved` if you need names compared.
+
+- **A `.zna` passed alongside any other input wrote an empty file at exit 0.**
+  The re-encode check is `len(files) == 1`, so with two inputs the binary went to
+  the FASTQ parser, which found no records. It warned only about *format
+  inference*. Now refused.
+
+### Fixed
+
+- **The two label extractors disagreed on malformed tag values**, and the
+  compiled one produced numbers rather than errors: `NM:i:abc` → `5451`
+  (`'a'-'0'` = 49, `'b'-'0'` = 50, …), `NM:i:3.7` → `287`, `NM:i:` → `0`, and a
+  value past `int64` was signed overflow — undefined behaviour, not merely a
+  wrong answer. The float path used bare `strtod`, so `3.7x` became `3.7` and an
+  empty value became `0.0`. A label column is not self-describing, so nothing
+  downstream could tell a garbage value from a real one.
+
+  The fast path now handles plain decimal digits and **everything else is
+  delegated to CPython's own `int()`/`float()`**, so both the value and the
+  exception match the reference by construction rather than by a reimplementation
+  kept in step by hand. Arbitrary-precision integers now survive exactly.
+
+  **This is a behaviour change:** an encode that previously produced a corpus with
+  garbage label values now fails with `ValueError`. That is the intent, but a
+  pipeline relying on the old leniency will stop.
+
+- `scripts/wheel_smoketest.py` never imported `zna.merge._accel`. It asserted the
+  codec extension only, so it caught the merge target overwriting the codec but
+  not the reverse, nor the merge target failing to build on a platform — in which
+  case the wheel shipped with `zna merge` refusing to run. It now checks both
+  extensions are present and are the right ones.
+
+- `pytest.importorskip` for both extensions now passes `exc_type=ImportError`, so
+  a half-built environment (a stale `.so`, a missing runtime dependency) skips
+  rather than erroring. Required from pytest 9.1.
 
 ### Added
+- **A lossless copy path: `ZnaReader.copy_records()` → `ZnaWriter.write_copy()`.**
+
+  The rule it establishes, and which the code now states: **a view is for reading;
+  the flag byte is for copying.** `records()` returns *views* —
+  `(is_paired, is_read1, is_read2)`, `is_rc`, `(has_start, has_end)` — each chosen
+  for a consumer, and none able to carry the whole flag byte back to a writer.
+  `(has_start, has_end)` in particular remains exactly right for its purpose
+  (*which edges of this record are true fragment boundaries*, which is what a
+  downstream model wants) and is unchanged; it simply must never travel back into
+  a writer.
+
+  ```python
+  with open(src, "rb") as fin, open(dst, "wb") as fout:
+      reader = ZnaReader(fin)
+      with ZnaWriter(fout, reader.header, preserve_normalization=True) as w:
+          for rec in reader.copy_records():
+              w.write_copy(rec)
+  ```
+
+  `copy_records()` yields `ZnaRecord(seq, flags, labels)` — the raw
+  `ZnaRecordFlags` byte, verbatim. Nothing on either side interprets it, so a copy
+  carries every bit, including combinations this version does not interpret and
+  bits a later format version may define. `ZnaRecord` is three fields and named,
+  and no `records()` shape is three wide, so code that confuses the two fails at
+  the unpack instead of reading `flags` as `is_paired`.
+
+  `zna shuffle` and `zna encode` of a `.zna` both use it. Neither codec backend
+  changed: both were already the identity on the flags column with normalization
+  off, and OR in `IS_RC` with it on — which is why `write_copy` requires
+  `preserve_normalization=True` and says so rather than corrupting silently.
+
 - **`zna merge` — overlap-merge paired-end reads into one mixed interleaved
   FASTQ**, ready for `zna encode --interleaved`. Replaces fastp's PE-merge step.
 
@@ -43,9 +273,8 @@ behaviour.
   spurious "full molecule with both endpoints". Those are precisely the
   properties `IS_RC`, `IS_FULL_FRAGMENT` and `--treat-unpaired-as-merged` rest
   on, and they were previously asserted across a repo boundary. See
-  [docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation
-  and [docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for what was measured
-  and rejected.
+  [docs/METHODS.md](docs/METHODS.md) for the derivation, and
+  [docs/ROADMAP.md](docs/ROADMAP.md) for what was measured and rejected.
 
   Also available in-process as `zna.merge.process_pair` / `zna.merge.find_overlap`,
   and as `python -m zna.merge`.
@@ -78,6 +307,116 @@ behaviour.
   path can disagree with the reference on any input. A 2-bit packed kernel
   measured slower (0.535 vs 0.470) *and* would have needed a purity dispatch to
   keep those semantics.
+
+### Verified against ground truth
+- **The full production recipe was re-run end to end on the 1M-pair library**, at
+  `zna merge` → `zna encode --interleaved --treat-unpaired-as-merged
+  --strand-normalize --shuffle`, and the flag column checked record by record:
+
+  ```
+  1,416,630 records
+    merged, not flipped      byte 16   288,509  ┐
+    merged, reverse-compl.   byte 24   293,853  ┘ 582,362 = every merged read
+    mates                  bytes 5,6,13,14      834,268
+    fragment geometry     (True,True)  582,362   (True,False)/(False,True) 417,134 each
+  ```
+
+  **The 293,853 records at byte 24 are the ones this release stops losing** — every
+  one of them previously came back as byte 16 with `IS_RC` cleared. Decoding the
+  shuffled, normalized file with `--restore-strand` now reproduces the original
+  base multiset **exactly**, all 1,416,630 records.
+
+- **`zna merge` was benchmarked against fastp on 1,000,000 simulated pairs from
+  hg38**, with the true fragment length, true overlap and every injected error
+  known exactly. Everything measured before this proved the tool matches
+  *itself*; this is the first thing that checks whether its answers are true.
+
+  **Base 0 of every emitted read is a true fragment boundary — 0 violations in
+  1,416,630 records**, and no orphaned mates. That is the contract `IS_RC`,
+  `IS_FULL_FRAGMENT` and `--treat-unpaired-as-merged` rest on, and it had only
+  ever been checked against the tool's own inferences.
+
+  Merge sensitivity steps exactly where the derivation puts it (92.6% at a true
+  overlap of 15–19, 100% at 30+), read-through fragments reconstruct at 100.00%,
+  merged records equal the true fragment 86.6% of the time against fastp's
+  85.9%, and the quality-aware consensus recovers **90.4%** of the recoverable
+  overlap errors against fastp's 74.1% — with a constant quality string both
+  recover 0.0%, which is why that comparison needs a realistic quality model.
+  Throughput 1.53 µs/pair against fastp's 2.83 on the same input.
+
+  0.96% of merges are at the wrong shift, all of them fragments whose two ends
+  genuinely repeat: the scan never picked a lower-scoring alignment than the true
+  one (0 of 848 checked), 56% carry no sequencing error, and the hotspots are
+  pericentromeric satellite. See
+  [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) for the
+  analysis and `scripts/merge_bench/` for the simulator and scorer.
+
+  **The trim band was measured too**, because a pair that does not merge is still
+  encoded and its redundant overlap reaches the corpus just as directly. Scored
+  against truth over every kept pair: the overlap comes off exactly on 96.0% of
+  pairs with a true overlap of 5–9 bases and 99.8% at 10–14, R1's 3' end is never
+  moved, and **2.25 duplicated bases survive per 10,000 unmerged bases against
+  85.79 with no trim at all**. Sweeping `--threshold-trim` over 8/12/16/20 with
+  the merge decision held fixed shows the default minimises duplicated-plus-
+  deleted bases — the first time that parameter has been chosen by measurement
+  rather than by argument.
+
+### Changed
+- **`ZnaWriter.write_records()` no longer accepts the 6-tuples of
+  `records(with_ends=True)`; it raises, naming `copy_records()`.** Its docstring
+  advertised that shape as "a lossless ZNA → ZNA copy in one line", which was
+  false — see the flag-bit entry above. 4-tuples and the 5-tuples of
+  `records(with_rc=True)` are unchanged.
+
+  Removed with it: the private `_flags_from_ends`, `_RC_FULL_BY_ENDS` and
+  `_FLAG_BITS_BY_ENDS`. `_flags_from_ends`' docstring claimed "a bijection over
+  the three reachable states"; there are four, and every caller was a corruption
+  site, so there was nothing to fix. The public read-side tables — `ENDS_BY_FLAG`,
+  `FLAG_FIELDS` — are correct and unchanged, and `ENDS_BY_FLAG` is now documented
+  as the deliberate many-to-one projection it is.
+
+- **The trim is now symmetric: the redundant overlap is split between the two
+  mates' 3' ends** instead of being taken entirely off R2. The overlap sits at the
+  3' end of *both* reads — each starts at a fragment end and reads inward — so
+  splitting it tiles the fragment exactly once just as before, while leaving the
+  two emitted reads the same length, which is what downstream aligners and models
+  expect, and discarding the last cycles of both reads rather than one read's whole
+  copy. Where the mates disagree, both now carry the consensus call.
+
+  Measured on 1,000,000 simulated pairs, **every decision and every accuracy metric
+  is identical** to the old rule — same merges, same trims, same duplicated and
+  deleted bases, zero boundary violations — while the mean `|len(R1) − len(R2)|` on
+  trimmed pairs falls from the whole overlap (10.8 bases, up to 110) to **0.51**,
+  at most 1. Throughput is unchanged.
+
+  **This changes the output bytes for trimmed pairs**, so a corpus re-encoded with
+  0.4.0 will not be byte-identical to one built with the pre-release tool. Merged
+  and untouched pairs are unaffected.
+
+  Two subtleties, both found by re-running the ground-truth benchmark and both
+  pinned by tests. The consensus is written into R2 **only** on the trim branch: on
+  a read-through geometry the overlap lands on R2's *5'* end, and rewriting bases
+  there on an inference too weak to merge on corrupted 237 fragment boundaries per
+  million pairs. And the trim guard, which read as "don't leave R2 under
+  `--min-read-length`", was also capping the overlap the trim band may act on; it
+  is now stated symmetrically as *each mate must reach at least `--min-read-length`
+  past the other's 3' end*, which recovers both properties.
+- **`--threshold-trim`'s justification now carries a number.** Both `args.py` and
+  the redesign document said a wrong trim "costs a few bases"; measured against
+  ground truth it costs a median of 9, a mean of 20 and up to 110. The asymmetry
+  the claim was making still holds — the band removes 4.45 duplicated bases for
+  every real base it deletes — but it is stated with the measurement now. No
+  behaviour change; the default stays 8.
+- **The three `zna merge` histograms are no longer capped at 1024 bins.**
+  `length_histogram`, `overlap_length_histogram` and `insert_size_histogram`
+  clamped every index to bin 1024, so reads past that length silently aggregated
+  — while read length itself is uncapped. They now size themselves from the
+  scratch arena (`2 × cap + 1` bins), so indexing stays a single dense lookup in
+  the per-record path and there is no cap at any read length. Histogram bins with
+  no counts were already omitted from the JSON, so nothing downstream changes.
+- **`insert_size_censoring.floor` was removed** from the `zna merge` JSON. It was
+  a second copy of `params.min_read_length`; `min_mergeable_overlap`, the bound
+  the JSON did not otherwise carry, stays. No consumer read it.
 
 ### Reproducibility
 - **The score is computed in integers**, at 2²⁴ units per bit. No float takes

@@ -90,7 +90,7 @@ STRAND_CONFIGS = (
     (False, False, False, True),   # unstranded -> random normalization
 )
 
-NPOLICIES = ("", "A", "C", "G", "T", "random")
+NPOLICIES = ("", "random")
 
 LAYOUTS = ("se", "pe", "merged", "mixed")
 
@@ -130,8 +130,10 @@ def model_stored(orig: str, is_rc: bool, npolicy: str) -> tuple[str, list[int]]:
     """The sequence the file should hold, given the ``IS_RC`` the encoder chose.
 
     Returns ``(expected, wildcard_positions)``.  Under ``npolicy="random"`` the
-    replaced bases are unpredictable, so those positions are returned as
-    wildcards and checked structurally (must be one of ACGT) instead.
+    substituted base comes from a seeded, position-derived stream the model does not
+    reproduce, so those positions are returned as wildcards and checked structurally
+    (must be one of ACGT) instead.  The *positions* are fully determined, which is what
+    this model is for.
 
     Order matters and mirrors both backends: reverse-complement first, N-policy
     second.  Decoding always emits uppercase, so the model uppercases last.
@@ -139,8 +141,6 @@ def model_stored(orig: str, is_rc: bool, npolicy: str) -> tuple[str, list[int]]:
     s = model_revcomp(orig) if is_rc else orig
     if not npolicy or ("N" not in s and "n" not in s):
         return s.upper(), []
-    if npolicy != "random":
-        return s.replace("N", npolicy).replace("n", npolicy).upper(), []
     # Random replacement: the bases are unpredictable, so hand back the N
     # positions as wildcards for the caller to check structurally.
     wildcards = [i for i, c in enumerate(s) if c in ("N", "n")]
@@ -415,7 +415,7 @@ class TestRoundTripMatrix(FuzzCase):
         for backend in BACKENDS:
             for seq_len_bytes in (1, 2, 4):
                 for strand_cfg in (STRAND_CONFIGS[1], STRAND_CONFIGS[4]):
-                    for npolicy in ("", "G"):
+                    for npolicy in ("", "random"):
                         lengths = _LARGE_LENGTHS[seq_len_bytes]
                         recs = [
                             (gen_seq(rng, ln, allow_n=bool(npolicy), allow_lower=True),
@@ -453,7 +453,7 @@ class TestBackendParity(FuzzCase):
         from zna import _accel, _pycodec
         rng = random.Random(SEED + 2)
         for seq_len_bytes in (1, 2, 4):
-            for npolicy in ("", "A", "C", "G", "T"):  # 'random' is nondeterministic
+            for npolicy in ("", "random"):   # `random` is seeded, so comparable
                 for do_rc_r1, do_rc_r2 in ((False, False), (True, False),
                                            (False, True), (True, True)):
                     recs = gen_records(rng, "mixed", 40, seq_len_bytes,
@@ -570,18 +570,25 @@ class TestReencode(FuzzCase):
                     ctx = f"backend={backend} strand={strand_cfg} layout={layout}"
                     with force_backend(backend):
                         data = write_file(header, recs, "")
-                        gen1 = list(ZnaReader(io.BytesIO(data)).records(with_ends=True))
 
-                        # Copy twice, carrying orientation through with_ends.
-                        prev = gen1
+                        # Copy twice, carrying the FLAG BYTE.
+                        #
+                        # This used to copy through `records(with_ends=True)` and compare
+                        # the same view, which made it blind to the defect it exists to
+                        # catch: (has_start, has_end) has three states where
+                        # (IS_RC, IS_FULL_FRAGMENT) has four, so byte 24 decayed to 16
+                        # on generation 2 — and the comparison, being in the same lossy
+                        # view, saw two records that agreed. Comparing ZnaRecord
+                        # compares the whole byte, so a dropped bit fails here now.
+                        prev = list(ZnaReader(io.BytesIO(data)).copy_records())
                         for gen_i in (2, 3):
                             buf = io.BytesIO()
                             with ZnaWriter(buf, header, block_size=BLOCK_SIZE,
                                            preserve_normalization=True) as w:
-                                w.write_records(prev)
+                                for rec in prev:
+                                    w.write_copy(rec)
                             nxt = list(
-                                ZnaReader(io.BytesIO(buf.getvalue()))
-                                .records(with_ends=True)
+                                ZnaReader(io.BytesIO(buf.getvalue())).copy_records()
                             )
                             self.assertEqual(
                                 nxt, prev,
@@ -681,38 +688,28 @@ class TestInvalidBaseHandling(FuzzCase):
         with self.assertRaises(ValueError):
             _pycodec.encode_sequence("ACGN")
 
-    def test_npolicy_rejects_non_n_ambiguity_codes_in_python_backend(self):
-        """Documents a live divergence rather than asserting it is correct.
+    def test_both_backends_reject_non_n_ambiguity_codes(self):
+        """`--npolicy` governs `N` and nothing else, in BOTH backends.
 
-        With an N-policy set, ``_accel`` substitutes the policy base for *any*
-        unencodable character, while ``_pycodec`` substitutes only for N/n and
-        raises on everything else.  So an IUPAC ambiguity code (R, Y, S, ...)
-        encodes on the C++ backend and raises on the Python one.
-
-        Before the ``encode_sequence`` fix this divergence was invisible at
-        indices congruent to 3 mod 4, where the Python backend produced "TTTT"
-        instead of raising.  Pinning it here means a future change to either
-        backend has to do so deliberately.
+        This used to document a live divergence: with a policy set, ``_accel``
+        substituted the policy base for *any* unencodable character while ``_pycodec``
+        substituted only ``N``/``n`` and raised on the rest — so an IUPAC code encoded on
+        the compiled backend and raised on the reference one. Both now raise.
         """
-        from zna import _accel, _pycodec
-        for ch in "RYSWKM":
-            seq = "ACG" + ch + "ACGT"
-            args = ([seq], [1], 1, "A", False, False, False)
-            with self.assertRaises(ValueError, msg=f"python accepted {ch!r}"):
-                _pycodec.encode_block(*args)
-            fl, ln, sq = _accel.encode_block(*args)
-            got = _pycodec.decode_block(fl, ln, sq, 1, 1)[0][0]
-            self.assertEqual(
-                got, "ACGAACGT",
-                f"accel should substitute the N-policy base for {ch!r}",
-            )
-
-
-class TestBlocksAPI(FuzzCase):
-    """``blocks()`` is a second decode path over the same bytes, so the only
-    property worth testing is that it never disagrees with ``records()`` — and
-    that sharding by block partitions the file exactly, losing and duplicating
-    nothing."""
+        from zna import _pycodec
+        mods = [_pycodec]
+        try:
+            from zna import _accel
+            mods.append(_accel)
+        except ImportError:
+            pass
+        for mod in mods:
+            for policy in ("", "random"):
+                for ch in "RYSWKMBDHV.-":
+                    with self.subTest(mod=mod.__name__, policy=policy, ch=ch):
+                        with self.assertRaises(ValueError):
+                            mod.encode_block([f"AC{ch}GT"], [0], 2, policy,
+                                             False, False, False)
 
     def test_blocks_match_records(self):
         rng = random.Random(SEED + 12)

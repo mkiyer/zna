@@ -2,7 +2,7 @@
 
 Reads two positionally-synced FASTQ files, merges/trims/keeps each pair, and writes one
 mixed interleaved FASTQ stream for ``zna encode --interleaved`` (see
-``docs/READ_MERGE_REDESIGN.md``). Also invocable as ``python -m zna.merge``.
+``docs/METHODS.md``). Also invocable as ``python -m zna.merge``.
 
 All per-pair work happens inside one backend call per chunk, which releases the GIL,
 so ``--threads`` are real worker threads. Output is written in submission order and is
@@ -25,7 +25,6 @@ from .pairs import MergeParams
 
 logger = logging.getLogger("zna.merge")
 
-_HIST_MAX = 1024   # length/overlap histograms are clamped to this many bins
 # --------------------------------------------------------------------------- #
 # the merge loop
 #
@@ -38,10 +37,10 @@ _HIST_MAX = 1024   # length/overlap histograms are clamped to this many bins
 # --------------------------------------------------------------------------- #
 
 #: Counter fields, in the order every backend returns them.
-_N_COUNTERS = 13
+_N_COUNTERS = 15
 (_N_PAIRS, _MERGED, _TRIMMED, _KEPT, _EMITTED, _DROPPED, _BASES_TRIMMED,
  _FRAGS_SHORT, _BASES_CONSENSUS, _TRIM_GUARD, _SUM_OLEN, _SUM_DIFF,
- _MAX_READ_LEN) = range(_N_COUNTERS)
+ _MAX_READ_LEN, _NPOLICY_BASES, _N_RESCUED) = range(_N_COUNTERS)
 
 #: Reads longer than this get one informational line. The scan is O(L^2), so a
 #: long-read FASTQ fed here by accident is slow rather than wrong, and saying so once
@@ -50,18 +49,29 @@ _LONG_READ_NOTICE = 1024
 
 
 def _new_acc():
-    return ([0] * _N_COUNTERS,
-            [0] * (_HIST_MAX + 1), [0] * (_HIST_MAX + 1), [0] * (_HIST_MAX + 1))
+    return ([0] * _N_COUNTERS, [], [], [])
 
 
 def _fold(counters, len_hist, olen_hist, insert_hist, acc):
-    """Fold one chunk's statistics into the accumulator, in place."""
+    """Fold one chunk's statistics into the accumulator, in place.
+
+    The histograms are uncapped and both backends return them with trailing zero bins
+    dropped, so a chunk carrying a longer read than anything seen before extends the
+    accumulator. Bin *i* is the count of value *i* in every one of them.
+    """
     ac, al, ao, ai = acc
     for i in range(_MAX_READ_LEN):
         ac[i] += counters[i]
     if counters[_MAX_READ_LEN] > ac[_MAX_READ_LEN]:      # a maximum, not a sum
         ac[_MAX_READ_LEN] = counters[_MAX_READ_LEN]
+    # Everything past the maximum is a plain sum again. Adding a counter without
+    # extending this loop silently reports zero -- which is how the first version of the
+    # N-policy counters read 0 on input that definitely had no-calls.
+    for i in range(_MAX_READ_LEN + 1, _N_COUNTERS):
+        ac[i] += counters[i]
     for src, dst in ((len_hist, al), (olen_hist, ao), (insert_hist, ai)):
+        if len(src) > len(dst):
+            dst.extend([0] * (len(src) - len(dst)))
         for i, c in enumerate(src):
             if c:
                 dst[i] += c
@@ -150,6 +160,8 @@ def _run_merge(args, params):
     acc = _new_acc()
     kwargs = (params.match_q, params.step_q, params.t_merge_q, params.t_trim_q,
               params.min_read_length, DISAGREE_Q, not args.no_sync_check)
+    # `base_index` is appended per call by the drivers; the policy code and seed
+    # follow it.
 
     # Bytes to keep buffered per stream. Chunks are cut to whole records, so this only
     # has to be comfortably larger than one chunk's worth of them.
@@ -162,9 +174,11 @@ def _run_merge(args, params):
                          level=args.compress_level) as w:
             if args.threads > 1:
                 _drive_threaded(backend, r1, r2, w, acc, kwargs, target,
-                                args.threads, args.chunk_size, args.quiet)
+                                args.threads, args.chunk_size, args.quiet,
+                                params.npolicy_code, params.rng_seed)
             else:
-                _drive_serial(backend, r1, r2, w, acc, kwargs, target, args.quiet)
+                _drive_serial(backend, r1, r2, w, acc, kwargs, target, args.quiet,
+                              params.npolicy_code, params.rng_seed)
         # Both streams must run out together. A non-empty leftover here is the failure
         # the audit's prototype for this shipped silently: R1 ending first left the
         # trailing R2 records unread, and the desync check cannot see records that were
@@ -193,7 +207,8 @@ def _check_drained(backend, stream, which, other):
     raise InputError(f"{other} exhausted before {which} (unequal read counts)")
 
 
-def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet):
+def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet, npolicy=1,
+                  rng_seed=42):
     while True:
         r1.fill(target)
         r2.fill(target)
@@ -201,7 +216,7 @@ def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet):
             break
         blob, c1, c2, counters, lh, oh, ih = backend.merge_chunk(
             r1.buf, r1.pos, len(r1.buf), r2.buf, r2.pos, len(r2.buf),
-            *kwargs, acc[0][_N_PAIRS])
+            *kwargs, acc[0][_N_PAIRS], npolicy, rng_seed)
         if not c1 and not c2:
             break                      # neither stream holds a complete record
         w.write_raw(blob)
@@ -213,7 +228,7 @@ def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet):
 
 
 def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_size,
-                    quiet):
+                    quiet, npolicy=1, rng_seed=42):
     """Fan chunks out to worker threads, writing results in SUBMISSION order.
 
     Ordered output makes the file a pure function of the input and the parameters, so
@@ -255,7 +270,7 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
             # No slicing: the workers read [pos, o) of a buffer they share.
             pending.append(pool.submit(backend.merge_chunk,
                                        r1.buf, r1.pos, o1, r2.buf, r2.pos, o2,
-                                       *kwargs, submitted_pairs))
+                                       *kwargs, submitted_pairs, npolicy, rng_seed))
             r1.pos, r2.pos = o1, o2
             submitted_pairs += k
             drain(window)
@@ -299,6 +314,12 @@ def _assemble_stats(acc, params, elapsed=None):
         "fragments_dropped_short_mate": frags_short,
         "bases_trimmed": bases_trimmed,
         "bases_consensus_changed": bases_consensus,
+        # What the N policy did. Reported unconditionally, because the failure this
+        # guards against is silent: one dark cycle can make a policy eat most of a
+        # library while the run still finishes with "Done".
+        "npolicy": params.npolicy,
+        "n_rescued_from_mate": counters[_N_RESCUED],
+        "npolicy_bases": counters[_NPOLICY_BASES],
         # A trim that would have left R2 below min_read_length; both reads kept whole
         # instead of discarding the fragment. Expected to be ~0 (redesign §8).
         "trim_guard_kept_untrimmed": trim_guard,
@@ -344,8 +365,10 @@ def _assemble_stats(acc, params, elapsed=None):
         # len1 + len2 - ceil(t_merge / match_bits), beyond which the mates no longer
         # overlap enough to merge.
         "insert_size_histogram": {str(i): c for i, c in enumerate(ihist) if c},
+        # Only the upper bound needs publishing: the lower one is `min_read_length`,
+        # already in `params` above, and a second copy of it here was one more thing to
+        # keep in step for no information.
         "insert_size_censoring": {
-            "floor": params.min_read_length,
             "min_mergeable_overlap": -(-params.t_merge_q // params.match_q),
         },
     }
@@ -400,6 +423,8 @@ def run(args) -> dict:
         t_merge=args.t_merge,
         t_trim=args.t_trim,
         min_read_length=args.min_read_length,
+        npolicy=getattr(args, "npolicy", "trim3"),
+        rng_seed=getattr(args, "seed", 42),
     )
     _validate(args, params)
 
@@ -433,6 +458,24 @@ def run(args) -> dict:
             stats["input_pairs"], stats["merged"], stats["trimmed_pairs"],
             stats["kept_pairs"], stats["emitted_records"], stats["dropped_below_min_length"],
         )
+        # Always say what the N policy did. The failure this guards against is silent:
+        # a single dark cycle can make a policy consume most of a library while the run
+        # still ends with "done".
+        n_bases = stats["npolicy_bases"]
+        logger.info(
+            "no-calls: %d rescued from the mate; --npolicy %s then %s %d base%s",
+            stats["n_rescued_from_mate"], stats["npolicy"],
+            "removed" if stats["npolicy"] == "trim3" else "substituted",
+            n_bases, "" if n_bases == 1 else "s",
+        )
+        total_bases = sum(i * c for i, c in enumerate(acc[1]))
+        if total_bases and n_bases / total_bases > 0.01:
+            logger.warning(
+                "--npolicy %s affected %.1f%% of emitted bases. That is high enough to "
+                "be a run problem (a dark cycle, a failed tile) rather than ordinary "
+                "no-calls -- check the input before using this library.",
+                stats["npolicy"], 100.0 * n_bases / total_bases,
+            )
     return stats
 
 

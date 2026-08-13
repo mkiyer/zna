@@ -14,7 +14,7 @@ i.e. a matching base is worth ~2 bits (log2 4: the information in agreeing on on
 four bases) and a mismatch costs ~6.2 bits at ``e = 1%``. Both weights fall out of the
 error rate; neither is tuned. The decision is ``argmax`` over ``s`` — not fastp's
 first-accept — which is what stops a spurious short hit from preempting the real
-offset. See ``docs/READ_MERGE_REDESIGN.md``.
+offset. See ``docs/METHODS.md``.
 
 **Pruning.** Because ``score = n * match_q - d * step_q`` depends only on the
 overlap length ``n`` and the mismatch count ``d``, the best score still reachable inside
@@ -34,7 +34,7 @@ improvement is strict ``>``, which realises exactly that order. Ties can only ar
 between shifts of *equal* overlap length: a tie across different ``n`` would need
 ``dn * match_q == dd * step_q``, whose minimal solution is ``step_q / gcd(match_q,
 step_q)`` and that gcd is 1, so ``dn`` would have to exceed 1.3e8. See
-``docs/MERGE_CPP_DESIGN.md`` §5.
+``docs/METHODS.md``.
 
 **This module is the public interface, not the kernel.** The scan itself lives in a
 backend — :mod:`zna.merge._pymerge` (the reference oracle) or the accelerated

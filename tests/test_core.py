@@ -1,4 +1,5 @@
 import contextlib
+import io
 import random
 import sys
 import tempfile
@@ -850,6 +851,15 @@ class TestRcFlagAndReencode(unittest.TestCase):
         with open(path, "rb") as fh:
             return list(ZnaReader(fh).records(**kwargs))
 
+    def _flag_bytes(self, path):
+        """Every record's raw flag byte, in file order.
+
+        The only representation that can prove a copy was lossless: every *view*
+        (`with_rc`, `with_ends`) drops or conflates bits by design.
+        """
+        with open(path, "rb") as fh:
+            return b"".join(bytes(f) for _seqs, f in ZnaReader(fh).blocks(labels=False))
+
     def _co_oriented(self, records):
         """Count pairs whose mates sit in the same frame — what normalization
         achieves, and what a second normalization pass destroys."""
@@ -1060,6 +1070,73 @@ class TestRcFlagAndReencode(unittest.TestCase):
         # The flag must still be doing real work, not uniformly False.
         self.assertEqual(sum(rec[4] for rec in after), self.N_PAIRS)
 
+    def test_a_full_fragment_record_can_also_be_reverse_complemented(self):
+        """Flag byte 24 (IS_RC | IS_FULL_FRAGMENT) is reachable, and must survive.
+
+        This is the state that broke every copy path. A merged read is unpaired and
+        spans its fragment, so it gets IS_FULL_FRAGMENT; unstranded normalization then
+        reverse-complements a coin-flip half of them, adding IS_RC. Both bits, one
+        record.
+
+        The copy path used to route flags through ``(has_start, has_end)``, which has
+        three states where these two bits have four — ``ENDS_BY_FLAG`` maps 16 and 24
+        alike to ``(True, True)``, correctly, because both records *do* have two real
+        fragment ends. So the projection is right and its inverse cannot exist. Every
+        byte-24 record came back as byte 16, silently, and ``--restore-strand`` then
+        returned it in the wrong orientation.
+
+        NOTE for anyone extending this: a fixture built from ``"ACGT"`` repeats is blind
+        to the whole class, because ``ACGT`` is its own reverse complement.
+        """
+        seq = "AAACCCGGGTTT" * 7 + "ACGGGA"
+        self.assertNotEqual(seq, reverse_complement(seq), "palindromic fixture")
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.zna"
+            with open(src, "wb") as fh, ZnaWriter(fh, header) as w:
+                for _ in range(self.N_PAIRS):
+                    w.write_record(seq, False, False, False, is_full_fragment=True)
+
+            before = self._flag_bytes(src)
+            self.assertGreater(before.count(24), 0, "byte 24 unreachable — fixture broke")
+            self.assertGreater(before.count(16), 0, "no un-flipped control records")
+
+            # 1. a copy carries it
+            copied = f"{tmpdir}/copy.zna"
+            with open(src, "rb") as fin, open(copied, "wb") as fh:
+                reader = ZnaReader(fin)
+                with ZnaWriter(fh, header, preserve_normalization=True) as w:
+                    for rec in reader.copy_records():
+                        w.write_copy(rec)
+            self.assertEqual(self._flag_bytes(copied), before)
+
+            # 2. so does a shuffle — which passes through the same conversion twice
+            out = f"{tmpdir}/shuf.zna"
+            shuffle_zna(src, out, seed=5, buffer_bytes=1024, quiet=True)
+            self.assertEqual(sorted(self._flag_bytes(out)), sorted(before),
+                             "shuffle dropped IS_RC from full-fragment records")
+
+            # 3. and the thing that actually matters downstream: the bases can still
+            #    be put back the way they arrived.
+            self.assertEqual(
+                sorted(r[0] for r in self._read(out, restore_strand=True)),
+                sorted([seq] * self.N_PAIRS),
+                "--restore-strand cannot recover records whose IS_RC was lost",
+            )
+
+    def test_write_records_refuses_the_ends_view(self):
+        """The removed copy path must fail loudly, not quietly do the wrong thing."""
+        header = self._unstranded_header()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = f"{tmpdir}/src.zna"
+            self._write(tmpdir, "src.zna", self._as_sequenced(), header)
+            ends = self._read(src, with_ends=True)
+            buf = io.BytesIO()
+            with self.assertRaises(ValueError) as exc:
+                with ZnaWriter(buf, header, preserve_normalization=True) as w:
+                    w.write_records(ends)
+            self.assertIn("copy_records", str(exc.exception))
+
     def test_full_fragment_survives_reencode_and_shuffle(self):
         """IS_FULL_FRAGMENT must ride through every copy path.
 
@@ -1079,11 +1156,21 @@ class TestRcFlagAndReencode(unittest.TestCase):
             n_full = sum(1 for v in before.values() if v == (True, True))
             self.assertGreater(n_full, 0)
 
-            # 1. re-encode through the pass-through writer
+            # 1. re-encode through the copy path
+            #
+            # This used to feed `records(with_ends=True)` to `write_records`, which
+            # rebuilt the flags from (has_start, has_end) — three states standing in for
+            # four, so IS_RC was cleared on every full-fragment record. Compare the raw
+            # flag BYTES, not the ends view: the view is what hid the bug, since
+            # ENDS_BY_FLAG maps 16 and 24 alike to (True, True).
             copied = f"{tmpdir}/copy.zna"
-            with open(copied, "wb") as fh:
-                write_zna(fh, header, self._read(src, with_ends=True),
-                          preserve_normalization=True)
+            with open(src, "rb") as fin, open(copied, "wb") as fh:
+                reader = ZnaReader(fin)
+                with ZnaWriter(fh, header, preserve_normalization=True) as w:
+                    for rec in reader.copy_records():
+                        w.write_copy(rec)
+            self.assertEqual(self._flag_bytes(copied), self._flag_bytes(src),
+                             "a copy must carry every flag bit verbatim")
             self.assertEqual(self._read(copied, with_ends=True),
                              self._read(src, with_ends=True))
 
@@ -1312,7 +1399,7 @@ class TestBackendLockstep(unittest.TestCase):
 
         strand_rules = [(False, False), (True, False), (False, True), (True, True)]
         len_bytes_opts = [1, 2, 4]
-        npolicy_opts = ["", "A", "C", "G", "T"]
+        npolicy_opts = ["", "random"]
 
         for npolicy, len_bytes, (do_r1, do_r2) in itertools.product(
             npolicy_opts, len_bytes_opts, strand_rules
@@ -1360,44 +1447,38 @@ class TestBackendLockstep(unittest.TestCase):
 class TestNPolicy(unittest.TestCase):
     """Test N-nucleotide handling policies."""
 
-    def test_npolicy_replace_with_A(self):
-        """Test that N nucleotides are replaced with A."""
-        header = ZnaHeader(read_group="test", description="")
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = f"{tmpdir}/npolicy.zna"
-            
-            # Write sequence with N
-            with open(path, "wb") as fh:
-                with ZnaWriter(fh, header, npolicy="A") as writer:
-                    writer.write_record("ACNGT", False, False, False)
-                    writer.write_record("NNN", False, False, False)
-            
-            # Read and verify N was replaced with A
-            with open(path, "rb") as fh:
-                reader = ZnaReader(fh)
-                records = list(reader.records())
-                self.assertEqual(records[0][0], "ACAGT")  # N -> A
-                self.assertEqual(records[1][0], "AAA")    # NNN -> AAA
-    
-    def test_npolicy_replace_with_other_bases(self):
-        """Test that N can be replaced with C, G, or T."""
+    def test_a_non_n_invalid_character_is_an_error_under_every_policy(self):
+        """`--npolicy` governs `N` and nothing else.
+
+        The compiled backend used to substitute for ANY unencodable byte, so an IUPAC
+        code was silently written as a real base and the two backends disagreed. Both
+        now raise, whatever the policy.
+        """
         header = ZnaHeader(read_group="test")
-        
-        for base in ['C', 'G', 'T']:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = f"{tmpdir}/npolicy.zna"
-                
-                with open(path, "wb") as fh:
-                    with ZnaWriter(fh, header, npolicy=base) as writer:
-                        writer.write_record("ACNGT", False, False, False)
-                
-                with open(path, "rb") as fh:
-                    reader = ZnaReader(fh)
-                    records = list(reader.records())
-                    expected = f"AC{base}GT"
-                    self.assertEqual(records[0][0], expected)
-    
+        for policy in (None, "random"):
+            for ch in "RYSWKMBDHV.-0":
+                with self.subTest(policy=policy, ch=ch):
+                    buf = io.BytesIO()
+                    with self.assertRaises(ValueError):
+                        with ZnaWriter(buf, header, npolicy=policy) as w:
+                            w.write_record(f"AC{ch}GT", False, False, False)
+
+    def test_the_policy_set_is_closed(self):
+        """An unrecognised policy is refused, not silently read as 'substitute A'.
+
+        `has_npolicy = !npolicy.empty()` plus a chain of equality tests with an `A`
+        default meant every unknown string — including `drop`, which was the CLI's own
+        default — substituted A without a word.
+        """
+        header = ZnaHeader(read_group="test")
+        for policy in ("drop", "A", "C", "G", "T", "keep", "xyz", " "):
+            with self.subTest(policy=policy):
+                buf = io.BytesIO()
+                with self.assertRaises(ValueError) as exc:
+                    with ZnaWriter(buf, header, npolicy=policy) as w:
+                        w.write_record("ACGT", False, False, False)
+                self.assertIn("npolicy", str(exc.exception))
+
     def test_npolicy_random(self):
         """Test that N nucleotides are replaced with random bases."""
         header = ZnaHeader(read_group="test")
@@ -1429,39 +1510,41 @@ class TestNPolicy(unittest.TestCase):
                 for base in seq2:
                     self.assertIn(base, "ACGT")
     
-    def test_npolicy_no_N_unchanged(self):
-        """Test that sequences without N are unchanged regardless of policy."""
+    def test_no_n_means_the_policy_changes_nothing(self):
         header = ZnaHeader(read_group="test")
-        test_seq = "ACGTACGT"
-        
-        for policy in ['A', 'C', 'G', 'T', 'random']:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = f"{tmpdir}/npolicy.zna"
-                
-                with open(path, "wb") as fh:
-                    with ZnaWriter(fh, header, npolicy=policy) as writer:
-                        writer.write_record(test_seq, False, False, False)
-                
-                with open(path, "rb") as fh:
-                    reader = ZnaReader(fh)
-                    records = list(reader.records())
-                    self.assertEqual(records[0][0], test_seq)
-    
-    def test_npolicy_case_insensitive(self):
-        """Test that lowercase n is also handled."""
+        for policy in (None, "random"):
+            with self.subTest(policy=policy):
+                buf = io.BytesIO()
+                with ZnaWriter(buf, header, npolicy=policy) as w:
+                    w.write_record("ACGTACGT", False, False, False)
+                buf.seek(0)
+                self.assertEqual(list(ZnaReader(buf).records())[0][0], "ACGTACGT")
+
+    def test_random_substitution_is_reproducible_and_block_independent(self):
+        """The whole point of the seeded, position-derived stream.
+
+        `_pycodec` used the unseeded global `random`, so the same input gave a different
+        file every run; `_accel` used a per-block xorshift, so the same records gave a
+        different answer at a different `block_size`. Both are now derived from
+        (seed, global record index, offset).
+        """
         header = ZnaHeader(read_group="test")
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = f"{tmpdir}/npolicy.zna"
-            
-            with open(path, "wb") as fh:
-                with ZnaWriter(fh, header, npolicy="A") as writer:
-                    writer.write_record("ACnGT", False, False, False)
-            
-            with open(path, "rb") as fh:
-                reader = ZnaReader(fh)
-                records = list(reader.records())
-                self.assertEqual(records[0][0], "ACAGT")
+        seqs = [f"ACN{'ACGT' * 20}N" for _ in range(40)]
+
+        def encode(block_size, seed):
+            buf = io.BytesIO()
+            with ZnaWriter(buf, header, npolicy="random",
+                           block_size=block_size, rng_seed=seed) as w:
+                for s_ in seqs:
+                    w.write_record(s_, False, False, False)
+            buf.seek(0)
+            return [r[0] for r in ZnaReader(buf).records()]
+
+        a = encode(1 << 20, 42)
+        self.assertEqual(a, encode(1 << 20, 42), "not reproducible across runs")
+        self.assertEqual(a, encode(64, 42), "substitution depends on block_size")
+        self.assertNotEqual(a, encode(1 << 20, 43), "the seed does nothing")
+        self.assertTrue(all("N" not in x for x in a))
 
 
 class TestColumnarFormat(unittest.TestCase):

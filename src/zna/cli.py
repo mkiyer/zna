@@ -19,7 +19,7 @@ from .core import (
     _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE, _VERSION,
     ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
-    _flags_from_ends, _RC_FULL_BY_ENDS,
+    FLAG_FIELDS,
 )
 from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
 from ._shuffle import shuffle_zna
@@ -193,6 +193,15 @@ def get_read_suffix_number(full_name: str) -> int:
     return 0
 
 
+#: ``suffix_number`` for a record that is a merged read rather than a mate.  Negative so
+#: it can never collide with a real mate number, and so ``if suffix`` still reads as
+#: "this record names a mate position".
+MERGED_SINGLE = -1
+
+#: The token `zna merge` and fastp append to a merged read's name.  See :func:`_read_key`.
+_MERGED_MARKER = b" merged_"
+
+
 def _read_key(raw_header: bytes) -> Tuple[bytes, int]:
     """``(base_name, suffix_number)`` from a raw FASTQ header line, as bytes.
 
@@ -203,7 +212,8 @@ def _read_key(raw_header: bytes) -> Tuple[bytes, int]:
     already been decoded from ASCII for no other reason.
 
     *base_name* is the ID up to the first whitespace with any ``/suffix``
-    removed; *suffix_number* is 1 for ``/1``, 2 for ``/2``, else 0.
+    removed; *suffix_number* is 1 for ``/1``, 2 for ``/2``,
+    :data:`MERGED_SINGLE` for a merged read, else 0.
     """
     sp = raw_header.find(b" ")
     tab = raw_header.find(b"\t")
@@ -216,14 +226,32 @@ def _read_key(raw_header: bytes) -> Tuple[bytes, int]:
     read_id = raw_header if end < 0 else raw_header[:end]
 
     slash = read_id.rfind(b"/")
-    if slash < 0:
-        return read_id, 0
-    suffix = read_id[slash + 1:]
-    if suffix == b"1":
-        return read_id[:slash], 1
-    if suffix == b"2":
-        return read_id[:slash], 2
-    return read_id[:slash], 0
+    if slash >= 0:
+        suffix = read_id[slash + 1:]
+        if suffix == b"1":
+            return read_id[:slash], 1
+        if suffix == b"2":
+            return read_id[:slash], 2
+        read_id = read_id[:slash]
+
+    # No mate number.  A merged read is a whole molecule and can never be a mate, so say
+    # so explicitly rather than leaving pairing to guess from the name -- names collide.
+    # Two independently merged molecules sharing a read name were silently paired into
+    # one fragment: both lost IS_FULL_FRAGMENT, both were flagged IS_PAIRED/IS_READ1/
+    # IS_READ2, and two different molecules were encoded as each other's mate, with a
+    # zero exit status.  Duplicate names are ordinary in real data (concatenated lanes,
+    # some SRA dumps, UMI-collapsed files) and nothing upstream forbids them.
+    #
+    # The trailing " merged_<n1>_<n2>" token is what marks one.  It is not a heuristic:
+    # `zna merge` writes it (merge/merge_core.hpp), fastp writes it, and khorana's
+    # `parse_merged_fastq` requires it -- it is already load-bearing in this contract,
+    # so reading it here makes an existing promise checked rather than adding a new one.
+    #
+    # Tested only when there is no /1,/2 suffix, so it costs one `rfind` per merged read
+    # and nothing per mate.
+    if end >= 0 and raw_header.rfind(_MERGED_MARKER, end) >= 0:
+        return read_id, MERGED_SINGLE
+    return read_id, 0
 
 
 def parse_fastq(fh: BinaryIO) -> Iterator[str]:
@@ -740,16 +768,56 @@ def _stream_zna_reencode(
             yield record
 
 
-def _stream_paired_files(f1: BinaryIO, f2: BinaryIO, 
+def _stream_paired_files(f1: BinaryIO, f2: BinaryIO,
                          path1: Optional[str], path2: Optional[str],
                          format_override: Optional[str]) -> Iterator[Tuple[str, bool, bool, bool]]:
-    """Stream paired-end reads from two separate files."""
+    """Stream paired-end reads from two separate files.
+
+    Pairing is **positional** — record *i* of R1 with record *i* of R2 — which is what
+    the two-file mode has always meant.  Read names are not compared; use ``zna merge``
+    or ``--interleaved`` if you need that.
+
+    The two files must therefore hold the same number of records, and this checks it.
+    It used to be ``for s1, s2 in zip(p1, p2)``, which stops at the shorter input: an R2
+    file with fewer records than R1 truncated the library silently and exited 0, every
+    remaining R1 read gone with nothing in the output to say so.
+
+    ``zip`` cannot be repaired by inspecting the iterators afterwards, either — it has
+    already pulled and discarded the extra value from the longer one, so the very
+    off-by-one case that matters most looks like a clean finish.  Pull both explicitly.
+    """
     p1 = choose_parser(path1, format_override)(f1)
     p2 = choose_parser(path2, format_override)(f2)
-    
-    for s1, s2 in zip(p1, p2):
+    end = _END
+
+    while True:
+        s1 = next(p1, end)
+        s2 = next(p2, end)
+        if s1 is end:
+            if s2 is end:
+                return
+            longer, shorter = path2, path1
+            break
+        if s2 is end:
+            longer, shorter = path1, path2
+            break
         yield s1, True, True, False
         yield s2, True, False, True
+
+    sys.exit(
+        f"Error: {_name_of(shorter)} ran out of records before {_name_of(longer)}. "
+        f"Paired-end input must hold the same number of records in both files; "
+        f"encoding what was read would silently drop the rest of the library."
+    )
+
+
+#: Sentinel for "this stream is exhausted", so a legitimately empty sequence cannot be
+#: mistaken for the end of the file.
+_END = object()
+
+
+def _name_of(path: Optional[str]) -> str:
+    return path if path else "<stdin>"
 
 
 def _describe_read(base: bytes, suffix: int) -> str:
@@ -763,8 +831,12 @@ def _pair_interleaved(records) -> Iterator[Tuple[object, bool, bool, bool]]:
     ``(base_name, suffix_number, payload)``.
 
     Consecutive records whose base names match are emitted as an R1/R2 pair;
-    a record whose neighbour has a different base name is a single (e.g. a
-    merged read, whose ``/1``,``/2`` suffix was stripped by the merger).
+    a record whose neighbour has a different base name is a single.
+
+    A record :func:`_read_key` identified as a merged read (:data:`MERGED_SINGLE`) is
+    **never** paired, whatever its name.  Matching on the name alone was not enough: two
+    independently merged molecules that share a read name were paired into one fragment
+    and both silently lost ``IS_FULL_FRAGMENT``.
 
     Yields ``(payload, is_paired, is_read1, is_read2)``.  *payload* is opaque —
     the sequence for unlabeled input, or ``(sequence, labels)`` for labeled —
@@ -787,7 +859,8 @@ def _pair_interleaved(records) -> Iterator[Tuple[object, bool, bool, bool]]:
             have_prev = True
             continue
 
-        if prev_base == base:
+        if (prev_base == base
+                and prev_suffix != MERGED_SINGLE and suffix != MERGED_SINGLE):
             if prev_suffix == 2:
                 print(f"[Warning] Found Read 2 before Read 1: "
                       f"{_describe_read(prev_base, prev_suffix)} -> "
@@ -1090,7 +1163,21 @@ def encode_command(args):
     # Check if input is ZNA (reencoding mode)
     input_header = None
     is_reencoding = len(files) == 1 and is_zna_file(files[0])
-    
+
+    # A .zna is only ever valid as input on its own, in re-encode mode.  Given two of
+    # them the check above never fires, so the binary went to the FASTQ parser, which
+    # found no records and wrote a valid 0-record file with a zero exit status --
+    # warning only about *format inference*, never about the real problem.  A library
+    # could disappear from a corpus with every stage green.
+    if not is_reencoding:
+        for path in files:
+            if is_zna_file(path):
+                sys.exit(
+                    f"Error: {path} is already a ZNA file. Re-encoding takes exactly "
+                    f"one .zna input and no other files; encoding it as FASTQ would "
+                    f"write an empty output and report success."
+                )
+
     if is_reencoding:
         # Read existing header to use as defaults
         with open(files[0], "rb") as f:
@@ -1244,6 +1331,11 @@ def encode_command(args):
     count = 0
     # Use ExitStack to safely close output file (or leave stdout open)
     npolicy = getattr(args, 'npolicy', None)
+    # trim3 reshapes records; it is not an encoding policy, so the codec never sees it.
+    # Keeping the two apart is what stopped `drop` reaching the codec and being silently
+    # read as "substitute A" -- see docs/NPOLICY_PLAN.md 8.1.
+    trim3 = (npolicy == 'trim3')
+    codec_npolicy = 'random' if npolicy == 'random' else ''
     block_size = parse_block_size(args.block_size)
     if preserve_normalization and not quiet:
         print(
@@ -1254,19 +1346,28 @@ def encode_command(args):
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
         writer = stack.enter_context(ZnaWriter(
-            f_out, header, block_size=block_size, npolicy=npolicy,
+            f_out, header, block_size=block_size, npolicy=codec_npolicy,
             preserve_normalization=preserve_normalization,
+            rng_seed=getattr(args, 'seed', 0) or 0,
         ))
 
-        # The N-drop filter is applied per FRAGMENT, not per record: dropping a
-        # single mate would leave its partner behind as a lone paired record.
-        drop_n = (npolicy == 'drop')
+        def _trim3(seq):
+            """Cut a record at its first no-call, keeping ``[0, first N)``.
+
+            3' only. Base 0 is a true fragment boundary -- a read starts at a fragment
+            end and runs inward -- so cutting from the far end never disturbs it, and the
+            record stays honestly anchored however short it gets. There is deliberately
+            no minimum length here: a core read-processing tool reports what it did and
+            leaves the length decision to the consumer.
+            """
+            i = seq.find('N')
+            if i < 0:
+                i = seq.find('n')
+            return seq if i < 0 else seq[:i]
         treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
 
         if label_defs:
             stream = stream_inputs_labeled(args, label_defs, tag_map)
-        elif preserve_normalization:
-            stream = stream_inputs(args, with_ends=True)
         else:
             stream = stream_inputs(args)
 
@@ -1280,7 +1381,46 @@ def encode_command(args):
                                 or is_reencoding)
         show_progress = not is_stdout and not quiet
 
-        if single_end_input:
+        if is_reencoding:
+            # ZNA -> ZNA is a COPY, so carry each record's flag byte verbatim rather
+            # than any view of it.  It used to go through records(with_ends=True) and
+            # rebuild the flags from (has_start, has_end), which loses information in
+            # both directions and did so silently:
+            #
+            #   * a strand-normalized source lost IS_RC on every full-fragment record,
+            #     because (True, True) cannot say whether the record was flipped -- so
+            #     --restore-strand then returned those records in the wrong orientation;
+            #   * a NON-normalized source took the 4-tuple path instead and re-derived
+            #     IS_FULL_FRAGMENT from scratch, i.e. dropped it altogether.
+            #
+            # No fragment grouping and no N-drop here, and neither is an oversight: ZNA
+            # stores two bits per base, so a decoded record cannot contain an N for the
+            # filter to act on.
+            with open(files[0], "rb") as f_re:
+                src = ZnaReader(f_re)
+                if preserve_normalization:
+                    write_copy = writer.write_copy
+                    for rec in src.copy_records():
+                        write_copy(rec)
+                        count += 1
+                        if show_progress and count % 1_000_000 == 0:
+                            print(f"      Processed {count//1_000_000}M records...",
+                                  end='\r', file=sys.stderr)
+                else:
+                    # The source is not normalized, so the writer owns IS_RC -- it may
+                    # be about to apply normalization for the first time.  Hand over
+                    # only the bit it cannot derive.
+                    write_record = writer.write_record
+                    fields = FLAG_FIELDS
+                    for seq, flags, _labels in src.copy_records():
+                        is_paired, is_read1, is_read2 = fields[flags]
+                        write_record(seq, is_paired, is_read1, is_read2,
+                                     is_full_fragment=bool(flags & 16))
+                        count += 1
+                        if show_progress and count % 1_000_000 == 0:
+                            print(f"      Processed {count//1_000_000}M records...",
+                                  end='\r', file=sys.stderr)
+        elif single_end_input:
             is_full = treat_unpaired_as_merged
             write_record = writer.write_record
             for rec in stream:
@@ -1288,8 +1428,8 @@ def encode_command(args):
                 # Membership on the sequence itself: the old test uppercased a
                 # copy of every read (150 bytes each) purely to look for one
                 # character.
-                if drop_n and ('N' in seq or 'n' in seq):
-                    continue
+                if trim3:
+                    seq = _trim3(seq)
                 if label_defs:
                     write_record(seq, rec[1], rec[2], rec[3],
                                  labels=rec[4], is_full_fragment=is_full)
@@ -1302,26 +1442,19 @@ def encode_command(args):
                           end='\r', file=sys.stderr)
         else:
             for unit in _fragment_units(stream):
-                if drop_n and any(('N' in rec[0] or 'n' in rec[0]) for rec in unit):
-                    continue
-                if preserve_normalization:
-                    # Orientation and fragment span are copied from the source.
-                    for rec in unit:
-                        is_rc, is_full = _RC_FULL_BY_ENDS[
-                            (2 if rec[4] else 0) | (1 if rec[5] else 0)
-                        ]
+                if trim3:
+                    # Per record, not per fragment: trimming never orphans a mate, so
+                    # there is nothing here for the old pair-atomic drop to protect.
+                    unit = [(_trim3(rec[0]),) + tuple(rec[1:]) for rec in unit]
+                full = _full_fragment_flags(unit, treat_unpaired_as_merged)
+                if label_defs:
+                    for rec, is_full in zip(unit, full):
                         writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                            is_rc=is_rc, is_full_fragment=is_full)
+                                            labels=rec[4], is_full_fragment=is_full)
                 else:
-                    full = _full_fragment_flags(unit, treat_unpaired_as_merged)
-                    if label_defs:
-                        for rec, is_full in zip(unit, full):
-                            writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                                labels=rec[4], is_full_fragment=is_full)
-                    else:
-                        for rec, is_full in zip(unit, full):
-                            writer.write_record(rec[0], rec[1], rec[2], rec[3],
-                                                is_full_fragment=is_full)
+                    for rec, is_full in zip(unit, full):
+                        writer.write_record(rec[0], rec[1], rec[2], rec[3],
+                                            is_full_fragment=is_full)
                 count += len(unit)
                 if (count % 1_000_000 < len(unit) and count >= 1_000_000
                         and show_progress):
@@ -1792,7 +1925,12 @@ def main():
     input_group = enc.add_argument_group("Input Options")
     input_group.add_argument("--interleaved", action="store_true", help="Treat input as interleaved paired-end")
     input_group.add_argument("--shuffle", action="store_true", help="Shuffle records after encoding")
-    input_group.add_argument("--seed", type=int, default=42, help="Random seed for --shuffle (default: 42)")
+    input_group.add_argument("--seed", type=int, default=42, help="Seed for every random decision this command makes: "
+                                    "--shuffle, unstranded strand normalization, and "
+                                    "--npolicy random. All three are derived from it and "
+                                    "the record index, never from a running stream, so "
+                                    "the output does not depend on --block-size "
+                                    "(default: 42)")
     input_group.add_argument(
         "--shuffle-buffer-size",
         type=str,
@@ -1810,8 +1948,16 @@ def main():
                            help="Enable strand normalization (RC reads to consistent strand). "
                                 "With --strand-specific: deterministic (antisense reads RC'd). "
                                 "Without: random RC (for unstranded data).")
-    meta_group.add_argument("--npolicy", choices=["drop", "random", "A", "C", "G", "T"], default="drop",
-                           help="Policy for handling 'N' nucleotides: drop (skip the whole fragment, so mates are never orphaned), random (replace with random base), or A/C/G/T (replace with specific base)")
+    meta_group.add_argument("--npolicy", choices=["trim3", "random"], default="trim3",
+                           help="What to do with a base call that is not A/C/G/T. ZNA "
+                                "stores two bits per base, so an Illumina 'N' no-call "
+                                "cannot be stored. trim3 (default): cut the read at it, "
+                                "keeping [0, first N) -- 3' only, so base 0 stays a true "
+                                "fragment boundary however short the read gets. random: "
+                                "substitute a base drawn from a seeded stream (--seed), "
+                                "reproducible and identical on both backends. Any OTHER "
+                                "non-ACGT character (an IUPAC code, punctuation) is an "
+                                "error under both policies.")
     meta_group.add_argument("--treat-unpaired-as-merged", dest="treat_unpaired_as_merged",
                            action="store_true",
                            help="Unpaired records span their whole fragment, so BOTH edges "

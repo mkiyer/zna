@@ -2,7 +2,7 @@
  * FASTQ chunk adapter: raw text in, formatted text out.
  *
  * This is an *adapter* over `merge_core.hpp`, not part of the kernel
- * (docs/MERGE_CPP_DESIGN.md §7.2). The core knows nothing about FASTQ; this file knows
+ * (docs/METHODS.md, "Layering"). The core knows nothing about FASTQ; this file knows
  * nothing about the scoring rule. `zna encode --merge-pairs` will add a second adapter
  * beside this one that emits records instead of text, reusing the same core.
  *
@@ -30,6 +30,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "merge_core.hpp"
 
@@ -42,18 +43,39 @@ struct InputError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-constexpr int HIST_MAX = 1024;   ///< histograms are clamped to this many bins
-
 struct ChunkStats {
     int64_t n_pairs = 0, merged = 0, trimmed = 0, kept = 0;
     int64_t emitted = 0, dropped = 0, bases_trimmed = 0, frags_short = 0;
     int64_t bases_consensus = 0, trim_guard = 0, sum_olen = 0, sum_diff = 0;
+    /// Bases the N policy removed (trim3) or invented (random), and no-calls the
+    /// overlap recovered from the mate at no cost.
+    int64_t npolicy_bases = 0, n_rescued = 0;
     /// Longest read seen. Reported rather than capped: the scan is O(L^2), so this is
     /// how an accidental long-read FASTQ becomes diagnosable instead of just slow.
     int max_read_len = 0;
-    uint32_t len_hist[HIST_MAX + 1] = {};      ///< every emitted record's length
-    uint32_t olen_hist[HIST_MAX + 1] = {};     ///< detected overlap lengths
-    uint32_t insert_hist[HIST_MAX + 1] = {};   ///< inferred fragment length, merged only
+    std::vector<uint32_t> len_hist;      ///< every emitted record's length
+    std::vector<uint32_t> olen_hist;     ///< detected overlap lengths
+    std::vector<uint32_t> insert_hist;   ///< inferred fragment length, merged only
+
+    /// Size the three histograms from the scratch arena's capacity, so indexing them
+    /// needs no bound check and no clamp.
+    ///
+    /// They used to be `uint32_t[1025]` with every index clamped to the last bin, which
+    /// silently aggregated the length and insert distributions for reads over 1024 bp --
+    /// and read length is otherwise uncapped. The arena grows by doubling and every
+    /// value binned here is bounded by it: an overlap is at most `cap`, and an emitted
+    /// record is at most `len1 + len2 <= 2 * cap`. So `2 * cap + 1` bins always suffice
+    /// and this resizes O(log L) times per chunk, not per record.
+    ///
+    /// Not a sparse map: that would put a hash lookup where a dense index is one
+    /// instruction, in the per-record path.
+    void ensure_bins(size_t cap) {
+        const size_t want = 2 * cap + 1;
+        if (len_hist.size() >= want) return;
+        len_hist.resize(want, 0);
+        olen_hist.resize(want, 0);
+        insert_hist.resize(want, 0);
+    }
 };
 
 /// Scratch for the two uppercased sequences, beside the core's per-pair arena.
@@ -199,6 +221,7 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
         // and no flag: the arena doubles to whatever the input turns out to need.
         const int longest = a.s.n > b.s.n ? a.s.n : b.s.n;
         sc.ensure_reads(static_cast<size_t>(longest));
+        st.ensure_bins(sc.core.cap);          // every bin index below is bounded by cap
         if (longest > st.max_read_len) st.max_read_len = longest;
 
         upper_into(a.s.p, a.s.n, sc.up1.data());
@@ -218,24 +241,31 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
             }
         }
 
-        const PairResult r = process_pair(r1, r2, p, sc.core);
+        const PairResult r = process_pair(r1, r2, p, sc.core,
+                                          base_index + st.n_pairs);
         ++st.n_pairs;
         st.dropped += r.n_dropped;
         st.bases_consensus += r.bases_consensus_changed;
         st.trim_guard += r.trim_guard_fired;
+        st.npolicy_bases += r.npolicy_bases;
+        st.n_rescued += r.n_rescued;
 
         if (r.outcome == OUTCOME_MERGED) {
             ++st.merged;
         } else if (r.outcome == OUTCOME_TRIMMED) {
             ++st.trimmed;
-            if (r.n_recs) st.bases_trimmed += r2.s.n - r.recs[1].s.n;
+            // Both mates are cut now, so charge both: this counter is "redundant bases
+            // removed", and it is the overlap length either way.
+            if (r.n_recs) {
+                st.bases_trimmed += (r1.s.n - r.recs[0].s.n) + (r2.s.n - r.recs[1].s.n);
+            }
         } else {
             ++st.kept;
         }
         if (!r.n_recs && r.outcome != OUTCOME_MERGED) ++st.frags_short;
 
         if (r.overlap_len) {
-            st.olen_hist[r.overlap_len <= HIST_MAX ? r.overlap_len : HIST_MAX] += 1;
+            st.olen_hist[r.overlap_len] += 1;
             st.sum_olen += r.overlap_len;
             st.sum_diff += r.mismatches;
         }
@@ -243,10 +273,10 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
             emit(blob, r.recs[i]);
             ++st.emitted;
             const int L = r.recs[i].s.n;
-            st.len_hist[L <= HIST_MAX ? L : HIST_MAX] += 1;
+            st.len_hist[L] += 1;
             if (r.outcome == OUTCOME_MERGED) {
                 // A merged record IS the fragment, so its length is the insert size.
-                st.insert_hist[L <= HIST_MAX ? L : HIST_MAX] += 1;
+                st.insert_hist[L] += 1;
             }
         }
         pos1 = a.next_pos;

@@ -110,6 +110,8 @@ def encode_block(
     do_rc_r1: bool,
     do_rc_r2: bool,
     do_random_rc: bool = False,
+    rng_seed: int = 0,
+    base_index: int = 0,
     label_values: list[list] | None = None,
     label_defs: list | None = None,
 ) -> tuple[bytes, ...]:
@@ -125,7 +127,6 @@ def encode_block(
     replacement before 2-bit packing.
     """
     import struct as _struct
-    import random as _random
 
     _len_struct = {1: _struct.Struct("<B"), 2: _struct.Struct("<H"), 4: _struct.Struct("<I")}[len_bytes_fmt]
     pack_len = _len_struct.pack
@@ -133,6 +134,13 @@ def encode_block(
     # Make a mutable copy of flags so we can set IS_RC (bit 3)
     flags = list(flags)
     lengths_buf = bytearray()
+    if npolicy and npolicy != "random":
+        raise ValueError(
+            f"unknown npolicy {npolicy!r}; expected 'random' or none. "
+            "'trim3' is applied before the codec, and 'drop' is a record filter, "
+            "not an encoding policy."
+        )
+
     seqs_buf = bytearray()
 
     IS_RC_BIT = 0x08
@@ -154,8 +162,9 @@ def encode_block(
             if is_paired and is_read1 and (i + 1 < n) and (flags[i + 1] & IS_PAIRED):
                 # Process R1+R2 pair together
                 seq2 = seqs[i + 1]
-                coin = _random.getrandbits(1)
-                if coin:
+                # Derived from the pair's GLOBAL record index, so the assignment cannot
+                # depend on how records were batched into blocks.
+                if _rc_coin(rng_seed, base_index + i):
                     seq = reverse_complement(seq)
                     flags[i] |= IS_RC_BIT
                 else:
@@ -163,20 +172,20 @@ def encode_block(
                     flags[i + 1] |= IS_RC_BIT
 
                 # Encode R1
-                seq = _apply_npolicy(seq, npolicy)
+                seq = _apply_npolicy(seq, npolicy, rng_seed, base_index + i)
                 lengths_buf.extend(pack_len(len(seq)))
                 seqs_buf.extend(encode_sequence(seq))
 
                 # Encode R2
-                seq2 = _apply_npolicy(seq2, npolicy)
+                seq2 = _apply_npolicy(seq2, npolicy, rng_seed, base_index + i + 1)
                 lengths_buf.extend(pack_len(len(seq2)))
                 seqs_buf.extend(encode_sequence(seq2))
 
                 i += 2
                 continue
             else:
-                # Unpaired read: random RC
-                if _random.getrandbits(1):
+                # Unpaired read: same position-derived coin.
+                if _rc_coin(rng_seed, base_index + i):
                     seq = reverse_complement(seq)
                     flags[i] |= IS_RC_BIT
         else:
@@ -193,7 +202,7 @@ def encode_block(
                 flags[i] |= IS_RC_BIT
 
         # N-policy
-        seq = _apply_npolicy(seq, npolicy)
+        seq = _apply_npolicy(seq, npolicy, rng_seed, base_index + i)
 
         lengths_buf.extend(pack_len(len(seq)))
         seqs_buf.extend(encode_sequence(seq))
@@ -211,15 +220,57 @@ def encode_block(
     return flags_out, bytes(lengths_buf), bytes(seqs_buf)
 
 
-def _apply_npolicy(seq: str, npolicy: str) -> str:
-    """Replace N nucleotides according to *npolicy*."""
-    if npolicy and "N" in seq.upper():
-        if npolicy == "random":
-            import random
-            seq = "".join(random.choice("ACGT") if c.upper() == "N" else c for c in seq)
-        elif npolicy in ("A", "C", "G", "T"):
-            seq = seq.replace("N", npolicy).replace("n", npolicy.lower())
-    return seq
+_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _mix64(x: int) -> int:
+    """splitmix64's finalizer — the same function as ``zna_mix64`` in ``_accel.cpp``.
+
+    The substitution and orientation streams are *derived* from the record index rather
+    than carried as mutable state, so neither depends on how records are batched. That
+    matters: the old per-block xorshift gave the same records a different orientation
+    assignment at a different ``--block-size``. Integer-only, so the two backends cannot
+    drift. See docs/NPOLICY_PLAN.md 8.3.
+    """
+    x = (x + 0x9E3779B97F4A7C15) & _M64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _M64
+    return x ^ (x >> 31)
+
+
+def _rc_coin(seed: int, r: int) -> int:
+    """Which mate of the pair at global record index *r* is reverse-complemented."""
+    return _mix64((seed + 0x9E3779B97F4A7C15 * (r + 1)) & _M64) & 1
+
+
+def _sub_base(seed: int, r: int, off: int) -> int:
+    """The base substituted for the no-call at *off* of the STORED record at index *r*.
+
+    A different multiplier from the coin, so the two streams never shift each other.
+    """
+    return _mix64((seed + 0xBF58476D1CE4E5B9 * (r + 1)
+                        + 0x94D049BB133111EB * (off + 1)) & _M64) & 3
+
+
+_SUB_BASES = "ACGT"
+
+
+def _apply_npolicy(seq: str, npolicy: str, seed: int, rec: int) -> str:
+    """Substitute every no-call in *seq*, which is already in STORED orientation.
+
+    Only ``N``/``n`` is substitutable; ``encode_sequence`` raises on anything else, under
+    every policy. The base is drawn from :func:`_sub_base`, keyed by the record's global
+    index and the offset within the stored sequence — position-derived rather than a
+    running stream, so the result cannot depend on how records were batched into blocks.
+    """
+    if not npolicy:
+        return seq
+    if "N" not in seq and "n" not in seq:
+        return seq
+    return "".join(
+        _SUB_BASES[_sub_base(seed, rec, i)] if c in "Nn" else c
+        for i, c in enumerate(seq)
+    )
 
 
 def decode_block_sequences(

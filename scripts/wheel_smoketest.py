@@ -34,6 +34,24 @@ def main() -> int:
         print("FAIL: the C++ backend did not load from this wheel")
         return 1
 
+    # There are TWO extensions, and both are imported as `_accel` within their own
+    # package (`zna._accel`, `zna.merge._accel`).  Asserting only the codec catches the
+    # merge target overwriting it, but not the reverse and not the merge target simply
+    # failing to build on a platform -- in which case `zna merge` ships refusing to run.
+    try:
+        from zna.merge.backend import available_merge_backends
+    except ImportError as exc:
+        print(f"FAIL: zna.merge is not importable from this wheel: {exc}")
+        return 1
+    if "accel" not in available_merge_backends():
+        print("FAIL: the compiled merge kernel (zna.merge._accel) is not in this wheel")
+        return 1
+    import zna.merge._accel as _merge_accel
+    if not hasattr(_merge_accel, "scan") or hasattr(_merge_accel, "encode_block"):
+        print("FAIL: zna.merge._accel is not the merge extension "
+              "(the two _accel targets collided)")
+        return 1
+
     rng = random.Random(20260812)
     n = 5000
     seqs = ["".join(rng.choices("ACGT", k=rng.choice([0, 1, 3, 150, 151])))

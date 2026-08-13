@@ -76,9 +76,9 @@ install(TARGETS _accel LIBRARY DESTINATION zna)
 # No -march, no ISA flags, no runtime dispatch.  The kernel uses 16-byte vectors,
 # which are baseline on every target we build for -- NEON on aarch64, SSE2 on
 # x86-64 -- and falls back to a scalar loop anywhere else.  Anything wider is not
-# baseline, and per docs/MERGE_CPP_DESIGN.md §6.1 is not obviously faster either:
-# the scan is rejection-dominated, so the bail interval matters more than the
-# vector width.  x86 tuning is scheduled for 0.4.1 (docs/FUTURE.md).
+# baseline, and per docs/METHODS.md is not obviously faster either: the scan is
+# rejection-dominated, so the bail interval matters more than the vector width.
+# x86 tuning is scheduled for 0.4.1 (docs/ROADMAP.md).
 nanobind_add_module(
     _merge_accel
     NB_STATIC

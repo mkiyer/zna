@@ -136,16 +136,24 @@ ENDS_BY_FLAG = tuple(
 _ENDS_BY_FLAG = ENDS_BY_FLAG
 
 
-def _flags_from_ends(has_start: bool, has_end: bool) -> tuple[bool, bool]:
-    """Inverse of :func:`_ends_from_flags` — the mapping is a bijection over the
-    three reachable states, so ``(has_start, has_end)`` round-trips losslessly.
-
-    This is the readable reference form.  The write loops that run it on every
-    record index :data:`_RC_FULL_BY_ENDS` or :data:`_FLAG_BITS_BY_ENDS` instead,
-    to avoid a Python call frame per record; the tables are generated from this
-    function below, so the three cannot drift apart.
-    """
-    return (bool(has_end) and not has_start), (bool(has_start) and bool(has_end))
+# There is deliberately no inverse of :func:`_ends_from_flags`, and there used to be.
+#
+# ``_flags_from_ends`` claimed to be "a bijection over the three reachable states".
+# There are **four**: byte 24 (``IS_RC | IS_FULL_FRAGMENT``) is what the encoder writes
+# whenever strand normalization reverse-complements a merged read.  ``ENDS_BY_FLAG``
+# maps 16 and 24 alike to ``(True, True)`` — correctly, because both records do have two
+# real fragment ends — so no inverse can exist, and the one that existed silently
+# cleared ``IS_RC`` on every full-fragment record that passed through it.  Measured on a
+# 200-record normalized file: 101 records carried ``IS_RC`` before ``zna shuffle`` and 0
+# after, at which point ``--restore-strand`` returned half the corpus in the wrong
+# orientation.  The same loss ran through ZNA -> ZNA re-encode.
+#
+# **The rule this file now keeps: a view is for reading; the flag byte is for copying.**
+# ``(has_start, has_end)`` is a decode-side projection *for consumers* — it answers
+# "which edges of this record are true fragment boundaries", which is what a downstream
+# model wants and is genuinely all it wants.  It must never travel back into a writer.
+# Copying carries the byte (:meth:`ZnaReader.copy_records` -> :meth:`ZnaWriter.write_copy`);
+# producing carries ``is_full_fragment`` (:meth:`ZnaWriter.write_record`).
 
 
 #: ``flag byte -> (is_paired, is_read1, is_read2)`` — the three booleans
@@ -155,16 +163,21 @@ FLAG_FIELDS = tuple(
     (bool(f & 4), bool(f & 1), bool(f & 2)) for f in range(256)
 )
 
-#: ``(has_start << 1 | has_end) -> (is_rc, is_full_fragment)``.
-_RC_FULL_BY_ENDS = tuple(
-    _flags_from_ends(bool(i & 2), bool(i & 1)) for i in range(4)
-)
 
-#: ``(has_start << 1 | has_end) -> IS_RC|IS_FULL_FRAGMENT flag bits``, for the
-#: write paths that want the packed byte rather than the pair.
-_FLAG_BITS_BY_ENDS = tuple(
-    (8 if is_rc else 0) | (16 if is_full else 0) for is_rc, is_full in _RC_FULL_BY_ENDS
-)
+class ZnaRecord(NamedTuple):
+    """One record as it is **stored**, for copying between ZNA files.
+
+    ``flags`` is the raw :class:`ZnaRecordFlags` byte, verbatim — not a projection of
+    it — so a copy carries every bit, including combinations this version of the library
+    does not interpret and bits a future format version may add.
+
+    Three fields, and named: no ``records()`` shape is three wide, so code that confuses
+    the two fails at the unpack instead of silently reading ``flags`` as ``is_paired``.
+    """
+
+    seq: str
+    flags: int
+    labels: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +252,13 @@ class ZnaWriter:
     idempotent**: applying it twice returns the data to an un-normalized state
     while leaving the header still claiming otherwise.
 
-    Block layout (V1)::
+    Block layout::
 
         [20-byte header]
-        [ZSTD-compressed payload: flags ‖ lengths ‖ sequences]
+        [compressed payload: flags ‖ labels ‖ lengths ‖ sequences]
+
+    The labels column is present only for a labeled file, and the column order is
+    the compression order -- flags first because they are the most redundant.
     """
 
     __slots__ = (
@@ -261,6 +277,8 @@ class ZnaWriter:
         "_batch_flags",
         "_size_estimate",
         "_pending_r1",
+        "_rng_seed",
+        "_records_written",
         "_label_defs",
         "_batch_labels",
     )
@@ -272,6 +290,7 @@ class ZnaWriter:
         block_size: int = DEFAULT_BLOCK_SIZE,
         npolicy: str | None = None,
         preserve_normalization: bool = False,
+        rng_seed: int = 0,
     ) -> None:
         self._fh = fh
         self._header = header
@@ -301,6 +320,12 @@ class ZnaWriter:
         self._batch_flags = bytearray()
         self._size_estimate = 0
         self._pending_r1 = False  # True when last buffered record is a paired R1
+        # Both random decisions -- which mate unstranded normalization flips, and the
+        # base substituted for a no-call -- are derived from `rng_seed` and the record's
+        # GLOBAL index, never from a running stream. That is what makes the output
+        # independent of `block_size`: batching cannot shift a position-derived draw.
+        self._rng_seed = rng_seed
+        self._records_written = 0
 
         self._label_defs = header.labels
         self._batch_labels: list[list] = [[] for _ in self._label_defs]
@@ -389,6 +414,48 @@ class ZnaWriter:
             if self._size_estimate >= self._block_size:
                 self._flush_block()
 
+    def write_copy(self, rec: ZnaRecord) -> None:
+        """Buffer a record read from another ZNA file, flag byte verbatim.
+
+        The write half of the copy path; see :meth:`ZnaReader.copy_records`.  Nothing
+        here interprets the byte, so every bit survives — including
+        ``IS_RC | IS_FULL_FRAGMENT`` together, which no boolean-shaped API can express,
+        and bits a later format version may define.
+
+        Requires ``preserve_normalization=True``.  Without it the codec ORs ``IS_RC``
+        into the flag column as it reverse-complements (see ``_pycodec.encode_block``),
+        which would both corrupt the copied byte and normalize already-normalized bases
+        a second time.
+        """
+        if not self._preserve_normalization:
+            raise ValueError(
+                "write_copy() requires ZnaWriter(preserve_normalization=True). "
+                "A copy carries each record's stored orientation in its flag byte; "
+                "without the flag the writer would apply normalization again, on top "
+                "of bases that already have it."
+            )
+        seq = rec[0]
+        seq_len = len(seq)
+        if seq_len > self._max_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds maximum {self._max_len} "
+                f"allowed by header (seq_len_bytes={self._seq_len_bytes})"
+            )
+        if self._label_defs:
+            labels = rec[2]
+            if len(labels) != len(self._label_defs):
+                raise ValueError(
+                    f"Expected {len(self._label_defs)} label values, got {len(labels)}"
+                )
+            for i, val in enumerate(labels):
+                self._batch_labels[i].append(val)
+
+        self._batch_seqs.append(seq)
+        self._batch_flags.append(rec[1])
+        self._size_estimate += (seq_len // 4) + 1 + self._seq_len_bytes
+        if self._size_estimate >= self._block_size:
+            self._flush_block()
+
     def write_records(
         self, records: Iterable[Tuple[str, bool, bool, bool]]
     ) -> None:
@@ -422,32 +489,42 @@ class ZnaWriter:
         size_est = self._size_estimate
 
         if self._preserve_normalization:
-            # Pass-through. Accepts either shape the reader produces:
-            #   5-tuple  (..., is_rc)                  <- records(with_rc=True)
-            #   6-tuple  (..., has_start, has_end)     <- records(with_ends=True)
+            # Pass-through. Accepts:
+            #   5-tuple  (..., is_rc)   <- records(with_rc=True)
             # A plain 4-tuple is only acceptable when the output is not
             # normalized, since there is then no orientation to carry; otherwise
             # accepting it would clear every IS_RC bit and lose the orientation
             # silently.
+            #
+            # A 6-tuple from records(with_ends=True) is REFUSED. It used to be
+            # accepted, and this docstring used to advertise it as "a lossless ZNA ->
+            # ZNA copy in one line", which was false: (has_start, has_end) has three
+            # states and the flag pair it was reconstructing has four, so every
+            # full-fragment record came out with IS_RC cleared. See the note above
+            # ENDS_BY_FLAG. Copying carries the byte; use copy_records/write_copy.
             require_rc = self._header.strand_normalized
-            flag_bits_by_ends = _FLAG_BITS_BY_ENDS
             for rec in records:
                 seq = rec[0]
                 is_paired = rec[1]
                 is_read1 = rec[2]
                 n_fields = len(rec)
                 if n_fields > 5:
-                    rc_bit = flag_bits_by_ends[
-                        (2 if rec[4] else 0) | (1 if rec[5] else 0)
-                    ]
-                elif n_fields > 4:
+                    raise ValueError(
+                        "write_records() no longer accepts the 6-tuples of "
+                        "records(with_ends=True): (has_start, has_end) cannot express "
+                        "IS_RC on a full-fragment record, so this silently dropped the "
+                        "orientation of every merged read. Copy with "
+                        "ZnaReader.copy_records() -> ZnaWriter.write_copy() instead, "
+                        "which carries the flag byte verbatim."
+                    )
+                if n_fields > 4:
                     rc_bit = 8 if rec[4] else 0
                 elif require_rc:
                     raise ValueError(
                         "preserve_normalization=True on a strand-normalized "
                         "header requires each record to carry its orientation, "
-                        f"but got a {n_fields}-tuple. Read the source with "
-                        "ZnaReader.records(with_ends=True)."
+                        f"but got a {n_fields}-tuple. Copy the source with "
+                        "ZnaReader.copy_records()."
                     )
                 else:
                     rc_bit = 0
@@ -565,6 +642,8 @@ class ZnaWriter:
                     self._do_random_norm,
                     label_col_data,
                     label_col_sizes,
+                    self._rng_seed,
+                    self._records_written,
                 )
             else:
                 flags_bytes, labels_bytes, lengths_bytes, seqs_bytes = _pycodec_mod.encode_block(
@@ -577,6 +656,8 @@ class ZnaWriter:
                     self._do_random_norm,
                     label_values=self._batch_labels,
                     label_defs=list(self._label_defs),
+                    rng_seed=self._rng_seed,
+                    base_index=self._records_written,
                 )
         else:
             flags_bytes, lengths_bytes, seqs_bytes = _codec.encode_block(
@@ -587,6 +668,8 @@ class ZnaWriter:
                 self._do_strand_norm_r1,
                 self._do_strand_norm_r2,
                 self._do_random_norm,
+                self._rng_seed,
+                self._records_written,
             )
             labels_bytes = b""
 
@@ -612,6 +695,9 @@ class ZnaWriter:
         self._fh.write(compressed)
 
         # 4. Reset
+        # Advance the global record index BEFORE clearing, so the next block's
+        # position-derived draws continue where this one left off.
+        self._records_written += count
         self._batch_seqs.clear()
         self._batch_flags.clear()
         self._size_estimate = 0
@@ -682,7 +768,13 @@ class ZnaReader:
             it already combines ``IS_RC`` with ``IS_FULL_FRAGMENT``, so a caller
             never has to re-derive the geometry (and a full-fragment record
             correctly reports *both* edges, which ``with_rc`` alone cannot
-            express).  The pair round-trips losslessly back to the two flags.
+            express).
+
+            It is a **projection, not an encoding**: ``IS_FULL_FRAGMENT`` and
+            ``IS_RC|IS_FULL_FRAGMENT`` both report ``(True, True)``, correctly,
+            because both records do have two real fragment ends.  So the pair
+            does *not* round-trip back to the flags and must never be fed to a
+            writer — use :meth:`copy_records` to copy records between files.
         with_rc
             If ``True``, include the per-record ``IS_RC`` flag in each tuple.
             This is the only way to recover which edge of a mate is a real
@@ -707,9 +799,42 @@ class ZnaReader:
         if with_rc and with_ends:
             raise ValueError(
                 "with_rc=True and with_ends=True are mutually exclusive; "
-                "with_ends already encodes IS_RC (has_end and not has_start)."
+                "for a record that is not a full fragment, with_ends already encodes "
+                "IS_RC as (has_end and not has_start). For a full-fragment record it "
+                "does not -- the ends are (True, True) either way -- so if you need "
+                "the orientation of those, read the flag byte with copy_records()."
             )
         return self._iter_records(restore_strand, with_rc, with_ends)
+
+    def copy_records(self) -> Iterator[ZnaRecord]:
+        """Yield every record as stored, for writing to another ZNA file.
+
+        The lossless counterpart to :meth:`records`.  ``records`` returns *views* —
+        ``(is_paired, is_read1, is_read2)``, ``is_rc``, ``(has_start, has_end)`` — each
+        of which is a projection chosen for a consumer, and none of which can carry the
+        whole flag byte back to a writer.  This yields the byte.
+
+        Pair it with :meth:`ZnaWriter.write_copy`::
+
+            with open(src, "rb") as fin, open(dst, "wb") as fout:
+                reader = ZnaReader(fin)
+                with ZnaWriter(fout, reader.header, preserve_normalization=True) as w:
+                    for rec in reader.copy_records():
+                        w.write_copy(rec)
+
+        Sequences come back in their **stored** orientation, which is the only
+        orientation a copy may write: re-deriving it would apply normalization a second
+        time.  Hence ``preserve_normalization=True`` on the writer, which
+        :meth:`~ZnaWriter.write_copy` requires.
+        """
+        if self._header.labels:
+            for seqs, flags, cols in self.blocks(labels=True):
+                for rec in zip(seqs, flags, zip(*cols)):
+                    yield ZnaRecord(*rec)
+        else:
+            for seqs, flags in self.blocks(labels=False):
+                for seq, flag in zip(seqs, flags):
+                    yield ZnaRecord(seq, flag, ())
 
     def block_index(self) -> list[BlockInfo]:
         """Return one :class:`BlockInfo` per block, without decompressing any.

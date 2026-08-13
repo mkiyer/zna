@@ -8,7 +8,7 @@ The decision reads **one** likelihood-ratio score (from :mod:`overlap`, in the
 fixed-point scale of :mod:`params`) at **two** thresholds, because a wrong merge and a
 wrong trim cost different amounts: a wrong merge produces a chimera — actively false
 sequence — while a wrong trim removes a few real bases from a read tail. See
-``docs/READ_MERGE_REDESIGN.md`` §4.
+``docs/METHODS.md``.
 
 The emitted overlap comes from R1, but where the two mates *disagree* the base is
 resolved by posterior from the two Phred scores — the §7 quality-aware consensus the
@@ -54,9 +54,10 @@ def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
       ``err_rate``: it should sit near it, and a chance-alignment regime drives it up.
     """
     (records, outcome, n_dropped, score, olen, diff,
-     n_consensus, trim_guard) = _backend.active().process_pair(
+     n_consensus, trim_guard, _npolicy_bases, _n_rescued) = _backend.active().process_pair(
         h1, s1, q1, h2, s2, q2,
-        p.match_q, p.step_q, p.t_merge_q, p.t_trim_q, p.min_read_length, DISAGREE_Q)
+        p.match_q, p.step_q, p.t_merge_q, p.t_trim_q, p.min_read_length, DISAGREE_Q,
+        p.npolicy_code, p.rng_seed)
     if counters is not None:
         counters[0] += n_consensus
         counters[1] += trim_guard

@@ -99,7 +99,7 @@ def test_baseline_encode():
         count = 0
         t0 = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(MERGED_PATH, "rb") as fq:
                     for seq in parse_fastq(fq):
                         w.write_record(seq, False, False, False)
@@ -145,7 +145,7 @@ def test_labeled_encode():
         count = 0
         t0 = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(MERGED_PATH, "rb") as fq:
                     if HAS_CPP_EXTRACT:
                         for raw_header, seq in parse_fastq_with_headers(fq):
@@ -231,7 +231,7 @@ def test_roundtrip_correctness(max_records=500_000):
 
     try:
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(MERGED_PATH, "rb") as fq:
                     for raw_header, seq in parse_fastq_with_headers(fq):
                         if HAS_CPP_EXTRACT:
@@ -317,7 +317,7 @@ def test_profile_encode(max_records=500_000):
         try:
             count = 0
             with open(tmp_path, "wb") as fh:
-                with ZnaWriter(fh, header, npolicy='A') as w:
+                with ZnaWriter(fh, header, npolicy='random') as w:
                     with gzip.open(MERGED_PATH, "rb") as fq:
                         if HAS_CPP_EXTRACT:
                             for raw_header, seq in parse_fastq_with_headers(fq):

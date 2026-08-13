@@ -13,7 +13,7 @@ best-scoring shift is then read at two thresholds:
 
 Output is a single **mixed interleaved** FASTQ stream (merged reads as singles with the
 pair suffix stripped; unmerged pairs as adjacent ``/1``,``/2`` records) consumed by
-``zna encode --interleaved``. See ``docs/READ_MERGE_REDESIGN.md``.
+``zna encode --interleaved``. See ``docs/METHODS.md``.
 
 **The exports below are resolved lazily** (PEP 562). Importing them eagerly would make
 ``import zna.merge.args`` — which ``zna/cli.py`` does on *every* invocation, just to

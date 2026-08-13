@@ -930,5 +930,104 @@ class TestShuffleLabels(unittest.TestCase):
             self.assertEqual(original_set, shuffled_set)
 
 
+class TestLabelExtractorsAgree(unittest.TestCase):
+    """The compiled label extractor must agree with the reference on EVERY value.
+
+    It did not, and silently. `extract_labels_fast` parsed integers with
+    ``v = v * 10 + (c - '0')`` and no digit test and no range test, so a malformed tag
+    became a plausible-looking number instead of an error:
+
+        NM:i:      ->    0        reference: ValueError
+        NM:i:abc   -> 5451        reference: ValueError    ('a'-'0'=49, 'b'-'0'=50, ...)
+        NM:i:3.7   ->  287        reference: ValueError    ('.'-'0' = -2)
+        NM:i:<2^63 -> wrapped     reference: the exact integer
+
+    and the float path used bare ``strtod``, which stops at the first byte it cannot
+    use, so ``3.7x`` became 3.7 and ``""`` became 0.0.
+
+    A label column is not self-describing: nothing downstream can tell a garbage value
+    from a real one, so this surfaces only when a model trains on it. The fix delegates
+    every non-trivial case to CPython's own ``int()``/``float()``, which is why this test
+    can assert exact agreement rather than a hand-maintained table of expectations.
+    """
+
+    CASES = [
+        b"5", b"", b"abc", b"3.7", b"-4", b"+7", b"0", b"007",
+        b"99999999999999999999",          # past int64
+        b"-99999999999999999999",
+        b"3.7x", b" 5", b"5 ", b"0x10", b"1e3", b"nan", b"inf", b"--5",
+    ]
+
+    def _both(self, tag, conv, raw):
+        """(reference result, accel result), each either a value tuple or 'ValueError'."""
+        from zna.cli import (extract_labels_from_header, build_label_defs,
+                             build_tag_extractor)
+        from zna.dtypes import resolve_missing
+        defs = build_label_defs([f"lab:{tag}:XX"], [])
+        tag_map = build_tag_extractor(defs)
+        missing = tuple(resolve_missing(d) for d in defs)
+        header = b"readname\tXX:Z:" + raw
+        try:
+            ref = extract_labels_from_header(header, tag_map, 1, label_defs=defs)
+        except (ValueError, TypeError) as e:
+            ref = type(e).__name__
+        try:
+            from zna._accel import extract_labels_fast
+        except ImportError:
+            self.skipTest("zna._accel not built")
+        try:
+            acc = extract_labels_fast(header, [(b"XX", conv)], 1, missing)
+        except (ValueError, TypeError) as e:
+            acc = type(e).__name__
+        return ref, acc
+
+    @staticmethod
+    def _same(a, b):
+        """Equality that treats NaN as equal to itself.
+
+        ``float("nan")`` is a legitimate label value that both backends produce, and
+        ``(nan,) == (nan,)`` is False — so a plain assertEqual reports a divergence
+        where there is none.
+        """
+        if a != b:
+            import math
+            return (isinstance(a, tuple) and isinstance(b, tuple) and len(a) == len(b)
+                    and all(x == y or (isinstance(x, float) and isinstance(y, float)
+                                       and math.isnan(x) and math.isnan(y))
+                            for x, y in zip(a, b)))
+        return True
+
+    def test_integer_values_agree(self):
+        from zna.cli import _CONV_INT
+        for raw in self.CASES:
+            with self.subTest(raw=raw):
+                ref, acc = self._both("i", _CONV_INT, raw)
+                self.assertTrue(self._same(ref, acc),
+                                f"int backends disagree on {raw!r}: {ref} vs {acc}")
+
+    def test_float_values_agree(self):
+        from zna.cli import _CONV_FLOAT
+        for raw in self.CASES:
+            with self.subTest(raw=raw):
+                ref, acc = self._both("f", _CONV_FLOAT, raw)
+                self.assertTrue(self._same(ref, acc),
+                                f"float backends disagree on {raw!r}: {ref} vs {acc}")
+
+    def test_a_malformed_integer_is_an_error_not_a_number(self):
+        """The specific regression: garbage must not decode as a plausible value."""
+        from zna.cli import _CONV_INT
+        for raw in (b"abc", b"3.7", b""):
+            with self.subTest(raw=raw):
+                ref, acc = self._both("i", _CONV_INT, raw)
+                self.assertEqual(ref, "ValueError")
+                self.assertEqual(acc, "ValueError")
+
+    def test_an_integer_past_int64_survives_exactly(self):
+        from zna.cli import _CONV_INT
+        ref, acc = self._both("i", _CONV_INT, b"99999999999999999999")
+        self.assertEqual(ref, (99999999999999999999,))
+        self.assertEqual(acc, (99999999999999999999,))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1028,6 +1028,71 @@ class TestStrandProtocol:
 
 # --- ZNA -> ZNA Re-encode Tests ---
 
+class TestReencodeKeepsFullFragment:
+    """`zna encode` of a ZNA file is a COPY, and must carry IS_FULL_FRAGMENT.
+
+    The normalized case was handled; the *un*-normalized one was not, and fell through
+    a gap nobody had a test for. `preserve_normalization` was
+    ``is_reencoding and input_header.strand_normalized``, so re-encoding a file that was
+    never normalized took the plain 4-tuple path, where IS_FULL_FRAGMENT has no source
+    at all and was simply re-derived as False.
+
+    Measured before the fix: a merged read encoded with `--treat-unpaired-as-merged`
+    read back as ends (True, True); re-encoding that .zna gave (True, False). Silent,
+    exit 0 — a whole-molecule record downgraded to a one-ended one, which is lost
+    supervision rather than visible corruption.
+    """
+
+    def _args(self, files, out, **over):
+        class Args:
+            pass
+        a = Args()
+        a.files, a.output = files, out
+        a.interleaved = a.fasta = False
+        a.fastq = True
+        a.read_group, a.description = "rg", ""
+        a.strand_specific = a.read1_sense = a.read2_antisense = False
+        a.strand_normalize = False
+        a.npolicy = None
+        a.seq_len_bytes, a.block_size = 2, 131072
+        a.compress_flag, a.level, a.quiet = False, 3, True
+        a.treat_unpaired_as_merged = False
+        for k, v in over.items():
+            setattr(a, k, v)
+        return a
+
+    def _ends(self, path):
+        with open(path, "rb") as fh:
+            return [(r[4], r[5]) for r in ZnaReader(fh).records(with_ends=True)]
+
+    def test_a_merged_read_stays_a_whole_fragment_across_a_reencode(self, tmp_path):
+        fq = tmp_path / "m.fq"
+        fq.write_text("".join(f"@merged{i} merged_20_0\nACGTACGTACGTACGTACGT\n+\n"
+                              f"{'I' * 20}\n" for i in range(6)))
+        first, second = tmp_path / "a.zna", tmp_path / "b.zna"
+        encode_command(self._args([str(fq)], str(first),
+                                  treat_unpaired_as_merged=True))
+        assert self._ends(first) == [(True, True)] * 6
+
+        encode_command(self._args([str(first)], str(second)))
+        assert self._ends(second) == [(True, True)] * 6, \
+            "re-encoding a non-normalized file dropped IS_FULL_FRAGMENT"
+
+    def test_reencoding_is_idempotent_over_several_generations(self, tmp_path):
+        fq = tmp_path / "m.fq"
+        fq.write_text("".join(f"@merged{i} merged_20_0\nACGTACGTACGTACGTACGT\n+\n"
+                              f"{'I' * 20}\n" for i in range(6)))
+        path = tmp_path / "gen0.zna"
+        encode_command(self._args([str(fq)], str(path),
+                                  treat_unpaired_as_merged=True))
+        expected = self._ends(path)
+        for gen in range(1, 4):
+            nxt = tmp_path / f"gen{gen}.zna"
+            encode_command(self._args([str(path)], str(nxt)))
+            assert self._ends(nxt) == expected, f"generation {gen} diverged"
+            path = nxt
+
+
 class TestReencode:
     """Re-encoding an already strand-normalized ZNA must copy its orientation.
 
@@ -1360,7 +1425,7 @@ class TestFullFragment:
             label = None
             label_desc = None
             label_defs = None
-            npolicy = "drop"
+            npolicy = "trim3"
             treat_unpaired_as_merged = False
         Args.files = files
         for k, v in overrides.items():
@@ -1406,9 +1471,15 @@ class TestFullFragment:
         encode_command(self._args([str(src)], on, treat_unpaired_as_merged=True))
         assert self._ends(on)[0] == (True, True), "declared: both edges real"
 
-    def test_npolicy_drop_is_pair_atomic(self, tmp_path):
-        """Dropping one mate would leave a lone paired record, which downstream
-        cannot distinguish from a genuine single."""
+    def test_trim3_never_orphans_a_mate(self, tmp_path):
+        """trim3 reshapes a record; it never removes one, so a pair stays a pair.
+
+        This replaces a pair-atomicity test for the old `drop` policy. Dropping one mate
+        would have left a lone paired record, which downstream cannot distinguish from a
+        genuine single — the reason `drop` was fragment-atomic. trim3 has no such hazard
+        by construction, and it salvages the rest of the read instead of discarding the
+        whole fragment.
+        """
         src = tmp_path / "in.fq"
         self._write_fq(src, [
             ("keep/1", "AAAACCCCGGGGTTTT"), ("keep/2", "TTTTGGGGCCCCAAAA"),
@@ -1418,26 +1489,30 @@ class TestFullFragment:
         encode_command(self._args([str(src)], out))
         with open(out, "rb") as fh:
             recs = list(ZnaReader(fh).records())
-        assert len(recs) == 2, "the whole fragment must go, not just the N-containing mate"
-        assert [(r[1], r[2], r[3]) for r in recs] == [(True, True, False), (True, False, True)]
+        assert len(recs) == 4, "trim3 must keep both mates of both fragments"
+        assert [(r[1], r[2], r[3]) for r in recs] == [
+            (True, True, False), (True, False, True),
+            (True, True, False), (True, False, True)]
+        assert recs[2][0] == "AAAACCCCGGGGTTT", "R1 must be cut at its N, 3' only"
+        assert recs[3][0] == "TTTTGGGGCCCCAAAA", "the clean mate must be untouched"
+        assert all("N" not in r[0] for r in recs)
 
-    def test_npolicy_drop_keeps_single_records_independent(self, tmp_path):
-        """Atomic dropping must not over-reach: unpaired records stand alone."""
+    def test_trim3_treats_each_record_independently(self, tmp_path):
+        """A no-call in one single must not disturb its neighbours."""
         src = tmp_path / "in.fq"
         self._write_fq(src, [
-            ("s1", "AAAACCCCGGGGTTTT"),
-            ("s2", "AAAACCCCGGGGTTTN"),   # dropped
-            ("s3", "TTTTGGGGCCCCAAAA"),
+            ("a", "AAAACCCCGGGGTTTT"), ("b", "AAAACCCCGGGGTTTN"),
+            ("c", "TTTTGGGGCCCCAAAA"),
         ])
         out = str(tmp_path / "o.zna")
         encode_command(self._args([str(src)], out))
         with open(out, "rb") as fh:
-            assert len(list(ZnaReader(fh).records())) == 2
-
-
-class TestGeometryVisibility:
-    """A file's geometry must be checkable before anything trains on it, and the
-    one silent way to destroy it must warn."""
+            seqs = [r[0] for r in ZnaReader(fh).records()]
+        # This fixture normalizes, so a record may be stored reverse-complemented.
+        # What trim3 owes us is the LENGTH and the absence of no-calls.
+        assert [len(x) for x in seqs] == [16, 15, 16], seqs
+        assert all("N" not in x for x in seqs)
+        assert seqs[0] != seqs[2], "the two clean records should not collide"
 
     def _norm_zna(self, path):
         header = ZnaHeader(read_group="g", strand_specific=False,
@@ -1495,83 +1570,40 @@ class TestGeometryVisibility:
 class TestNPolicyCLI:
     """Test CLI N-policy functionality."""
     
-    def test_npolicy_drop(self):
-        """Test that sequences with N are dropped when using --npolicy drop."""
+    def test_npolicy_trim3(self):
+        """`--npolicy trim3` (the default) cuts each record at its first no-call."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create FASTA with some sequences containing N
-            fasta_path = f"{tmpdir}/input.fasta"
-            with open(fasta_path, "w") as f:
-                f.write(">seq1\nACGT\n")
-                f.write(">seq2_with_N\nACNGT\n")
-                f.write(">seq3\nTGCA\n")
-                f.write(">seq4_with_N\nNNNN\n")
-            
-            zna_path = f"{tmpdir}/output.zna"
-            
+            fastq_path = f"{tmpdir}/test.fastq"
+            with open(fastq_path, "w") as f:
+                f.write("@r1\nACGTACGT\n+\nIIIIIIII\n")
+                f.write("@r2\nACGNACGT\n+\nIIIIIIII\n")
+                f.write("@r3\nNACGTACG\n+\nIIIIIIII\n")
+            zna_path = f"{tmpdir}/out.zna"
+
             class Args:
-                files = [fasta_path]
+                files = [fastq_path]
                 interleaved = False
-                fasta = True
-                fastq = False
+                fasta = False
+                fastq = True
                 read_group = "test"
                 description = ""
                 strand_specific = False
                 read1_sense = False
                 read2_antisense = False
-                npolicy = "drop"
+                npolicy = "trim3"
                 output = zna_path
-                seq_len_bytes = 1
+                seq_len_bytes = 2
                 block_size = 131072
                 compress_flag = False
                 level = 3
-            
+                quiet = True
+
             encode_command(Args())
-            
-            # Decode and verify only sequences without N remain
             with open(zna_path, "rb") as f:
-                reader = ZnaReader(f)
-                records = list(reader.records())
-                
-                assert len(records) == 2  # Only seq1 and seq3
-                assert records[0][0] == "ACGT"
-                assert records[1][0] == "TGCA"
-    
-    def test_npolicy_replace_A(self):
-        """Test that N nucleotides are replaced with A."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fasta_path = f"{tmpdir}/input.fasta"
-            with open(fasta_path, "w") as f:
-                f.write(">seq_with_N\nACNGT\n")
-            
-            zna_path = f"{tmpdir}/output.zna"
-            
-            class Args:
-                files = [fasta_path]
-                interleaved = False
-                fasta = True
-                fastq = False
-                read_group = "test"
-                description = ""
-                strand_specific = False
-                read1_sense = False
-                read2_antisense = False
-                npolicy = "A"
-                output = zna_path
-                seq_len_bytes = 1
-                block_size = 131072
-                compress_flag = False
-                level = 3
-            
-            encode_command(Args())
-            
-            # Decode and verify N was replaced with A
-            with open(zna_path, "rb") as f:
-                reader = ZnaReader(f)
-                records = list(reader.records())
-                
-                assert len(records) == 1
-                assert records[0][0] == "ACAGT"  # N -> A
-    
+                seqs = [r[0] for r in ZnaReader(f).records()]
+            # Cut at the N, keeping the 5' side — including down to nothing.
+            assert seqs == ["ACGTACGT", "ACG", ""]
+
     def test_npolicy_random(self):
         """Test that N nucleotides are replaced with random bases."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1615,9 +1647,165 @@ class TestNPolicyCLI:
 
 # --- Mixed Interleaved Tests ---
 
+class TestZnaInputIsOnlyValidAlone:
+    """A .zna is input only in single-file re-encode mode.
+
+    ``is_reencoding`` is ``len(files) == 1 and is_zna_file(...)``, so with two .zna files
+    the check never fired, the binary went to the FASTQ parser, and encode wrote a valid
+    0-record file at exit 0 — warning only about *format inference*, never about the real
+    problem.
+    """
+
+    def _args(self, files, out):
+        class Args:
+            pass
+        a = Args()
+        a.files, a.output = files, out
+        a.interleaved = a.fasta = a.fastq = False
+        a.read_group, a.description = "rg", ""
+        a.strand_specific = a.read1_sense = a.read2_antisense = False
+        a.npolicy = None
+        a.seq_len_bytes, a.block_size = 2, 131072
+        a.compress_flag, a.level, a.quiet = False, 3, True
+        return a
+
+    def _make_zna(self, tmp_path, name):
+        src = tmp_path / "in.fq"
+        src.write_text("@r1\nACGTACGT\n+\nIIIIIIII\n")
+        out = tmp_path / name
+        a = self._args([str(src)], str(out))
+        a.fastq = True
+        encode_command(a)
+        return out
+
+    @pytest.mark.parametrize("second", ["zna", "fastq"])
+    def test_a_zna_alongside_another_file_is_refused(self, tmp_path, second):
+        z = self._make_zna(tmp_path, "a.zna")
+        if second == "zna":
+            other = self._make_zna(tmp_path, "b.zna")
+        else:
+            other = tmp_path / "r2.fq"
+            other.write_text("@r1\nACGTACGT\n+\nIIIIIIII\n")
+        with pytest.raises(SystemExit) as exc:
+            encode_command(self._args([str(z), str(other)], str(tmp_path / "o.zna")))
+        assert "already a ZNA file" in str(exc.value)
+
+    def test_a_lone_zna_still_reencodes(self, tmp_path):
+        z = self._make_zna(tmp_path, "a.zna")
+        out = tmp_path / "b.zna"
+        encode_command(self._args([str(z)], str(out)))
+        with open(out, "rb") as fh:
+            assert len(list(ZnaReader(fh).records())) == 1
+
+
+class TestPairedFilesMustHaveEqualCounts:
+    """Two-file input with unequal record counts is an error, not a silent truncation.
+
+    The loop was ``for s1, s2 in zip(p1, p2)``, which stops at the shorter file: an R2
+    with fewer records than R1 dropped every remaining R1 read and exited 0.  A whole
+    half-library could vanish with every stage green.
+
+    Note ``zip`` also makes the bug unfixable from outside — by the time it stops it has
+    already pulled and discarded the extra value from the longer iterator, so the
+    off-by-one case looks like a clean finish.  Hence the explicit two-``next`` loop.
+    """
+
+    def _write(self, path, n, mate):
+        with open(path, "w") as f:
+            for i in range(n):
+                f.write(f"@r{i}/{mate}\nACGTACGT\n+\nIIIIIIII\n")
+
+    def _args(self, files, out):
+        class Args:
+            pass
+        a = Args()
+        a.files, a.output = files, out
+        a.interleaved = a.fasta = False
+        a.fastq = True
+        a.read_group, a.description = "rg", ""
+        a.strand_specific = a.read1_sense = a.read2_antisense = False
+        a.npolicy = None
+        a.seq_len_bytes, a.block_size = 2, 131072
+        a.compress_flag, a.level, a.quiet = False, 3, True
+        return a
+
+    @pytest.mark.parametrize("n1,n2", [(3, 2), (2, 3)])
+    def test_unequal_counts_are_refused(self, tmp_path, n1, n2):
+        r1, r2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
+        self._write(r1, n1, 1)
+        self._write(r2, n2, 2)
+        with pytest.raises(SystemExit) as exc:
+            encode_command(self._args([str(r1), str(r2)], str(tmp_path / "o.zna")))
+        msg = str(exc.value)
+        assert "ran out of records before" in msg
+        # The message names the file that ended early, and the one that outlasted it.
+        short, long_ = (r2, r1) if n1 > n2 else (r1, r2)
+        assert f"{short} ran out of records before {long_}" in msg
+
+    def test_equal_counts_still_encode(self, tmp_path):
+        r1, r2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
+        self._write(r1, 3, 1)
+        self._write(r2, 3, 2)
+        out = tmp_path / "o.zna"
+        encode_command(self._args([str(r1), str(r2)], str(out)))
+        with open(out, "rb") as fh:
+            recs = list(ZnaReader(fh).records())
+        assert len(recs) == 6
+        assert [(r[1], r[2], r[3]) for r in recs[:2]] == [
+            (True, True, False), (True, False, True)]
+
+
+class TestMergedReadsAreNeverMates:
+    """A merged read is a whole molecule, so it must never be paired with a neighbour.
+
+    Interleaved pairing matches on the read NAME, and names collide.  Two independently
+    merged molecules that happened to share a name were paired into one fragment: both
+    lost ``IS_FULL_FRAGMENT``, both gained ``IS_PAIRED``/``IS_READ1``/``IS_READ2``, and
+    two different molecules were encoded as each other's mate — with a zero exit status
+    and no warning.  Duplicate read names are ordinary in real data (concatenated lanes,
+    some SRA dumps, UMI-collapsed files) and nothing upstream forbids them.
+
+    `zna merge`, fastp and khorana's `parse_merged_fastq` all already agree on the
+    ``merged_<n1>_<n2>`` token, so :func:`_read_key` reads it and reports
+    :data:`MERGED_SINGLE`.  Nothing errors: the records simply come out right.
+    """
+
+    def test_read_key_reports_a_merged_read(self):
+        from zna.cli import _read_key, MERGED_SINGLE
+        assert _read_key(b"f12 merged_90_0") == (b"f12", MERGED_SINGLE)
+        assert _read_key(b"f12\tZI:i:7 merged_90_0") == (b"f12", MERGED_SINGLE)
+        # A mate keeps its mate number and never pays for the check.
+        assert _read_key(b"f12/1\tZI:i:7") == (b"f12", 1)
+        assert _read_key(b"f12/2\tZI:i:7") == (b"f12", 2)
+        # An ordinary single is still an ordinary single.
+        assert _read_key(b"f12 some comment") == (b"f12", 0)
+        assert _read_key(b"f12") == (b"f12", 0)
+
+    def test_two_merged_reads_sharing_a_name_stay_separate(self):
+        from zna.cli import _pair_interleaved, _read_key
+        recs = [(*_read_key(h), h) for h in
+                (b"dup merged_90_0", b"dup merged_95_0", b"uniq merged_100_0")]
+        out = list(_pair_interleaved(recs))
+        assert len(out) == 3
+        for _payload, is_paired, is_read1, is_read2 in out:
+            assert not is_paired and not is_read1 and not is_read2
+
+    def test_genuine_mates_sharing_a_name_with_a_merged_read_still_pair(self):
+        """The fix must not cost a real pair its pairing."""
+        from zna.cli import _pair_interleaved, _read_key
+        recs = [(*_read_key(h), h) for h in
+                (b"dup merged_90_0", b"dup/1", b"dup/2")]
+        out = list(_pair_interleaved(recs))
+        assert [(r[1], r[2], r[3]) for r in out] == [
+            (False, False, False),        # the merged read, alone
+            (True, True, False),          # ...and the pair that shares its name
+            (True, False, True),
+        ]
+
+
 class TestMixedInterleaved:
     """Tests for interleaved mode with mixed paired-end and single-end reads."""
-    
+
     def test_mixed_paired_and_single(self):
         """Test interleaved mode with both paired and single-end reads."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2145,7 +2333,7 @@ class TestShuffle:
         a.compress_flag = None
         a.level = 3
         a.block_size = "4M"
-        a.npolicy = "drop"
+        a.npolicy = "trim3"
         a.shuffle = True
         a.seed = 42
         a.shuffle_buffer_size = "1G"
@@ -2239,7 +2427,7 @@ class TestGzipInput:
                 seq_len_bytes = 2
                 strand_specific = False
                 strand_normalize = False
-                npolicy = "drop"
+                npolicy = "trim3"
                 compress_flag = False
                 level = 3
                 block_size = "64K"
@@ -2278,7 +2466,7 @@ class TestEncodeShuffleBufferSize:
             seq_len_bytes = 2
             strand_specific = False
             strand_normalize = False
-            npolicy = "drop"
+            npolicy = "trim3"
             compress_flag = False
             level = 3
             block_size = "64K"

@@ -10,7 +10,7 @@ speed here would only buy the ability to be wrong in the same way as the thing i
 checks.
 
 Scores are integers throughout — see :mod:`zna.merge.params` for why, and
-``docs/MERGE_CPP_DESIGN.md`` §5 for the argmax total order the visiting order realises.
+``docs/METHODS.md`` for the argmax total order the visiting order realises.
 """
 from __future__ import annotations
 
@@ -151,40 +151,140 @@ def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
 
 MERGED, TRIMMED, KEPT = 0, 1, 2
 
+#: What to do with a no-call the overlap could not rescue. Same vocabulary as
+#: ``zna encode --npolicy``, deliberately: one flag, one meaning, both tools.
+NPOLICY_KEEP, NPOLICY_TRIM3, NPOLICY_RANDOM = 0, 1, 2
 
-def _consensus_r1_overlap(s1, q1, s2rc, q2r, s, olen, disagree_q):
-    """Resolve overlap disagreements into R1, by posterior. Returns ``(s1, q1, n)``.
+_M64 = 0xFFFFFFFFFFFFFFFF
+_SUB = b"ACGT"
 
-    Only R1 is written because the output's overlap always comes from R1 (merge
-    concatenates R1 through the overlap; trim keeps R1 and discards R2's copy), so
-    editing R2's discarded copy could never reach the corpus. New ``bytes`` if anything
-    changed, else the originals unchanged.
+
+def _merge_mix64(x):
+    """splitmix64's finalizer — the same function as ``merge_mix64`` in merge_core.hpp.
+
+    Substitution is position-derived rather than drawn from a running stream, so it
+    cannot depend on how pairs were batched into chunks.
+    """
+    x = (x + 0x9E3779B97F4A7C15) & _M64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _M64
+    return x ^ (x >> 31)
+
+
+def _sub_n(seq, seed, rec):
+    """Replace every ``N`` in *seq* with a base from the seeded, position-derived stream."""
+    if b"N" not in seq:
+        return seq, 0
+    out = bytearray(seq)
+    n = 0
+    for i, c in enumerate(out):
+        if c == 0x4E:
+            out[i] = _SUB[_merge_mix64(
+                (seed + 0xBF58476D1CE4E5B9 * (rec + 1)
+                      + 0x94D049BB133111EB * (i + 1)) & _M64) & 3]
+            n += 1
+    return bytes(out), n
+
+
+def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
+                            write_r2):
+    """Resolve overlap disagreements by posterior, into every emitted copy.
+
+    Returns ``(s1, q1, s2, q2, s2rc, n, rescued)``; ``n`` counts bases changed in R1,
+    ``rescued`` counts no-calls recovered from the mate in either direction.
+
+    The decision is symmetric — the better-supported base by posterior from the two
+    Phred scores, with the winner's quality derated because a contested base is less
+    certain.  The only question is which emitted copies of the overlap receive it, and
+    the rule is *every copy that reaches the corpus*.  :func:`process_pair` decides and
+    passes ``write_r2``; its comment gives the four cases.
+
+    **N rescue.**  An ``N`` carries no base information, so a real call on the other
+    mate beats it whatever the two qualities say, and the rescued base keeps the
+    surviving mate's own quality rather than a contested-base derating — there was no
+    contest.  Without this the rescue happened only by luck, because an instrument
+    usually assigns an N a low quality; a *high*-quality N beat a real base and survived
+    into the corpus.  Only ``N`` is rescued, not the IUPAC codes, which do carry partial
+    information.
+
+    Rescue does not touch the *scan*: an N still counts as a mismatch when the shift is
+    scored, so which shift wins — and therefore whether the pair merges — is unchanged.
+
+    ``s2``/``q2`` are R2 in its own orientation, which is how it is emitted: overlap slot
+    ``b`` on the reverse-complemented axis is R2 index ``len2 - 1 - b``, holding the
+    complement of the resolved call.  New ``bytes`` if anything changed, else the
+    originals unchanged.
     """
     a0 = s if s > 0 else 0        # mirrors the scan's overlap alignment
     b0 = -s if s < 0 else 0
-    s1b = q1b = None
-    n = 0
+    len2 = len(s2)
+    s1b = q1b = s2b = q2b = s2rcb = None
+    n = rescued = 0
     for i in range(olen):
         a = a0 + i
         b = b0 + i
         qa = q1[a]
         qb = q2r[b]
         if s1[a] != s2rc[b]:
-            if qb > qa:                       # R2 is the better-supported call
-                if s1b is None:
-                    s1b = bytearray(s1)
-                    q1b = bytearray(q1)
-                s1b[a] = s2rc[b]
-                q1b[a] = disagree_q[qb * 256 + qa]
+            if s1b is None:
+                s1b, q1b = bytearray(s1), bytearray(q1)
+                if write_r2:
+                    s2b, q2b = bytearray(s2), bytearray(q2)
+                    s2rcb = bytearray(s2rc)
+            j2 = len2 - 1 - b                 # the same base, in R2's own frame
+            a_is_n = s1[a] == 0x4E            # ord('N'); sequences are upper-cased
+            b_is_n = s2rc[b] == 0x4E
+            if a_is_n != b_is_n:              # rescue: a real call beats an N
+                if a_is_n:                    # R2 rescues R1
+                    s1b[a] = s2rc[b]
+                    q1b[a] = qb
+                    n += 1                    # `n` counts R1 only, by contract
+                    rescued += 1
+                elif write_r2:                # R1 rescues R2
+                    s2rcb[b] = s1b[a]
+                    s2b[j2] = _COMPLEMENT[s1b[a]]
+                    q2b[j2] = qa
+                    rescued += 1              # only where it is actually WRITTEN
+            elif a_is_n:                      # both are N: nothing to rescue from
+                pass
+            elif qb > qa:                     # R2 is the better-supported call
+                nq = disagree_q[qb * 256 + qa]
+                s1b[a] = s2rc[b]              # R2's base already stands in s2rc/s2
+                q1b[a] = nq
+                if write_r2:
+                    q2b[j2] = nq
                 n += 1
             else:                             # R1 wins, but it is contested: derate it
-                if s1b is None:
-                    s1b = bytearray(s1)
-                    q1b = bytearray(q1)
-                q1b[a] = disagree_q[qa * 256 + qb]
+                nq = disagree_q[qa * 256 + qb]
+                q1b[a] = nq
+                if write_r2:
+                    s2rcb[b] = s1b[a]         # keep s2rc the exact revcomp of s2
+                    s2b[j2] = _COMPLEMENT[s1b[a]]
+                    q2b[j2] = nq
     if s1b is None:
-        return s1, q1, 0
-    return bytes(s1b), bytes(q1b), n
+        return s1, q1, s2, q2, s2rc, 0, 0
+    if not write_r2:
+        return bytes(s1b), bytes(q1b), s2, q2, s2rc, n, rescued
+    return (bytes(s1b), bytes(q1b), bytes(s2b), bytes(q2b), bytes(s2rcb), n, rescued)
+
+
+def _balanced_split(L, len1, len2):
+    """Emitted lengths for a trimmed pair: as close to equal as the geometry allows.
+
+    The pair must tile the fragment exactly once, so ``keep1 + keep2 == L`` is forced and
+    the only freedom is where the cut falls. Splitting the overlap down the middle rather
+    than taking all of it off R2 keeps the two emitted reads the same length -- what
+    downstream aligners and models expect -- and discards the *last* cycles of both
+    reads, the lowest-quality bases in the pair, instead of one read's entire copy.
+
+    ``keep1`` is clamped into ``[L - len2, len1]``, the range in which both reads can
+    supply their share; for equal-length mates the clamp never binds and this is exactly
+    "cut ``olen / 2`` from each".
+    """
+    k = (L + 1) // 2                  # an odd overlap leaves the extra base on R1
+    k = max(k, L - len2)
+    k = min(k, len1)
+    return k, L - k
 
 
 def _build_merged(s, s1, q1, s2rc, q2, len1, len2):
@@ -216,8 +316,32 @@ def _build_merged(s, s1, q1, s2rc, q2, len1, len2):
     return seq, qual, take1, take2
 
 
+def _trim_is_allowed(L, len1, len2, lr):
+    """May this pair be trimmed? Each mate must reach at least ``lr`` past the other's
+    3' end — which both keeps every emitted read above the length filter and caps the
+    overlap the trim band may act on."""
+    return (L - len1) >= lr and (L - len2) >= lr
+
+
+def _trim3(seq, qual):
+    """Cut a read at its first ``N``, keeping ``[0, first_N)``.
+
+    3' only. Base 0 is a true fragment boundary — the read starts at a fragment end and
+    runs inward — so cutting from the far end never disturbs it, and the emitted read
+    stays honestly anchored however short it gets.
+
+    Returns the original objects untouched when there is no ``N``, so the common case
+    allocates nothing.
+    """
+    k = seq.find(b"N")
+    if k < 0:
+        return seq, qual, len(seq)
+    return seq[:k], qual[:k], k
+
+
 def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-                 min_read_length, disagree_q):
+                 min_read_length, disagree_q, npolicy=NPOLICY_TRIM3, rng_seed=0,
+                 pair_index=0):
     """Classify one pair and build its output records.
 
     Returns ``(records, outcome, n_dropped, score_q, overlap_len, mismatches,
@@ -226,15 +350,24 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     **The decision** is a single ``argmax`` shift read at two thresholds::
 
         score >= t_merge_q            -> merge (one full-fragment record)
-        t_trim_q <= score < t_merge_q -> keep both, trim the redundant overlap off R2's 3'
+        t_trim_q <= score < t_merge_q -> keep both, split the redundant overlap between
+                                         their 3' ends so the fragment is tiled once
         score <  t_trim_q             -> keep both unchanged
+
+    **The trim is symmetric.** The overlap sits at the 3' end of *both* mates (each read
+    starts at a fragment end and reads inward), so cutting half from each tiles the
+    fragment exactly once just as taking it all off R2 did -- and leaves the two emitted
+    reads the same length, which is what downstream aligners and models expect, while
+    discarding the last cycles of both reads rather than one read's whole copy. Because
+    both mates now keep part of the overlap, the consensus is written into both.
 
     Trimming applies only to the normal (``s >= 0``) geometry: in a read-through the
     redundant bases are R2's *5'* fragment copy and its 3' end is adapter, so there is
     nothing sensible to cut -- such a pair is either merged or kept whole.
 
-    **Trim guard:** a trim that would leave R2 below ``min_read_length`` keeps both reads
-    *untrimmed* instead, turning a would-be whole-fragment discard into a no-op.
+    **Trim guard:** a trim that would leave *either* read below ``min_read_length`` keeps
+    both *untrimmed* instead, turning a would-be whole-fragment discard into a no-op. It
+    binds far less often than it did, because balancing puts both reads near ``L / 2``.
 
     **Pair integrity:** an unmerged pair is emitted all-or-nothing. A lone surviving mate
     would be encoded as a spurious "single" -- a full molecule with both endpoints --
@@ -245,23 +378,99 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     s2rc = reverse_complement(s2)
     shift, score, olen, diff = scan(s1, s2rc, len1, len2, match_q, step_q, t_trim_q)
 
-    n_consensus = trim_guard = 0
-    if diff > 0:
-        s1, q1, n_consensus = _consensus_r1_overlap(
-            s1, q1, s2rc, q2[::-1], shift, olen, disagree_q)
-
     lr = min_read_length
-    if olen > 0 and score >= t_merge_q:
+    L = shift + len2                       # the inferred fragment length; 0 if no overlap
+
+    # PROVISIONAL decision, on the full reads. It settles where the consensus is written
+    # (below) and carries the evidence forward: the score is a statement about this
+    # pair's fragment length, and trimming interior bases cannot change a fragment's
+    # length. The final decision is re-taken after trimming, in `_decide` -- but on
+    # GEOMETRY, never by re-scoring. See docs/NPOLICY_PLAN.md D4a.
+    prov_merge = olen > 0 and score >= t_merge_q
+    prov_band = olen > 0 and shift >= 0 and t_trim_q <= score < t_merge_q
+    prov_trim = prov_band and _trim_is_allowed(L, len1, len2, lr)
+
+    # WHERE the consensus is written: into the records whose CONSTRUCTION depends on
+    # the overlap being real, and nowhere else.
+    #
+    #   merged  -> R1 alone. R1's overlap region becomes the merged record; R2
+    #              contributes only outside it, so its copy is discarded.
+    #   trimmed -> both. Each mate keeps part of the overlap, so both copies are emitted
+    #              and both must carry the same call.
+    #   kept    -> neither. Nothing emitted depends on the alignment being right.
+    #
+    # The kept case is what the measurements say, not a symmetry nicety. A detection
+    # that lands in KEPT is spurious almost by construction: at `shift >= 0` it is here
+    # only because `trim_is_allowed` refused it, which needs an inferred overlap over
+    # ~110 bases -- and a genuine one of that length scores ~218 bits and would have
+    # merged; at `shift < 0` a genuine read-through overlap equals the fragment length,
+    # so scoring in [8, 28) needs a 5-14 bp fragment. An overlap too suspect to CUT on is
+    # too suspect to REWRITE BASES on.
+    #
+    # Measured on 1M ground-truth pairs: of 3,068 kept pairs with a detected overlap,
+    # ZERO found the true shift and 97.3% had no true overlap at all. Wrong emitted bases
+    # in the overlap window -- correct-neither 208, correct-R1-only (the old behaviour)
+    # 1,509, correct-both 17,870. The old R1 write turned 1,379 correct bases wrong to
+    # fix 78.
+    write_r1 = prov_merge or prov_trim
+    write_r2 = prov_trim
+
+    n_consensus = trim_guard = npolicy_bases = n_rescued = 0
+    if diff > 0 and write_r1:
+        s1, q1, s2, q2, s2rc, n_consensus, n_rescued = _consensus_pair_overlap(
+            s1, q1, s2, q2, s2rc, q2[::-1], shift, olen, disagree_q, write_r2)
+
+    # ---- trim3: cut each read at its first SURVIVING N -------------------------
+    #
+    # After the rescue, so a no-call the mate could answer costs nothing. 3' only, so
+    # both 5' anchors -- the two fragment termini -- are untouched however short the
+    # reads get.
+    if npolicy == NPOLICY_RANDOM:
+        # Substitution does not change a length, so the coverage test below is
+        # unaffected and `random` never costs a merge -- unlike trim3.
+        s1n, k1 = _sub_n(s1, rng_seed, pair_index * 2)
+        s2n, k2 = _sub_n(s2, rng_seed, pair_index * 2 + 1)
+        npolicy_bases = k1 + k2
+        if npolicy_bases:
+            s1, s2 = s1n, s2n
+            s2rc = reverse_complement(s2)
+    elif npolicy == NPOLICY_TRIM3:
+        s1t, q1t, k1 = _trim3(s1, q1)
+        s2t, q2t, k2 = _trim3(s2, q2)
+        if k1 != len1 or k2 != len2:
+            npolicy_bases = (len1 - k1) + (len2 - k2)
+            s1, q1, s2, q2 = s1t, q1t, s2t, q2t
+            len1, len2 = k1, k2
+            s2rc = reverse_complement(s2)
+            # `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to
+            # len2. R2 keeps its 5' anchor at fragment position L-1, so the trimmed mate
+            # covers [L - len2, L) and the offset becomes L - len2. L itself is unchanged
+            # -- that is the whole point.
+            shift = L - len2
+
+    # ---- the final decision, on GEOMETRY, reusing the original evidence --------
+    #
+    # The pair still tiles the fragment iff len1 + len2 >= L. When it does, the
+    # reconstruction IS the fragment, exactly and N-free. Nothing is re-scored: trimming
+    # cuts 3' ends, which is where a normal overlap lives, so a re-scan would refuse
+    # merges it had ample evidence for a moment earlier.
+    covers = olen > 0 and (len1 + len2) >= L
+    will_merge = prov_merge and covers
+    will_trim = (not will_merge) and prov_band and (len1 + len2) > L \
+        and _trim_is_allowed(L, len1, len2, lr)
+    if will_trim:
+        keep1, keep2 = _balanced_split(L, len1, len2)
+
+    if will_merge:
         seq, qual, n1, n2 = _build_merged(shift, s1, q1, s2rc, q2, len1, len2)
         name = strip_pair_suffix(h1) + b" merged_%d_%d" % (n1, n2)
         cand = [(name, seq, qual)]
         paired, outcome = False, MERGED
-    elif olen > 0 and shift >= 0 and score >= t_trim_q and len2 - olen >= lr:
-        keep2 = len2 - olen
-        cand = [(h1, s1, q1), (h2, s2[:keep2], q2[:keep2])]
+    elif will_trim:
+        cand = [(h1, s1[:keep1], q1[:keep1]), (h2, s2[:keep2], q2[:keep2])]
         paired, outcome = True, TRIMMED
     else:
-        if olen > 0 and shift >= 0 and score >= t_trim_q:
+        if prov_band and not prov_trim:
             trim_guard = 1                                  # guard fired
         cand = [(h1, s1, q1), (h2, s2, q2)]
         paired, outcome = True, KEPT
@@ -271,7 +480,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     else:
         kept = [r for r in cand if len(r[1]) >= lr]
     return (kept, outcome, len(cand) - len(kept), score, olen, diff,
-            n_consensus, trim_guard)
+            n_consensus, trim_guard, npolicy_bases, n_rescued)
 
 
 # =========================================================================== #
@@ -287,7 +496,17 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
 # came out empty.
 # =========================================================================== #
 
-HIST_MAX = 1024
+def _bump(hist, i):
+    """Count one observation of value *i*, growing *hist* to fit.
+
+    The histograms are uncapped (the compiled backend sizes its dense arrays from the
+    scratch arena; see ``fastq_chunk.hpp``), so both backends return a list whose last
+    element is non-zero. Growing to exactly ``i + 1`` and then incrementing ``i`` keeps
+    that true here by construction.
+    """
+    if i >= len(hist):
+        hist.extend([0] * (i + 1 - len(hist)))
+    hist[i] += 1
 
 
 def _next_record(buf, pos, limit, which):
@@ -321,7 +540,8 @@ def _next_record(buf, pos, limit, which):
 
 
 def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge_q,
-                t_trim_q, min_read_length, disagree_q, check_sync, base_index):
+                t_trim_q, min_read_length, disagree_q, check_sync, base_index,
+                npolicy=NPOLICY_TRIM3, rng_seed=0):
     """Merge every whole pair available in both buffers.
 
     Returns ``(blob, consumed1, consumed2, counters, len_hist, olen_hist,
@@ -331,9 +551,8 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
     n_pairs = merged = trimmed = kept = emitted = dropped = 0
     bases_trimmed = frags_short = bases_consensus = trim_guard = 0
     sum_olen = sum_diff = max_read_len = 0
-    len_hist = [0] * (HIST_MAX + 1)
-    olen_hist = [0] * (HIST_MAX + 1)
-    insert_hist = [0] * (HIST_MAX + 1)
+    npolicy_bases = n_rescued_tot = 0
+    len_hist, olen_hist, insert_hist = [], [], []
     pos1, pos2 = start1, start2
 
     while True:
@@ -356,40 +575,45 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
                 f"'{base_name(h2).decode('latin-1')}'")
 
         (records, outcome, n_dropped, score, olen, diff,
-         n_consensus, guard) = process_pair(
+         n_consensus, guard, npol_bases, rescued) = process_pair(
             h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-            min_read_length, disagree_q)
+            min_read_length, disagree_q, npolicy, rng_seed, base_index + n_pairs)
 
         n_pairs += 1
         dropped += n_dropped
         bases_consensus += n_consensus
         trim_guard += guard
+        npolicy_bases += npol_bases
+        n_rescued_tot += rescued
         if outcome == MERGED:
             merged += 1
         elif outcome == TRIMMED:
             trimmed += 1
+            # Both mates are cut now, so charge both: the counter is "redundant bases
+            # removed", which is the overlap length either way.
             if records:
-                bases_trimmed += len(s2) - len(records[1][1])
+                bases_trimmed += ((len(s1) - len(records[0][1]))
+                                  + (len(s2) - len(records[1][1])))
         else:
             kept += 1
         if not records and outcome != MERGED:
             frags_short += 1
         if olen:
-            olen_hist[olen if olen <= HIST_MAX else HIST_MAX] += 1
+            _bump(olen_hist, olen)
             sum_olen += olen
             sum_diff += diff
         for header, seq, qual in records:
             parts.append(b"@%b\n%b\n+\n%b\n" % (header, seq, qual))
             emitted += 1
             L = len(seq)
-            len_hist[L if L <= HIST_MAX else HIST_MAX] += 1
+            _bump(len_hist, L)
             if outcome == MERGED:
-                insert_hist[L if L <= HIST_MAX else HIST_MAX] += 1
+                _bump(insert_hist, L)
         pos1, pos2 = try1, try2
 
     counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
                 frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
-                max_read_len)
+                max_read_len, npolicy_bases, n_rescued_tot)
     return (b"".join(parts), pos1 - start1, pos2 - start2, counters,
             len_hist, olen_hist, insert_hist)
 

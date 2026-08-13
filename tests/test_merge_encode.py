@@ -1,7 +1,7 @@
 """End-to-end: `zna merge` -> `zna encode` -> read back, checking the geometry.
 
 This is the test that sees BOTH sides of the merge/encode seam, which is why the
-contract is tested here (docs/SOS_EOS_ENCODING_PLAN.md §9.5). Two bugs would have been
+contract is tested here (docs/METHODS.md, "Fragment geometry"). Two bugs would have been
 caught by it and were not caught by either half's own suite:
 
   * `zna encode --label-defs` silently ignored `--interleaved` and flagged every
@@ -148,7 +148,7 @@ def encode(tmp_path, fastq, strand_args, name="reads.zna"):
     cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
            "--shuffle", "--seed", "7",
            "--seq-len-bytes", "2",
-           "--npolicy", "drop",
+           "--npolicy", "trim3",
            "--treat-unpaired-as-merged",
            "--read-group", "lib1",
            "--description", "test lib1",
@@ -268,7 +268,7 @@ class TestMergeToZna:
         out = tmp_path / "noflag.zna"
         cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
                "--seq-len-bytes", "2",
-               "--npolicy", "drop", "--strand-normalize", *STRANDS["ISF"],
+               "--npolicy", "trim3", "--strand-normalize", *STRANDS["ISF"],
                "--label-defs", str(label_defs(tmp_path)), "-o", str(out),
                str(merged_fastq)]
         assert subprocess.run(cmd, capture_output=True, text=True).returncode == 0

@@ -26,7 +26,7 @@ from zna.cli import (  # noqa: E402
     parse_fastq_with_names, get_base_name, get_read_suffix_number,
 )
 from zna.core import (  # noqa: E402
-    COMPRESSION_ZSTD, ZnaHeader, ZnaWriter, _RC_FULL_BY_ENDS, _flags_from_ends,
+    COMPRESSION_ZSTD, ZnaHeader, ZnaWriter,
 )
 
 RNG = random.Random(20260811)
@@ -142,70 +142,7 @@ def bench_single_end_loop():
 
 
 # ---------------------------------------------------------------------------
-# 3. _flags_from_ends per record
-# ---------------------------------------------------------------------------
-
-def bench_flags_from_ends():
-    # A realistic mix of the three reachable end states.
-    ends = [(True, False), (False, True), (True, True)] * (N_READS // 3)
-
-    def old():
-        acc = 0
-        for has_start, has_end in ends:
-            is_rc, is_full = _flags_from_ends(has_start, has_end)
-            acc += (8 if is_rc else 0) | (16 if is_full else 0)
-        return acc
-
-    def new():
-        acc = 0
-        table = _RC_FULL_BY_ENDS
-        for has_start, has_end in ends:
-            is_rc, is_full = table[(2 if has_start else 0) | (1 if has_end else 0)]
-            acc += (8 if is_rc else 0) | (16 if is_full else 0)
-        return acc
-
-    assert old() == new(), "_flags_from_ends table disagrees with the function"
-    return ab("_flags_from_ends -> table lookup (isolated)", old, new)
-
-
-def bench_flags_from_ends_in_context():
-    """The same change measured where it actually runs: a pass-through write
-    loop, which is what ``shuffle`` and ``encode`` of a normalized file do."""
-    recs = [(s, True, i % 2 == 0, i % 2 == 1, i % 3 != 1, i % 3 == 1)
-            for i, s in enumerate(SEQS_CLEAN)]
-
-    def hdr_norm():
-        return ZnaHeader(read_group="bench", seq_len_bytes=2,
-                         strand_normalized=True,
-                         compression_method=COMPRESSION_ZSTD, compression_level=3)
-
-    def old():
-        buf = io.BytesIO()
-        with ZnaWriter(buf, hdr_norm(), preserve_normalization=True) as w:
-            write_record = w.write_record
-            for rec in recs:
-                is_rc, is_full = _flags_from_ends(rec[4], rec[5])
-                write_record(rec[0], rec[1], rec[2], rec[3],
-                             is_rc=is_rc, is_full_fragment=is_full)
-        return buf.getbuffer().nbytes
-
-    def new():
-        buf = io.BytesIO()
-        table = _RC_FULL_BY_ENDS
-        with ZnaWriter(buf, hdr_norm(), preserve_normalization=True) as w:
-            write_record = w.write_record
-            for rec in recs:
-                is_rc, is_full = table[(2 if rec[4] else 0) | (1 if rec[5] else 0)]
-                write_record(rec[0], rec[1], rec[2], rec[3],
-                             is_rc=is_rc, is_full_fragment=is_full)
-        return buf.getbuffer().nbytes
-
-    assert old() == new(), "table lookup changed the written file"
-    return ab("_flags_from_ends in a pass-through write loop", old, new)
-
-
-# ---------------------------------------------------------------------------
-# 4. Interleaved pairing
+# 3. Interleaved pairing
 # ---------------------------------------------------------------------------
 
 def _old_parse_with_names(fh):
@@ -275,8 +212,6 @@ def main():
     results = [
         bench_ndrop(),
         bench_single_end_loop(),
-        bench_flags_from_ends(),
-        bench_flags_from_ends_in_context(),
         bench_read_key(),
         bench_interleaved_pairing(),
     ]

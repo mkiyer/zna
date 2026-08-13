@@ -53,6 +53,30 @@ constexpr uint8_t BASE_G = 2;
 constexpr uint8_t BASE_T = 3;
 constexpr uint8_t INVALID = 255;
 
+/// splitmix64's finalizer. The substitution and orientation streams are derived from it
+/// rather than carried as mutable state, so neither depends on how records are batched.
+/// Integer-only and written identically in `_pycodec.py`, so the two backends cannot
+/// drift; see docs/NPOLICY_PLAN.md 8.3.
+static inline uint64_t zna_mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+/// Which mate of the pair at global record index `r` is reverse-complemented.
+static inline uint64_t zna_rc_coin(uint64_t seed, uint64_t r) {
+    return zna_mix64(seed + 0x9E3779B97F4A7C15ULL * (r + 1)) & 1ULL;
+}
+
+/// The base substituted for the no-call at `off` of the STORED record at index `r`.
+/// A different multiplier from the coin, so the two streams never shift each other.
+static inline uint8_t zna_sub_base(uint64_t seed, uint64_t r, uint64_t off) {
+    return static_cast<uint8_t>(
+        zna_mix64(seed + 0xBF58476D1CE4E5B9ULL * (r + 1)
+                       + 0x94D049BB133111EBULL * (off + 1)) & 3ULL);
+}
+
 // Lookup table for encoding (char -> 2-bit value)
 alignas(64) static uint8_t ENCODE_TABLE[256];
 
@@ -423,8 +447,8 @@ struct SeqView {
 /// policy draws in output order, so the packed bytes are identical either way.
 template <bool RC>
 static inline void pack_sequence(uint8_t* out, const uint8_t* seq_bytes, size_t slen,
-                                 bool has_npolicy, bool use_random_n,
-                                 uint8_t n_replace_val, uint32_t& rng_state) {
+                                 bool has_npolicy, uint64_t rng_seed,
+                                 uint64_t rec_index) {
     auto code_at = [&](size_t k) -> uint8_t {
         uint8_t c;
         if constexpr (RC) {
@@ -433,16 +457,27 @@ static inline void pack_sequence(uint8_t* out, const uint8_t* seq_bytes, size_t 
             c = ENCODE_TABLE[seq_bytes[k]];
         }
         if (c == INVALID) {
+            // Which byte was it? `k` is the STORED offset, so report the source index.
+            const size_t src_k = RC ? (slen - 1 - k) : k;
+            const uint8_t raw = static_cast<uint8_t>(seq_bytes[src_k]);
+            // Only a no-call is substitutable. Every other non-ACGT byte -- the IUPAC
+            // codes, punctuation, anything -- is an error under EVERY policy. This used
+            // to substitute silently, so `--npolicy A` quietly turned an `R` into an `A`
+            // and the compiled backend disagreed with the reference.
+            if (raw != 'N' && raw != 'n') {
+                char msg[80];
+                std::snprintf(msg, sizeof(msg),
+                              "invalid character '%c' at offset %zu in sequence",
+                              (raw >= 32 && raw < 127) ? static_cast<char>(raw) : '?',
+                              src_k);
+                throw std::invalid_argument(msg);
+            }
             if (!has_npolicy) {
                 throw std::invalid_argument("Invalid character in sequence");
             }
-            if (use_random_n) {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 17;
-                rng_state ^= rng_state << 5;
-                return static_cast<uint8_t>(rng_state & 3);
-            }
-            return n_replace_val;
+            // Position-derived, so the answer does not depend on how records are batched.
+            return zna_sub_base(rng_seed, static_cast<uint64_t>(rec_index),
+                                static_cast<uint64_t>(k));
         }
         if constexpr (RC) {
             return static_cast<uint8_t>(3 - c);
@@ -516,6 +551,7 @@ static void collect_seq_views(PyObject* seqs, size_t count,
 static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
                         int len_bytes_fmt, const std::string& npolicy,
                         bool do_rc_r1, bool do_rc_r2, bool do_random_rc,
+                        uint64_t rng_seed, uint64_t base_index,
                         EncodeResult& out) {
     if (!PyList_Check(seqs)) {
         throw std::invalid_argument("seqs must be a list of str");
@@ -547,19 +583,16 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
     char* lengths_out = out.lengths_out.data();
     uint8_t* seqs_out = reinterpret_cast<uint8_t*>(out.seqs_out.data());
 
-    // N-handling logic setup
-    uint8_t n_replace_val = 0;  // Default: A
-    bool use_random_n = false;
-    const bool has_npolicy = !npolicy.empty();
-
-    if (npolicy == "C" || npolicy == "c") n_replace_val = BASE_C;
-    else if (npolicy == "G" || npolicy == "g") n_replace_val = BASE_G;
-    else if (npolicy == "T" || npolicy == "t") n_replace_val = BASE_T;
-    else if (npolicy == "random") use_random_n = true;
-    // else: A (default) or empty (will throw on N)
-
-    // Simple PRNG state for random N replacement (xorshift32)
-    uint32_t rng_state = 0xDEADBEEF;
+    // The policy set is CLOSED. It used to be a chain of equality tests with a silent
+    // `A` default, which meant every unrecognised string -- including "drop", the CLI's
+    // own default -- substituted A without a word. Reject instead.
+    const bool has_npolicy = npolicy == "random";
+    if (!npolicy.empty() && npolicy != "random") {
+        throw std::invalid_argument(
+            "unknown npolicy '" + npolicy + "'; expected 'random' or none. "
+            "'trim3' is applied before the codec, and 'drop' is a record filter, "
+            "not an encoding policy.");
+    }
 
     size_t max_len = 0;
     if (len_bytes_fmt == 1) max_len = 255;
@@ -579,11 +612,10 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
         if (do_random_rc) {
             // Unstranded random normalization
             if (is_paired && is_read1 && (i + 1 < count) && (flags[i + 1] & IS_PAIRED)) {
-                // Paired R1+R2: flip a coin to decide which read to RC
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 17;
-                rng_state ^= rng_state << 5;
-                if (rng_state & 1) {
+                // Paired R1+R2: which mate is flipped. Derived from the pair's GLOBAL
+                // record index, not from a running stream, so the assignment cannot
+                // depend on how records were batched into blocks.
+                if (zna_rc_coin(rng_seed, base_index + i)) {
                     needs_rc = true;
                     flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
                 } else {
@@ -591,10 +623,7 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
                 }
             } else if (!(is_paired && is_read2)) {
                 // Unpaired/SE or lone R1 (no following R2): random RC
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 17;
-                rng_state ^= rng_state << 5;
-                if (rng_state & 1) {
+                if (zna_rc_coin(rng_seed, base_index + i)) {
                     needs_rc = true;
                     flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
                 }
@@ -636,10 +665,10 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
         // --- Sequence (2-bit packing, reverse-complementing as it reads) ---
         if (needs_rc) {
             pack_sequence<true>(seqs_out + seq_off, views[i].data, slen,
-                                has_npolicy, use_random_n, n_replace_val, rng_state);
+                                has_npolicy, rng_seed, base_index + i);
         } else {
             pack_sequence<false>(seqs_out + seq_off, views[i].data, slen,
-                                 has_npolicy, use_random_n, n_replace_val, rng_state);
+                                 has_npolicy, rng_seed, base_index + i);
         }
         seq_off += (slen + 3) / 4;
     }
@@ -659,11 +688,13 @@ nb::tuple encode_block(
     const std::string& npolicy,
     bool do_rc_r1,
     bool do_rc_r2,
-    bool do_random_rc
+    bool do_random_rc,
+    uint64_t rng_seed,
+    uint64_t base_index
 ) {
     EncodeResult r;
     encode_core(seqs.ptr(), flags, len_bytes_fmt, npolicy,
-                do_rc_r1, do_rc_r2, do_random_rc, r);
+                do_rc_r1, do_rc_r2, do_random_rc, rng_seed, base_index, r);
     return nb::make_tuple(
         nb::bytes(r.flags_out.data(), r.flags_out.size()),
         nb::bytes(r.lengths_out.data(), r.lengths_out.size()),
@@ -691,12 +722,14 @@ nb::tuple encode_block_labeled(
     bool do_rc_r2,
     bool do_random_rc,
     const std::vector<nb::bytes>& label_col_data,
-    const std::vector<int>& label_col_sizes
+    const std::vector<int>& label_col_sizes,
+    uint64_t rng_seed,
+    uint64_t base_index
 ) {
     (void)label_col_sizes;
     EncodeResult r;
     encode_core(seqs.ptr(), flags, len_bytes_fmt, npolicy,
-                do_rc_r1, do_rc_r2, do_random_rc, r);
+                do_rc_r1, do_rc_r2, do_random_rc, rng_seed, base_index, r);
 
     if (!label_col_data.empty()) {
         size_t total_label_bytes = 0;
@@ -1066,6 +1099,89 @@ constexpr int CONV_ORD = 2;
  * The header format is: READNAME<ws>TAG:TYPE:VALUE<ws>TAG:TYPE:VALUE...
  * where <ws> is any whitespace (tab or space).
  */
+// ---------------------------------------------------------------------------
+// Label value conversion.
+//
+// These must agree with `extract_labels_from_header` in zna/cli.py EXACTLY -- it is the
+// reference, and a label column is not self-describing, so a disagreement is invisible
+// until a model trains on it.
+//
+// The parsing here used to be `v = v * 10 + (c - '0')` with no digit test and no range
+// test, which is wrong in three ways at once and silent in all of them:
+//
+//     NM:i:      -> 0        (reference: ValueError)
+//     NM:i:abc   -> 5451     (reference: ValueError)   'a'-'0'=49, 'b'-'0'=50, ...
+//     NM:i:3.7   -> 287      (reference: ValueError)   '.'-'0' = -2
+//     NM:i:<2^63 -> wrapped  (reference: the exact integer) -- and signed overflow is
+//                            undefined behaviour, not merely a wrong answer.
+//
+// So the fast loop stays for the case it is good at -- a short run of ASCII digits --
+// and everything else is handed to CPython's own `int()`/`float()`. That way the value
+// AND the exception are the reference's by construction, rather than by a
+// reimplementation that has to be kept in step by hand.
+// ---------------------------------------------------------------------------
+
+/// `int(bytes)`, including the ValueError it raises. Used for anything the fast path
+/// declines: empty, signed-and-long, over-long, or not a plain decimal.
+static nb::object int_via_python(const char* p, size_t n) {
+    const std::string buf(p, n);
+    char* end = nullptr;
+    PyObject* o = PyLong_FromString(buf.c_str(), &end, 10);
+    if (o == nullptr) throw nb::python_error();
+    // PyLong_FromString tolerates trailing junk that `int()` does not.
+    if (end != buf.c_str() + buf.size()) {
+        Py_DECREF(o);
+        PyErr_Format(PyExc_ValueError,
+                     "invalid literal for int() with base 10: b'%s'", buf.c_str());
+        throw nb::python_error();
+    }
+    return nb::steal<nb::object>(o);
+}
+
+/// An integer label value, parsed as Python's `int()` would.
+static nb::object parse_int_value(const char* p, size_t n) {
+    // Fast path: optional sign, then 1..18 digits -- which always fits in int64.
+    const size_t i = (n > 0 && (p[0] == '-' || p[0] == '+')) ? 1u : 0u;
+    if (n > i && n - i <= 18) {
+        long long v = 0;
+        size_t k = i;
+        for (; k < n; ++k) {
+            const unsigned d = static_cast<unsigned>(static_cast<unsigned char>(p[k])) - '0';
+            if (d > 9) break;
+            v = v * 10 + static_cast<long long>(d);
+        }
+        if (k == n) return nb::int_(p[0] == '-' ? -v : v);
+    }
+    return int_via_python(p, n);
+}
+
+/// A float label value, parsed as Python's `float()` would.
+///
+/// `strtod` alone will not do: it stops at the first byte it cannot use, so "3.7x"
+/// silently became 3.7 and "" became 0.0. It is also locale-sensitive about the decimal
+/// point, where `float()` never is -- which this handles for free, because a locale that
+/// rejects '.' leaves `end` short of the value and falls through to CPython.
+static nb::object parse_float_value(const char* p, size_t n) {
+    // `strtod` also accepts C99 hex float literals ("0x10" -> 16.0, whole string
+    // consumed) where `float()` raises. That is the one form it over-accepts, so send it
+    // to CPython rather than trying to out-guess it.
+    const size_t sign = (n > 0 && (p[0] == '-' || p[0] == '+')) ? 1u : 0u;
+    const bool hex = n >= sign + 2 && p[sign] == '0'
+                     && (p[sign + 1] == 'x' || p[sign + 1] == 'X');
+    if (n > 0 && !hex) {
+        const std::string buf(p, n);
+        char* end = nullptr;
+        const double v = std::strtod(buf.c_str(), &end);
+        if (end == buf.c_str() + buf.size()) return nb::float_(v);
+    }
+    PyObject* s = PyUnicode_FromStringAndSize(p, static_cast<Py_ssize_t>(n));
+    if (s == nullptr) throw nb::python_error();
+    PyObject* o = PyFloat_FromString(s);
+    Py_DECREF(s);
+    if (o == nullptr) throw nb::python_error();
+    return nb::steal<nb::object>(o);
+}
+
 nb::tuple extract_labels_fast(
     nb::bytes header,
     const std::vector<std::pair<nb::bytes, int>>& tag_specs,
@@ -1142,37 +1258,14 @@ nb::tuple extract_labels_fast(
 
                 nb::object py_val;
                 if (spec.conv_type == CONV_INT) {
-                    // Parse integer from bytes — no allocation
-                    long long v = 0;
-                    bool negative = false;
-                    size_t vi = 0;
-                    if (val_len > 0 && val_start[0] == '-') {
-                        negative = true;
-                        vi = 1;
-                    }
-                    for (; vi < val_len; ++vi) {
-                        v = v * 10 + (val_start[vi] - '0');
-                    }
-                    if (negative) v = -v;
-                    py_val = nb::int_(v);
+                    py_val = parse_int_value(val_start, val_len);
                 } else if (spec.conv_type == CONV_FLOAT) {
-                    // Use strtod for float parsing
-                    char buf[64];
-                    size_t copy_len = val_len < 63 ? val_len : 63;
-                    std::memcpy(buf, val_start, copy_len);
-                    buf[copy_len] = '\0';
-                    double v = std::strtod(buf, nullptr);
-                    py_val = nb::float_(v);
-                } else { // CONV_ORD
+                    py_val = parse_float_value(val_start, val_len);
+                } else { // CONV_ORD — a single byte is its ordinal, else an integer
                     if (val_len == 1) {
                         py_val = nb::int_(static_cast<long>(static_cast<uint8_t>(val_start[0])));
                     } else {
-                        // Fallback: parse as int
-                        long long v = 0;
-                        for (size_t vi = 0; vi < val_len; ++vi) {
-                            v = v * 10 + (val_start[vi] - '0');
-                        }
-                        py_val = nb::int_(v);
+                        py_val = parse_int_value(val_start, val_len);
                     }
                 }
 
@@ -1208,6 +1301,8 @@ NB_MODULE(_accel, m) {
           nb::arg("do_rc_r1"),
           nb::arg("do_rc_r2"),
           nb::arg("do_random_rc") = false,
+          nb::arg("rng_seed") = 0,
+          nb::arg("base_index") = 0,
           "Batch encode sequences into columnar streams (no labels).");
 
     m.def("encode_block_labeled", &encode_block_labeled,
@@ -1219,7 +1314,8 @@ NB_MODULE(_accel, m) {
           nb::arg("do_rc_r2"),
           nb::arg("do_random_rc"),
           nb::arg("label_col_data"),
-          nb::arg("label_col_sizes"),
+          nb::arg("label_col_sizes"), nb::arg("rng_seed") = 0,
+          nb::arg("base_index") = 0,
           "Batch encode sequences with pre-packed label columns.\n"
           "Returns 4-tuple (flags, labels, lengths, seqs) when labels present,\n"
           "or 3-tuple when label_col_data is empty.");

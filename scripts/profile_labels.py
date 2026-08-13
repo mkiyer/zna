@@ -129,7 +129,7 @@ def test_roundtrip_labeled_single(max_records=500_000):
     try:
         t_encode_start = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     for raw_header, seq in parse_fastq_with_headers(fq):
                         labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=COMMON_LABEL_DEFS)
@@ -228,7 +228,7 @@ def test_roundtrip_merged(max_records=500_000):
     try:
         t_encode_start = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(MERGED_PATH, "rb") as fq:
                     for raw_header, seq in parse_fastq_with_headers(fq):
                         labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=COMMON_LABEL_DEFS)
@@ -313,7 +313,7 @@ def test_encode_performance_baseline():
         count = 0
         t0 = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     for seq in parse_fastq(fq):
                         w.write_record(seq, False, False, False)
@@ -352,7 +352,7 @@ def test_encode_performance_labeled():
         count = 0
         t0 = time.perf_counter()
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     for raw_header, seq in parse_fastq_with_headers(fq):
                         labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=COMMON_LABEL_DEFS)
@@ -389,7 +389,7 @@ def test_decode_performance():
         count = 0
         from zna.cli import parse_fastq
         with open(unlabeled_path, "wb") as fh:
-            with ZnaWriter(fh, header_no, npolicy='A') as w:
+            with ZnaWriter(fh, header_no, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     for seq in parse_fastq(fq):
                         w.write_record(seq, False, False, False)
@@ -400,7 +400,7 @@ def test_decode_performance():
         labeled_path = f"{tmpdir}/labeled.zna"
         header_lbl = ZnaHeader(read_group="perf", compression_method=COMPRESSION_ZSTD, labels=label_defs)
         with open(labeled_path, "wb") as fh:
-            with ZnaWriter(fh, header_lbl, npolicy='A') as w:
+            with ZnaWriter(fh, header_lbl, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     for raw_header, seq in parse_fastq_with_headers(fq):
                         labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=COMMON_LABEL_DEFS)
@@ -456,7 +456,7 @@ def test_profile_encode():
         try:
             count = 0
             with open(tmp_path, "wb") as fh:
-                with ZnaWriter(fh, header, npolicy='A') as w:
+                with ZnaWriter(fh, header, npolicy='random') as w:
                     with gzip.open(R1_PATH, "rb") as fq:
                         for raw_header, seq in parse_fastq_with_headers(fq):
                             labels = extract_labels_from_header(raw_header, tag_map, num_labels, label_defs=COMMON_LABEL_DEFS)
@@ -503,7 +503,7 @@ def test_zna_inspect():
 
     try:
         with open(tmp_path, "wb") as fh:
-            with ZnaWriter(fh, header, npolicy='A') as w:
+            with ZnaWriter(fh, header, npolicy='random') as w:
                 with gzip.open(R1_PATH, "rb") as fq:
                     count = 0
                     for raw_header, seq in parse_fastq_with_headers(fq):

@@ -634,9 +634,9 @@ class TestCppEncodeLabeledStrandNorm(unittest.TestCase):
         col_data, col_sizes = _pack_label_columns([[7]], [ldef], 1)
 
         result = cpp_encode_block_labeled(
-            ["ACNGT"], [0], 2, "A", False, False, False, col_data, col_sizes,
+            ["ACNGT"], [0], 2, "random", False, False, False, col_data, col_sizes,
         )
-        # Should not raise — N replaced with A
+        # Should not raise — the no-call is substituted from the seeded stream
         self.assertEqual(len(result), 4)
 
 

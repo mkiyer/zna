@@ -1,6 +1,6 @@
 """Merge parameters, and the fixed-point scale the overlap score is computed in.
 
-The score is a log-likelihood ratio in **bits** (see ``docs/READ_MERGE_REDESIGN.md``),
+The score is a log-likelihood ratio in **bits** (see ``docs/METHODS.md``),
 but it is *computed* in **integers**::
 
     score_q = n * match_q - d * step_q          # int64, SCALE units per bit
@@ -106,9 +106,12 @@ class MergeParams:
     kernel and every threshold comparison use them; nothing downstream re-derives them.
     """
     t_merge: float = 28.0        # score >= this -> merge into one full-fragment read
-    t_trim: float = 8.0          # [t_trim, t_merge) -> keep both, trim R2's redundant 3'
+    t_trim: float = 8.0          # [t_trim, t_merge) -> keep both, split the redundant
+                                 # overlap between the two mates' 3' ends
     err_rate: float = 0.01       # per-position mismatch rate under "real overlap"
     min_read_length: int = 40    # drop emitted reads shorter than this (post merge/trim)
+    npolicy: str = "trim3"       # 'trim3' | 'random' — what to do with a surviving N
+    rng_seed: int = 42           # seeds --npolicy random; see merge_core.hpp
 
     # Derived, in fixed point. Not constructor arguments, and excluded from equality so
     # two MergeParams with the same bits compare equal.
@@ -116,6 +119,18 @@ class MergeParams:
     step_q: int = field(init=False, repr=False, compare=False, default=0)
     t_merge_q: int = field(init=False, repr=False, compare=False, default=0)
     t_trim_q: int = field(init=False, repr=False, compare=False, default=0)
+
+    #: ``npolicy`` name -> the integer code both backends take.
+    _NPOLICY_CODES = {"keep": 0, "trim3": 1, "random": 2}
+
+    @property
+    def npolicy_code(self) -> int:
+        try:
+            return self._NPOLICY_CODES[self.npolicy]
+        except KeyError:
+            raise ValueError(
+                f"unknown npolicy {self.npolicy!r}; expected 'trim3' or 'random'"
+            ) from None
 
     def __post_init__(self) -> None:
         match_w, mismatch_w = score_weights(self.err_rate)

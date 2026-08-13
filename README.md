@@ -99,13 +99,19 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for detailed benchmarking.
 
 ## Documentation
 
-- **[docs/RELEASING.md](docs/RELEASING.md)** - Publishing to PyPI and Bioconda
-- **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** - Benchmarks and tuning
-- **[docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md)** - `zna merge`: why the scoring rule is what it is
-- **[docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md)** - `zna merge`: what was measured and rejected
-- **[docs/READ_MERGE_ROADMAP.md](docs/READ_MERGE_ROADMAP.md)** - `zna merge`: status board
-- **[docs/MERGE_CPP_DESIGN.md](docs/MERGE_CPP_DESIGN.md)** - `zna merge`: design for the native backend
-- **[docs/SOS_EOS_ENCODING_PLAN.md](docs/SOS_EOS_ENCODING_PLAN.md)** - Fragment-boundary supervision, end to end
+This README is the **user manual** — installation, usage, the file format, the command
+reference and the Python API are all below.
+
+| | |
+|---|---|
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and why |
+| [docs/METHODS.md](docs/METHODS.md) | the algorithms: the overlap score and its two thresholds, the quality-aware consensus, fragment geometry and what the flags mean, the codec |
+| [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) | `zna merge` scored against known ground truth and head to head with fastp. Read this before changing a threshold |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | compression ratios, throughput, and tuning |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
+| [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
+| [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — specified, not built *(0.5.0)* |
+| [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | `--npolicy trim3` and a reproducible `random` — specified, not built |
 
 ---
 
@@ -286,9 +292,8 @@ zna encode R1.fastq.gz R2.fastq.gz \
   -o stranded.zna
 
 # Handle sequences with N nucleotides
-zna encode sample.fastq --npolicy drop -o clean.zna       # Skip sequences with N
-zna encode sample.fastq --npolicy random -o clean.zna     # Replace N with random base
-zna encode sample.fastq --npolicy A -o clean.zna          # Replace N with A
+zna encode sample.fastq --npolicy trim3 -o clean.zna      # Cut each read at its first N (default)
+zna encode sample.fastq --npolicy random -o clean.zna     # Substitute N from a seeded stream
 
 # Shuffle during encoding (for ML training data preparation)
 zna encode sample.fastq --shuffle -o shuffled.zna
@@ -554,7 +559,7 @@ Metadata:
   --read1-antisense      Read 1 represents antisense strand (default when --strand-specific)
   --read2-sense          Read 2 represents sense strand (default when --strand-specific)
   --read2-antisense      Read 2 represents antisense strand
-  --npolicy {drop,random,A,C,G,T}
+  --npolicy {trim3,random}
                          Policy for handling 'N' nucleotides:
                          - drop: skip sequences containing N
                          - random: replace N with random base (A/C/G/T)
@@ -663,7 +668,7 @@ then read at two thresholds:
 | | condition | action |
 |---|---|---|
 | **merge** | `score ≥ --threshold-merge` | emit one full-fragment record |
-| **trim** | `--threshold-trim ≤ score < merge` | keep both; cut the redundant overlap off R2's **3'** end |
+| **trim** | `--threshold-trim ≤ score < merge` | keep both; split the redundant overlap between their **3'** ends |
 | **keep** | `score < --threshold-trim` | keep both, untouched |
 
 Three parameters, all with units. Both thresholds read one calibrated scale, so `T` bits
@@ -671,8 +676,51 @@ tolerates a spurious rate of about `N · 2^-T` over the `N ≈ 2 · readlen` can
 shifts — the default 28 is one spurious merge in 10⁶ pairs *against chance alignment*
 (measured: 0 in 40,000 uniform-random pairs, at every read length from 50 to 300). It is
 not a bound against real sequence, where reads share genuine homology and repeat
-content. Trim sits far lower only because a wrong trim costs a few real bases while a
-wrong merge is a chimera.
+content. Trim sits far lower only because a wrong trim deletes bases from a read tail
+while a wrong merge invents sequence.
+
+The overlap sits at the 3' end of **both** mates — each read starts at a fragment end
+and reads inward — so a trim splits it between them. The emitted pair tiles the fragment
+exactly once and comes out at equal length, and where the mates disagree both carry the
+consensus call.
+
+#### Choosing `--threshold-merge`, measured against ground truth
+
+The defaults are not a guess. On 1,000,000 simulated pairs from hg38 with the true
+fragment length known exactly ([docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md)),
+against fastp 1.1.0 at its own defaults:
+
+| setting | chimera rate¹ | sensitivity² | merges that are wrong | reconstructed exactly³ |
+|---|---:|---:|---:|---:|
+| **`--threshold-merge 28`** (default) | 1.231% | **99.83%** | 0.96% | 86.59% |
+| `--threshold-merge 60` | 0.597% | 92.63% | 0.55% | 88.87% |
+| `--threshold-merge 100` | 0.245% | 83.57% | 0.29% | 91.39% |
+| fastp defaults | 0.621% | 92.98% | 0.65% | 85.90% |
+
+¹ fraction of pairs with **no true overlap** that were merged anyway — the false-positive
+rate. ² fraction of pairs with a true overlap ≥ 15 bases that merged. ³ merged records
+equal to the true fragment, base for base.
+
+**If you want fastp's false-positive rate, use `--threshold-merge 60.`** That is not a
+coincidence: 60 bits is 31 clean bases, which is essentially fastp's
+`--overlap_len_require 30`. At that matched operating point zna's sensitivity is the
+same (92.63% vs 92.98%) and its reconstruction is better (88.87% vs 85.90% exact),
+because the overlap consensus recovers 90.4% of recoverable overlap errors against
+fastp's 74.1%.
+
+**For best overall accuracy, keep the default 28.** It minimises false positives plus
+false negatives by a wide margin — 6,603 total errors per million pairs against 44,145
+for the fastp-equivalent setting. Raising the threshold trades ~10.9 extra missed merges
+for every wrong merge it prevents at 28→34, worsening to 15.7 at 28→60, so it only pays
+if a chimera costs you more than ~11x what a missed merge does. A missed merge is not
+lost data: the pair is still emitted, correctly bounded and with its redundant overlap
+trimmed.
+
+**Tuning cannot reach zero.** At 100 bits — 3.6x the default — 1,403 wrong merges per
+million remain. Every one is a fragment whose two ends are genuinely homologous (median
+88% identity over 79 bases, hotspots entirely pericentromeric), and the scan never
+picks a lower-scoring alignment than the true one. That residue is a property of the
+genome, not of the threshold.
 
 **Usage:**
 
@@ -740,11 +788,12 @@ zna encode --interleaved --treat-unpaired-as-merged --strand-normalize \
 ```
 
 **Boundary guarantee.** Base 0 of every emitted read is a true fragment boundary —
-nothing is ever removed from a read's 5' end, and trimming only ever cuts R2's 3' end.
-A merged record *is* its fragment, exactly. This is what makes `IS_RC` and
-`IS_FULL_FRAGMENT` honest for merged input; see
-[docs/READ_MERGE_REDESIGN.md](docs/READ_MERGE_REDESIGN.md) for the derivation and
-[docs/MERGE_TOOL_AUDIT.md](docs/MERGE_TOOL_AUDIT.md) for what was measured and rejected.
+nothing is ever removed from a read's 5' end, and trimming only ever cuts 3' ends. A
+merged record is the tool's assertion of its fragment. This is what makes `IS_RC` and
+`IS_FULL_FRAGMENT` honest for merged input; verified at 0 violations over 1,416,630
+records against genome truth. See [docs/METHODS.md](docs/METHODS.md) for the derivation
+and [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) for the
+verification.
 
 ---
 
@@ -759,8 +808,8 @@ Typical compression ratios compared to raw FASTQ:
 | FASTQ (uncompressed) | 100% | 1.0x | Baseline |
 | FASTQ.gz (gzip -6) | 25-30% | 3-4x | Standard |
 | ZNA (uncompressed) | 12-15% | 6-8x | 2-bit encoding only |
-| ZNA (Zstd L3) | 8-10% | 10-12x | Fast compression (default) |
-| ZNA (Zstd L9) | 6-8% | 12-16x | High compression |
+| ZNA (Zstd L3) | 8-10% | 10-12x | Fast compression (`--level 3`) |
+| ZNA (Zstd L9) | 6-8% | 12-16x | **Default** (`DEFAULT_ZSTD_LEVEL = 9`) |
 
 *Results vary based on sequence complexity and redundancy*
 
@@ -836,9 +885,13 @@ ZNA supports strand-specific RNA-seq libraries by normalizing all reads to sense
 
 ### How It Works
 
-1. **Encoding**: Antisense reads are reverse-complemented to sense strand
-2. **Storage**: All reads stored in sense orientation
-3. **Decoding**: Use `--restore-strand` to recover original orientation
+1. **Encoding**: reads are reverse-complemented into one common frame. *Which* reads,
+   and by what rule, depends on the mode — see **Strand Normalization** below: with
+   `--strand-specific` the protocol decides, without it one mate per pair is chosen at
+   random.
+2. **Storage**: each record's `IS_RC` flag records whether it was flipped. That flag is
+   the only record of it — it cannot be recovered from the sequence.
+3. **Decoding**: `--restore-strand` consumes `IS_RC` to recover the original orientation.
 
 ### Strand Normalization
 
@@ -946,16 +999,28 @@ two options are mutually exclusive.
 it a second time returns the data to an un-normalized state while the header
 still reports `strand_normalized`.  So anything that copies records between ZNA
 files — `zna encode` on a `.zna` input, `zna shuffle` — copies the existing
-orientation rather than re-deriving it.  In the Python API that is
-`ZnaWriter(..., preserve_normalization=True)` fed from `records(with_rc=True)`:
+orientation rather than re-deriving it.
+
+**A view is for reading; the flag byte is for copying.**  `records()` returns
+views — each of them chosen for a consumer, and none of them able to carry the
+whole flag byte back to a writer.  Copying uses `copy_records()`:
 
 ```python
 # A lossless ZNA -> ZNA copy.
 with open("in.zna", "rb") as fin, open("out.zna", "wb") as fout:
     reader = ZnaReader(fin)
     with ZnaWriter(fout, reader.header, preserve_normalization=True) as writer:
-        writer.write_records(reader.records(with_ends=True))
+        for rec in reader.copy_records():
+            writer.write_copy(rec)
 ```
+
+`copy_records()` yields `ZnaRecord(seq, flags, labels)` — the stored
+`ZnaRecordFlags` byte, verbatim — so a copy carries every bit, including ones
+this version does not interpret.  This example used to read
+`records(with_ends=True)` into `write_records()`, and that was wrong:
+`(has_start, has_end)` has three states where `(IS_RC, IS_FULL_FRAGMENT)` has
+four, so every full-fragment record came out of the copy with `IS_RC` cleared.
+`write_records()` now refuses that shape rather than accepting it.
 
 ### Strand Flags
 
@@ -1118,7 +1183,10 @@ is_rc, labels)` — so that the unlabeled and labeled tuples agree on where
 
 ### Not Recommended For
 
-- ❌ **Random access**: Sequential format (no index)
+- ⚠️ **Record-level random access**: there is no record index. Access is *block*
+  granular — `block_index()` gives per-block offsets and counts without decompressing,
+  and `blocks(indices=...)` reads only the blocks you ask for. That is what sharded
+  training uses; seeking to record *n* is what is not supported.
 - ❌ **Quality scores**: Sequences only (use CRAM/BAM for qualities)
 - ❌ **Small files**: Overhead outweighs benefits (<10K reads)
 - ❌ **Real-time streaming**: Use case requires quality scores
@@ -1167,6 +1235,13 @@ with open("output.zna", "rb") as f:
     
     for seq, is_paired, is_read1, is_read2 in reader.records():
         print(seq)
+
+# Copying to another ZNA file: carry the flag byte, not a view of it
+with open("output.zna", "rb") as fin, open("copy.zna", "wb") as fout:
+    reader = ZnaReader(fin)
+    with ZnaWriter(fout, reader.header, preserve_normalization=True) as writer:
+        for rec in reader.copy_records():
+            writer.write_copy(rec)
 ```
 
 `records()` yields a 4-tuple, or a 5-tuple ending in `labels` for labeled files.
@@ -1177,10 +1252,16 @@ Two options change what it yields:
 | *(default)* | `(seq, is_paired, is_read1, is_read2)` | stored orientation |
 | `restore_strand=True` | same 4-tuple | undoes strand normalization, returning original-orientation reads |
 | `with_rc=True` | `(seq, is_paired, is_read1, is_read2, is_rc)` | stored orientation plus the per-record `IS_RC` flag |
-| `with_ends=True` | `(seq, is_paired, is_read1, is_read2, has_start, has_end)` | which edges are true fragment boundaries; also the lossless form for copying |
+| `with_ends=True` | `(seq, is_paired, is_read1, is_read2, has_start, has_end)` | which edges are true fragment boundaries |
 
 The options are mutually exclusive: `restore_strand` consumes the orientation,
-`with_rc` returns it raw, and `with_ends` returns what it means.  See
+`with_rc` returns it raw, and `with_ends` returns what it means.
+
+All three are **views**, for consumers.  None of them round-trips back into a
+writer — `with_ends` in particular folds `IS_RC` and `IS_FULL_FRAGMENT` into two
+booleans that cannot distinguish all four reachable states.  To copy records
+between ZNA files use [`copy_records()` / `write_copy()`](#unstranded-normalization-and-fragment-geometry),
+which carry the flag byte itself.  See
 [Unstranded Normalization and Fragment Geometry](#unstranded-normalization-and-fragment-geometry)
 for what `is_rc` means and why it cannot be derived from the sequence.
 
@@ -1226,11 +1307,8 @@ mypy src/zna/
 
 ## Future Enhancements
 
-- [ ] Parallel compression/decompression
-- [ ] Optional index for random access
-- [ ] Support for IUPAC ambiguity codes
-- [ ] Memory-mapped I/O for large files
-- [ ] Streaming statistics (GC content, length distribution)
+See [docs/ROADMAP.md](docs/ROADMAP.md) — what is scheduled, what is under consideration,
+and what has already been tried and closed by measurement.
 
 ---
 

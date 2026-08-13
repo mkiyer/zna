@@ -29,8 +29,13 @@ best-scoring shift (argmax, not first-accept) is then read at two thresholds:
   * score >= --threshold-merge                -> MERGE into one read
       (R1 wins the overlap; R2's non-overlapping tail is appended, reverse-
        complemented). Emitted as a single record with the /1,/2 suffix stripped.
-  * --threshold-trim <= score < merge         -> KEEP BOTH, but trim the redundant
-      bases off R2's 3' end so the overlap is not counted twice.
+  * --threshold-trim <= score < merge         -> KEEP BOTH, splitting the redundant
+      overlap between their 3' ends so it is not counted twice. The overlap sits at
+      the 3' end of BOTH mates, so cutting half from each tiles the fragment exactly
+      once and leaves the two emitted reads the same length -- which is what
+      downstream aligners and models expect -- while discarding the last cycles of
+      both reads instead of one read's whole copy. Where they disagree, both mates
+      get the consensus call.
   * score < --threshold-trim                  -> KEEP BOTH, unchanged.
 
 Both thresholds are on one calibrated scale: T bits tolerates a spurious rate of
@@ -38,9 +43,29 @@ about N * 2**-T over the N ~ 2*readlen candidate shifts, so the default 28 is on
 spurious merge in 1e6 pairs AGAINST CHANCE ALIGNMENT (measured: 0 in 40,000
 uniform-random pairs, at every read length from 50 to 300). It is not a bound
 against real sequence, where reads share genuine homology and repeat content --
-raising T there buys far less than the formula suggests. Trim keeps a much lower
-threshold only because a wrong trim costs a few real bases while a wrong merge is
-a chimera.
+raising T there buys far less than the formula suggests.
+
+CHOOSING --threshold-merge. Measured on 1M simulated pairs from hg38 with the true
+fragment known (docs/MERGE_BENCHMARK_RESULTS.md §6):
+
+  * the DEFAULT 28 minimises false positives plus false negatives -- 6,603 errors
+    per million against 44,145 at the fastp-equivalent setting. Raising it trades
+    ~11 extra missed merges for each wrong merge prevented, so it pays only if a
+    chimera costs you more than that. A missed merge is not lost data: the pair is
+    still emitted, correctly bounded, with its redundant overlap trimmed.
+  * --threshold-merge 60 matches FASTP'S DEFAULT false-positive rate (0.597% vs
+    0.621% on pairs with no true overlap) at the same sensitivity (92.6% vs 93.0%).
+    60 bits is 31 clean bases, which is essentially fastp's --overlap_len_require
+    30. At that matched point zna reconstructs 88.9% of merged records exactly
+    against fastp's 85.9%.
+  * no threshold reaches zero. At 100 bits, 1,403 wrong merges per million remain,
+    every one a fragment whose two ends are genuinely homologous.
+
+Trim keeps a much lower threshold only because a wrong trim deletes bases from a
+read tail while a wrong merge is a chimera. That asymmetry is now measured rather than asserted: at 8 bits
+a wrong trim removes a median of 9 bases (mean 20, up to 110), and the band as a
+whole removes 4.4 bases of genuinely duplicated sequence for every base it
+deletes. See docs/MERGE_BENCHMARK_RESULTS.md.
 
 Output is ONE mixed interleaved FASTQ: merged reads are singles, unmerged pairs are
 adjacent /1,/2 records. Feed it to `zna encode --interleaved`. Where the mates
@@ -91,12 +116,30 @@ def add_merge_arguments(p):
                         "pairs at 2x150; each extra bit halves that.")
     p.add_argument("--threshold-trim", type=float, default=8.0, dest="t_trim",
                    help="overlap score (bits) >= this (but below --threshold-merge) "
-                        "-> keep both reads and trim the redundant overlap off R2's "
-                        "3' end. Low on purpose: a wrong trim costs a few bases.")
+                        "-> keep both reads and split the redundant overlap between "
+                        "their 3' ends. Low on purpose: a wrong trim deletes read tail, "
+                        "where a wrong merge invents sequence. Measured against ground "
+                        "truth (docs/MERGE_BENCHMARK_RESULTS.md), 8 bits removes 4.4 "
+                        "bases of duplicated sequence per base it deletes, and is the "
+                        "value that minimises the two costs added together.")
     p.add_argument("--min-read-length", type=int, default=40, dest="min_read_length",
                    help="drop emitted reads shorter than this (after merge/trim; a "
                         "trimmed read can fall below it). MUST match the pipeline-wide "
                         "floor used by any earlier quality-trimming step.")
+    p.add_argument("--npolicy", choices=("trim3", "random"), default="trim3",
+                   help="what to do with a no-call (N) that the overlap could not "
+                        "rescue from the mate. trim3: cut the read at it, keeping "
+                        "[0, first N) -- 3' only, so base 0 stays a true fragment "
+                        "boundary however short the read gets, and the length filter "
+                        "below discards what is left of a read that is mostly N. keep: "
+                        "substitute a base from a seeded stream (--seed), which "
+                        "never costs a merge because it does not change a length. "
+                        "Rescue from the mate happens first either way and costs "
+                        "nothing. Same flag and same values as `zna encode`.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="seed for --npolicy random. Substitution is derived from it and "
+                        "the read's position, never from a running stream, so the output "
+                        "does not depend on --chunk-size or --threads.")
     p.add_argument("--no-sync-check", action="store_true",
                    help="skip the per-pair R1/R2 read-name consistency check")
     p.add_argument("--allow-empty", action="store_true",

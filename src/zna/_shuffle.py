@@ -35,7 +35,7 @@ from typing import List, Tuple
 import zstandard
 
 from .core import (
-    COMPRESSION_ZSTD, ZnaHeader, ZnaWriter, ZnaReader, _RC_FULL_BY_ENDS,
+    COMPRESSION_ZSTD, ZnaHeader, ZnaWriter, ZnaReader, FLAG_FIELDS,
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE,
 )
 
@@ -193,9 +193,9 @@ def shuffle_zna(
         bucket_header = out_header
 
     has_labels = len(in_header.labels) > 0
-    # Bound once: both write passes below index this per record, and a global
-    # lookup plus a function call per record is what it replaces.
-    rc_full_by_ends = _RC_FULL_BY_ENDS
+    # Bound once: both passes below index this per record to recover the pairing
+    # triple from the flag byte, and a global lookup per record is what it replaces.
+    flag_fields = FLAG_FIELDS
 
     with tempfile.TemporaryDirectory(dir=tmp_dir, prefix="zna_shuffle_") as tmp_path:
         bucket_paths = [
@@ -214,52 +214,19 @@ def shuffle_zna(
                 distributed = 0
                 _pending_bucket = 0
 
-                for rec in reader.records(with_ends=True):
-                    seq = rec[0]
-                    is_paired = rec[1]
-                    is_read1 = rec[2]
-                    is_read2 = rec[3]
-                    is_rc, is_full = rc_full_by_ends[
-                        (2 if rec[4] else 0) | (1 if rec[5] else 0)
-                    ]
-                    labels = rec[6] if has_labels else None
+                for rec in reader.copy_records():
+                    is_paired, is_read1, is_read2 = flag_fields[rec.flags]
 
                     if is_paired and is_read1:
+                        # Hold the bucket so R2 lands in it too: a pair must not be
+                        # split across buckets or it cannot be kept adjacent.
                         _pending_bucket = rng.randrange(n_buckets)
-                        if has_labels:
-                            bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
-                        else:
-                            bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
+                        bucket_writers[_pending_bucket].write_copy(rec)
                     elif is_paired and is_read2:
-                        if has_labels:
-                            bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
-                        else:
-                            bucket_writers[_pending_bucket].write_record(
-                                seq, is_paired, is_read1, is_read2,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
+                        bucket_writers[_pending_bucket].write_copy(rec)
                         distributed += 1
                     else:
-                        bucket_idx = rng.randrange(n_buckets)
-                        if has_labels:
-                            bucket_writers[bucket_idx].write_record(
-                                seq, is_paired, is_read1, is_read2, labels=labels,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
-                        else:
-                            bucket_writers[bucket_idx].write_record(
-                                seq, is_paired, is_read1, is_read2,
-                                is_rc=is_rc, is_full_fragment=is_full,
-                            )
+                        bucket_writers[rng.randrange(n_buckets)].write_copy(rec)
                         distributed += 1
 
                     if (
@@ -300,10 +267,8 @@ def shuffle_zna(
                     with open(bp, "rb") as bfh:
                         breader = ZnaReader(bfh)
                         current_unit: List[Record] = []
-                        for rec in breader.records(with_ends=True):
-                            is_paired = rec[1]
-                            is_read1 = rec[2]
-                            is_read2 = rec[3]
+                        for rec in breader.copy_records():
+                            is_paired, is_read1, is_read2 = flag_fields[rec.flags]
                             if is_paired and is_read1:
                                 if current_unit:
                                     units.append(current_unit)
@@ -324,24 +289,7 @@ def shuffle_zna(
 
                     for unit in units:
                         for rec in unit:
-                            seq = rec[0]
-                            is_paired = rec[1]
-                            is_read1 = rec[2]
-                            is_read2 = rec[3]
-                            is_rc, is_full = rc_full_by_ends[
-                                (2 if rec[4] else 0) | (1 if rec[5] else 0)
-                            ]
-                            if has_labels:
-                                labels = rec[6]
-                                out_writer.write_record(
-                                    seq, is_paired, is_read1, is_read2, labels=labels,
-                                    is_rc=is_rc, is_full_fragment=is_full,
-                                )
-                            else:
-                                out_writer.write_record(
-                                    seq, is_paired, is_read1, is_read2,
-                                    is_rc=is_rc, is_full_fragment=is_full,
-                                )
+                            out_writer.write_copy(rec)
                     written += len(units)
 
                     if not quiet:
