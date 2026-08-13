@@ -1336,6 +1336,17 @@ def encode_command(args):
     # read as "substitute A" -- see docs/NPOLICY_PLAN.md 8.1.
     trim3 = (npolicy == 'trim3')
     codec_npolicy = 'random' if npolicy == 'random' else ''
+    # What the N policy did, for the summary below. `zna merge` has always reported
+    # this and `zna encode` did not, so the same policy on the same library was
+    # accountable on one side of the seam and silent on the other.
+    #
+    # trim3's count is free -- `_trim3` is already finding the first no-call. `random`
+    # substitutes inside the codec, which returns no count, so encode counts the
+    # no-calls itself rather than widening the codec ABI across two backends for a
+    # statistic. That costs one extra C-level scan per record, under `random` only.
+    npolicy_bases = 0
+    npolicy_records = 0
+    npolicy_total_bases = 0
     block_size = parse_block_size(args.block_size)
     if preserve_normalization and not quiet:
         print(
@@ -1359,11 +1370,19 @@ def encode_command(args):
             record stays honestly anchored however short it gets. There is deliberately
             no minimum length here: a core read-processing tool reports what it did and
             leaves the length decision to the consumer.
+
+            Returns ``(seq, bases_removed)``; the count is what the summary reports, and
+            it is "bases removed", not "no-calls found" -- the same quantity `zna merge`
+            reports, so the two halves of the pipeline are directly comparable.
             """
             i = seq.find('N')
             if i < 0:
                 i = seq.find('n')
-            return seq if i < 0 else seq[:i]
+            return (seq, 0) if i < 0 else (seq[:i], len(seq) - i)
+
+        def _count_subs(seq):
+            """No-calls the codec is about to substitute under ``--npolicy random``."""
+            return seq.count('N') + seq.count('n')
         treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
 
         if label_defs:
@@ -1429,7 +1448,16 @@ def encode_command(args):
                 # copy of every read (150 bytes each) purely to look for one
                 # character.
                 if trim3:
-                    seq = _trim3(seq)
+                    seq, cut = _trim3(seq)
+                    if cut:
+                        npolicy_bases += cut
+                        npolicy_records += 1
+                elif codec_npolicy:
+                    subs = _count_subs(seq)
+                    if subs:
+                        npolicy_bases += subs
+                        npolicy_records += 1
+                npolicy_total_bases += len(seq)
                 if label_defs:
                     write_record(seq, rec[1], rec[2], rec[3],
                                  labels=rec[4], is_full_fragment=is_full)
@@ -1445,7 +1473,21 @@ def encode_command(args):
                 if trim3:
                     # Per record, not per fragment: trimming never orphans a mate, so
                     # there is nothing here for the old pair-atomic drop to protect.
-                    unit = [(_trim3(rec[0]),) + tuple(rec[1:]) for rec in unit]
+                    cut_unit = []
+                    for rec in unit:
+                        seq, cut = _trim3(rec[0])
+                        if cut:
+                            npolicy_bases += cut
+                            npolicy_records += 1
+                        cut_unit.append((seq,) + tuple(rec[1:]))
+                    unit = cut_unit
+                elif codec_npolicy:
+                    for rec in unit:
+                        subs = _count_subs(rec[0])
+                        if subs:
+                            npolicy_bases += subs
+                            npolicy_records += 1
+                npolicy_total_bases += sum(len(rec[0]) for rec in unit)
                 full = _full_fragment_flags(unit, treat_unpaired_as_merged)
                 if label_defs:
                     for rec, is_full in zip(unit, full):
@@ -1494,6 +1536,25 @@ def encode_command(args):
     duration = time.time() - start_time
     if not is_stdout and not quiet:
         print(f"\n[ZNA] Done. Wrote {count} records in {duration:.2f}s.", file=sys.stderr)
+        # Always say what the N policy did, exactly as `zna merge` does. The failure
+        # this guards against is silent: one dark cycle can make a policy consume most
+        # of a library while the run still ends with "Done".
+        #
+        # Skipped when re-encoding a .zna, and that is not an oversight -- ZNA stores
+        # two bits per base, so a decoded record cannot contain a no-call and no policy
+        # ran. Reporting "removed 0 bases" there would imply one had been applied.
+        if npolicy and not is_reencoding:
+            verb = "removed" if npolicy == "trim3" else "substituted"
+            print(f"[ZNA] no-calls: --npolicy {npolicy} {verb} {npolicy_bases} "
+                  f"base{'' if npolicy_bases == 1 else 's'} "
+                  f"in {npolicy_records} record{'' if npolicy_records == 1 else 's'}.",
+                  file=sys.stderr)
+            if npolicy_total_bases and npolicy_bases / npolicy_total_bases > 0.01:
+                pct = 100.0 * npolicy_bases / npolicy_total_bases
+                print(f"[ZNA] WARNING: --npolicy {npolicy} affected {pct:.1f}% of "
+                      f"encoded bases. That is high enough to be a run problem (a dark "
+                      f"cycle, a failed tile) rather than ordinary no-calls -- check "
+                      f"the input before using this library.", file=sys.stderr)
 
 
 # --- COMMAND: DECODE ---

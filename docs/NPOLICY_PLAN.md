@@ -1,8 +1,9 @@
 # `--npolicy`: `trim3` and `random` — implementation plan
 
-Status: **built, except §5 and D5's per-record tokens.** Written 2026-08-13 after the
-consensus/N-rescue work landed and an audit of `--npolicy` against both codec backends
-found four defects, one of them on the default path.
+Status: **built.** Written 2026-08-13 after the consensus/N-rescue work landed and an
+audit of `--npolicy` against both codec backends found four defects, one of them on the
+default path; completed the same day with §5's encode summary and D5's per-record
+provenance.
 
 | section | state |
 |---|---|
@@ -12,8 +13,8 @@ found four defects, one of them on the default path.
 | D4 / D4a option C + the coverage retry | **built**, both backends byte-identical on N-bearing input |
 | §8.2 alphabet strictness | **built** — only `N`/`n` substitutable, everything else raises with character and offset |
 | §8.3 seeded position-derived streams | **built** — covers `--npolicy random` *and* the unstranded RC coin; verified reproducible, backend-identical, block- and chunk-size independent |
-| §5 reporting | **partly built** — run-level counters and a >1% warning are in `--merge-json` and the summary; the encode-side summary is not |
-| D5 per-record provenance | **not built** — header tokens and the optional label column |
+| §5 reporting | **built** — run-level counters and a >1% warning on both sides of the seam; `zna encode` now reports its policy the way `zna merge` always has |
+| D5 per-record provenance | **built** — header tokens for reading, `ZN:i:<bits>` for the corpus |
 
 A defect the audit found that is not in §1: `_accel` measured record length in UTF-8
 *bytes*, so a non-ASCII character corrupted the lengths column (`ACGéT` stored as length
@@ -183,17 +184,39 @@ geometry — two questions, each asked once.
 transparency for the *intermediate* only, and under `zna encode --merge-pairs` (0.5.0)
 there is no intermediate at all.
 
-- **Header tokens** on the merge FASTQ, for human inspection: `trim3_<n>` for bases cut,
-  `rescued_<n>` for no-calls recovered from the mate, beside the existing
-  `merged_<n1>_<n2>`. Verified safe against label extraction — a token with no colon is
-  skipped by the tag parser, exactly as `merged_150_87` is:
+- **Header tokens** on the merge FASTQ, for human inspection: `trim3_<n>` for bases cut
+  (`subn_<n>` under `random`), `rescued_<n>` for no-calls recovered from the mate,
+  beside the existing `merged_<n1>_<n2>`. Safe against label extraction — a token with no
+  colon is skipped by the tag parser, exactly as `merged_150_87` is:
   ```
-  f12  ZI:i:7 merged_90_0 trim3_12   ->   labels (7,)   unaffected
+  f12  ZI:i:7 ZN:i:6 trim3_12 rescued_1 merged_90_0   ->   labels (7,)   unaffected
   ```
-- **An optional provenance label** for the corpus, since that is the only thing that
-  survives encoding: one `C` (uint8) column, one byte per record, with bits for
-  merged / trimmed / N-rescued / N-trimmed. Durable, queryable, and identical on the
-  two-step and one-step paths.
+  They are emitted on **every** outcome, not only the merged one. A kept pair whose R1
+  lost 12 bases to `trim3` is emitted shorter, and without a token nothing on the record
+  says why — which is the gap this exists to close. A record nothing happened to is
+  emitted byte-unchanged and stays zero-copy in the compiled backend: 1,332,353 of
+  1,418,525 records on the 1M library at a 1.5% no-call rate.
+- **A provenance label** for the corpus, since that is the only thing that survives
+  encoding: one `C` (uint8) column, one byte per record.
+
+  It is carried as an ordinary SAM tag, `ZN:i:<bits>`, and read by the `--label`
+  machinery that already ships — `--label provenance:C:ZN`. That settles the question
+  §7 left open ("it adds a column to every labeled file"): it does not. Declaring the
+  column is opt-in per file, an absent tag resolves to 0 through the label path's own
+  missing-value handling, and there is no provenance-specific code in the encoder.
+
+  **Bits: trimmed 1, rescued 2, N-trimmed 4, N-substituted 8 — and deliberately no
+  "merged".** The plan above listed one. It was dropped on measurement: `merged` already
+  has two homes (the `merged_` token, and `IS_FULL_FRAGMENT` in the flag byte), and
+  spending a bit on it put ` ZN:i:1` on ~82% of emitted records to repeat what two other
+  places already said. Every remaining bit is a fact with nowhere else to live —
+  `trimmed` above all, since a trimmed pair is emitted as an ordinary pair and no ZNA
+  flag distinguishes it from one kept whole. The consequence worth knowing:
+  `IS_FULL_FRAGMENT` is set only under `zna encode --treat-unpaired-as-merged`, so an
+  encode that omits that flag records neither — which is what omitting it means.
+
+  The vocabulary is shared with `zna encode --merge-pairs` (0.5.0), which computes the
+  same `PairResult` and writes the same bits with no FASTQ in between.
 - **Run-level counters** in `--merge-json` and the encode summary (§5).
 
 ---
@@ -317,8 +340,9 @@ Steps 1–2 are independent of 3–6 and fix shipping bugs; they can land first.
 - **Is `trim3` or `random` the default?** `trim3` never invents a base, which suits a
   corpus whose value is that it reports what the instrument reported. `random` never loses
   a base. The plan assumes `trim3`.
-- **Does the provenance label ship in 0.5.0 or later?** It is the only durable
-  per-record transparency, but it adds a column to every labeled file.
+- ~~**Does the provenance label ship in 0.5.0 or later?**~~ **Closed: it ships in
+  0.4.0.** The premise was wrong — carried as a `ZN:i:` tag and read through the
+  existing `--label` path, it adds a column only to files that ask for one. See D5.
 
 ---
 

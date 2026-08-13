@@ -112,7 +112,7 @@ reference and the Python API are all below.
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
 | [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — specified, not built *(0.5.0)* |
 | [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
-| [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | what is left before the 0.4.0 tag, and the traps *(maintainers)* |
+| [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | what 0.4.0 shipped, what is next, and the build traps *(maintainers)* |
 
 ---
 
@@ -772,6 +772,52 @@ is never chosen for you.
 `zna encode --interleaved --treat-unpaired-as-merged`, which is exact here because
 merged records span their fragment and unmerged pairs are emitted all-or-nothing —
 never a lone mate.
+
+#### Per-record provenance
+
+The run summary says what happened to a *library*. These say what happened to a *read*.
+Existing header fields are always passed through untouched — provenance is **appended**,
+never substituted — so `--label` reads the same tags off an emitted record that it would
+have read off the input.
+
+A record that nothing happened to is emitted unchanged, so on a clean library this costs
+nothing.
+
+```
+@SRR1.7  ZI:i:42 ZN:i:6 trim3_12 rescued_1 merged_90_0
+          ^tag    ^bits  ^bases cut  ^no-calls   ^fastp-style,
+          yours          by trim3    recovered    stays last
+                                     from the mate
+```
+
+| token | meaning |
+|---|---|
+| `trim3_<n>` / `subn_<n>` | bases removed by `--npolicy trim3`, or substituted by `--npolicy random` |
+| `rescued_<n>` | no-calls this record recovered from its mate, which cost nothing |
+| `merged_<n1>_<n2>` | bases contributed by R1 and R2 to a merged record |
+
+The word tokens are for reading; **`ZN:i:<bits>` is the one that survives encoding.** ZNA
+does not store headers, so it is the only per-record provenance that reaches a corpus:
+
+```bash
+zna encode --interleaved --treat-unpaired-as-merged \
+           --label provenance:C:ZN -o reads.zna merged.fq.gz
+```
+
+That is an ordinary label column — declare it and you get one byte per record, omit it
+and nothing changes. There is no provenance-specific code in the encoder.
+
+| bit | | set when |
+|---:|---|---|
+| 1 | trimmed | the pair's redundant overlap was split between its mates |
+| 2 | rescued | ≥1 no-call was recovered from the mate |
+| 4 | N-trimmed | ≥1 base was removed by `--npolicy trim3` |
+| 8 | N-substituted | ≥1 base was invented by `--npolicy random` |
+
+There is deliberately **no "merged" bit**: that fact already has two homes, the
+`merged_` token here and `IS_FULL_FRAGMENT` in the corpus. Every bit above is one with
+nowhere else to live — a trimmed pair in particular is emitted as an ordinary pair, and
+nothing in the ZNA flag byte distinguishes it from one kept whole.
 
 **Examples:**
 

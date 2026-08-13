@@ -131,7 +131,7 @@ def add_merge_arguments(p):
                         "rescue from the mate. trim3: cut the read at it, keeping "
                         "[0, first N) -- 3' only, so base 0 stays a true fragment "
                         "boundary however short the read gets, and the length filter "
-                        "below discards what is left of a read that is mostly N. keep: "
+                        "below discards what is left of a read that is mostly N. random: "
                         "substitute a base from a seeded stream (--seed), which "
                         "never costs a merge because it does not change a length. "
                         "Rescue from the mate happens first either way and costs "

@@ -25,6 +25,17 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
+# Must be on main. This script pushes `main` and then the tag, so running it from a
+# feature branch pushes whatever local main happens to point at and then tags a commit
+# main does not contain -- a release whose tag and whose branch disagree.
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [ "$BRANCH" != "main" ]; then
+    echo "❌ Error: on branch '${BRANCH}', not main"
+    echo "This script pushes main and tags HEAD. Merge your branch first:"
+    echo "    git checkout main && git merge ${BRANCH} && ./scripts/release.sh ${VERSION}"
+    exit 1
+fi
+
 # Update version in __init__.py
 echo "📝 Updating version in src/zna/__init__.py..."
 sed -i.bak "s/__version__ = \".*\"/__version__ = \"${VERSION}\"/" src/zna/__init__.py
@@ -50,10 +61,19 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
-# Commit changes
-echo "💾 Committing version bump..."
+# Commit changes.
+#
+# The version files may ALREADY be at ${VERSION} -- development commonly bumps
+# __init__.py long before the tag. `git commit` with nothing staged exits non-zero, and
+# under `set -e` that aborted the release here, after the confirmation prompt and before
+# the tag. Nothing to commit is a normal state, not a failure.
 git add src/zna/__init__.py conda/meta.yaml
-git commit -m "Bump version to ${VERSION}"
+if git diff --cached --quiet; then
+    echo "💾 Version already ${VERSION}; nothing to commit."
+else
+    echo "💾 Committing version bump..."
+    git commit -m "Bump version to ${VERSION}"
+fi
 
 # Create and push tag
 echo "🏷️  Creating tag ${TAG}..."

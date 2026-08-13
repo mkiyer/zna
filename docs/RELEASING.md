@@ -30,20 +30,50 @@ That's it. No secrets or API tokens needed.
 
 ### Cutting a release
 
-```bash
-# Make sure tests pass and working directory is clean
-pytest
-git status
+**The release must be cut from `main`.** `release.sh` pushes `main` and then tags
+`HEAD`, so running it from a feature branch would push whatever local `main` happens to
+point at and then tag a commit `main` does not contain — a release whose tag and whose
+branch disagree. The script now refuses rather than doing that, but the merge is still
+yours to do:
 
-# Run the release script (updates version, tags, pushes)
-./scripts/release.sh 0.2.0
+```bash
+# 1. Verify on the release branch, in BOTH environments (see below)
+pytest
+
+# 2. Merge to main
+git checkout main
+git merge zna-0.4.0-hardening
+git status                      # must be clean
+
+# 3. Cut it
+./scripts/release.sh 0.4.0
 ```
 
 The script will:
-1. Update `__version__` in `src/zna/__init__.py`
-2. Update version in `conda/meta.yaml`
-3. Show a diff for your review
-4. Commit, tag `v0.2.0`, and push
+1. Refuse unless the tree is clean and you are on `main`
+2. Update `__version__` in `src/zna/__init__.py` and the version in `conda/meta.yaml` —
+   or say so and carry on if they are already at the target, which is the normal case
+   when development has bumped `__init__.py` ahead of the tag
+3. Show a diff for your review, and prompt before doing anything irreversible
+4. Commit (if there is anything to commit), tag `v0.4.0`, and push both
+
+#### Verify in both environments first
+
+The compiled merge extension is the thing most likely to be silently absent, and it
+fails *quietly correct* — the reference kernel is ~50x slower and gives identical
+answers, so a broken build looks like a slow node rather than a mistake.
+
+```bash
+# compiled: the configuration that ships
+/path/to/envs/zna_merge/bin/python -m pytest        # expect 0 skips in the merge suite
+
+# extension-less: proves the reference oracle is not silently untested
+/path/to/envs/zna/bin/python -m pytest              # expect ~53 skips
+```
+
+A rebuild is `pip install -e . --no-build-isolation`, and **grep its output for
+`Successfully built`** — a CMake failure ends with an unremarkable pip banner, leaves
+the old `.so` installed, and lets the whole suite run green against stale code.
 
 GitHub Actions then builds wheels for Linux/macOS/Windows × Python 3.10–3.14 and
 publishes to PyPI automatically.
@@ -223,12 +253,36 @@ git push origin v0.2.0
 ## Release Checklist
 
 ```
-[ ] Tests pass: pytest
+[ ] Tests pass in the COMPILED env (0 merge skips)
+[ ] Tests pass in the EXTENSION-LESS env (~53 skips, oracle exercised)
+[ ] Rebuild output contained "Successfully built"
+[ ] Merged to main:  git checkout main && git merge <branch>
 [ ] Working directory clean: git status
 [ ] Run release: ./scripts/release.sh X.Y.Z
 [ ] GitHub Actions green: check Actions tab
 [ ] PyPI updated: https://pypi.org/project/zna/
+[ ] Wheel smoke test: python scripts/wheel_smoketest.py  (see below)
 [ ] Update conda SHA: ./scripts/update-conda-sha.sh X.Y.Z
 [ ] Commit SHA update and push
 [ ] Submit/update bioconda-recipes PR
+```
+
+### Why the wheel needs its own check
+
+ZNA builds **two** extensions — `zna._accel` (the codec) and `zna.merge._accel` (the
+overlap scan). They are different CMake targets that both produce a file named
+`_accel.cpython-*.so`, and they have been installed into each other's place before; when
+that happened `zna.is_accelerated()` returned False while every test still passed. A
+wheel is the one artifact where nobody would notice, so check the installed package
+rather than the source tree:
+
+```bash
+pip install --upgrade zna
+python -c "
+import zna
+from zna.merge.backend import available_merge_backends
+assert zna.is_accelerated(), 'codec extension missing from the wheel'
+assert 'accel' in available_merge_backends(), 'merge extension missing from the wheel'
+print('ok', zna.__version__, available_merge_backends())
+"
 ```

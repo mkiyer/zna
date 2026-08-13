@@ -155,6 +155,11 @@ MERGED, TRIMMED, KEPT = 0, 1, 2
 #: ``zna encode --npolicy``, deliberately: one flag, one meaning, both tools.
 NPOLICY_KEEP, NPOLICY_TRIM3, NPOLICY_RANDOM = 0, 1, 2
 
+#: Per-record provenance bits, emitted as the ``ZN:i:<bits>`` header tag. Mirrors the
+#: ``PROV_*`` constants in ``merge_core.hpp``; see there for why the byte exists and why
+#: there is deliberately no "merged" bit.
+PROV_TRIMMED, PROV_RESCUED, PROV_NTRIMMED, PROV_NSUBBED = 1, 2, 4, 8
+
 _M64 = 0xFFFFFFFFFFFFFFFF
 _SUB = b"ACGT"
 
@@ -190,8 +195,10 @@ def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
                             write_r2):
     """Resolve overlap disagreements by posterior, into every emitted copy.
 
-    Returns ``(s1, q1, s2, q2, s2rc, n, rescued)``; ``n`` counts bases changed in R1,
-    ``rescued`` counts no-calls recovered from the mate in either direction.
+    Returns ``(s1, q1, s2, q2, s2rc, n, rescued1, rescued2)``; ``n`` counts bases changed
+    in R1, and the two rescue counts are charged to the mate that was *repaired*, so each
+    emitted record's ``rescued_<n>`` token counts only its own recovered no-calls. Their
+    sum is the run-level counter, unchanged.
 
     The decision is symmetric — the better-supported base by posterior from the two
     Phred scores, with the winner's quality derated because a contested base is less
@@ -219,7 +226,7 @@ def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
     b0 = -s if s < 0 else 0
     len2 = len(s2)
     s1b = q1b = s2b = q2b = s2rcb = None
-    n = rescued = 0
+    n = rescued1 = rescued2 = 0
     for i in range(olen):
         a = a0 + i
         b = b0 + i
@@ -239,12 +246,12 @@ def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
                     s1b[a] = s2rc[b]
                     q1b[a] = qb
                     n += 1                    # `n` counts R1 only, by contract
-                    rescued += 1
+                    rescued1 += 1
                 elif write_r2:                # R1 rescues R2
                     s2rcb[b] = s1b[a]
                     s2b[j2] = _COMPLEMENT[s1b[a]]
                     q2b[j2] = qa
-                    rescued += 1              # only where it is actually WRITTEN
+                    rescued2 += 1             # only where it is actually WRITTEN
             elif a_is_n:                      # both are N: nothing to rescue from
                 pass
             elif qb > qa:                     # R2 is the better-supported call
@@ -262,10 +269,11 @@ def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
                     s2b[j2] = _COMPLEMENT[s1b[a]]
                     q2b[j2] = nq
     if s1b is None:
-        return s1, q1, s2, q2, s2rc, 0, 0
+        return s1, q1, s2, q2, s2rc, 0, 0, 0
     if not write_r2:
-        return bytes(s1b), bytes(q1b), s2, q2, s2rc, n, rescued
-    return (bytes(s1b), bytes(q1b), bytes(s2b), bytes(q2b), bytes(s2rcb), n, rescued)
+        return bytes(s1b), bytes(q1b), s2, q2, s2rc, n, rescued1, rescued2
+    return (bytes(s1b), bytes(q1b), bytes(s2b), bytes(q2b), bytes(s2rcb), n,
+            rescued1, rescued2)
 
 
 def _balanced_split(L, len1, len2):
@@ -316,6 +324,32 @@ def _build_merged(s, s1, q1, s2rc, q2, len1, len2):
     return seq, qual, take1, take2
 
 
+def _prov_name(header, bits, trim3_n, subn_n, rescued_n):
+    """*header* with this record's provenance tokens appended. Mirrors ``build_name``.
+
+    **Tags pass through untouched.** The header is copied verbatim and the tokens are
+    *appended*; nothing is removed or rewritten, so ``zna encode --label`` reads the same
+    ``KEY:T:VALUE`` tags off an emitted record that it would have read off the input.
+
+    Returns *header* itself when there is nothing to say, which is the common case — and
+    on the accelerated side that is what keeps an untouched record zero-copy.
+
+    The colon-less tokens are skipped by ZNA's tag parser, which requires ``KEY:T:VALUE``.
+    ``ZN:i:<bits>`` is the one meant to be read, and it is absent when no bit is set, so
+    it resolves to 0 through the label machinery's own missing-value path.
+    """
+    if not bits:
+        return header
+    out = header + b" ZN:i:%d" % bits
+    if trim3_n:
+        out += b" trim3_%d" % trim3_n
+    if subn_n:
+        out += b" subn_%d" % subn_n
+    if rescued_n:
+        out += b" rescued_%d" % rescued_n
+    return out
+
+
 def _trim_is_allowed(L, len1, len2, lr):
     """May this pair be trimmed? Each mate must reach at least ``lr`` past the other's
     3' end — which both keeps every emitted read above the length filter and caps the
@@ -345,7 +379,12 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     """Classify one pair and build its output records.
 
     Returns ``(records, outcome, n_dropped, score_q, overlap_len, mismatches,
-    bases_consensus_changed, trim_guard_fired)``.
+    bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)``.
+
+    The last two are pair totals. Their per-mate splits stay local: they exist only to
+    build each record's provenance tokens, and summing them here keeps the run-level
+    counter tuple at its existing width — see :func:`_prov_name` and trap 6 in
+    ``docs/HANDOFF_0.4.0.md``.
 
     **The decision** is a single ``argmax`` shift read at two thresholds::
 
@@ -415,10 +454,12 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     write_r1 = prov_merge or prov_trim
     write_r2 = prov_trim
 
-    n_consensus = trim_guard = npolicy_bases = n_rescued = 0
+    n_consensus = trim_guard = 0
+    npolicy_1 = npolicy_2 = rescued_1 = rescued_2 = 0
     if diff > 0 and write_r1:
-        s1, q1, s2, q2, s2rc, n_consensus, n_rescued = _consensus_pair_overlap(
-            s1, q1, s2, q2, s2rc, q2[::-1], shift, olen, disagree_q, write_r2)
+        s1, q1, s2, q2, s2rc, n_consensus, rescued_1, rescued_2 = \
+            _consensus_pair_overlap(
+                s1, q1, s2, q2, s2rc, q2[::-1], shift, olen, disagree_q, write_r2)
 
     # ---- trim3: cut each read at its first SURVIVING N -------------------------
     #
@@ -430,15 +471,15 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
         # unaffected and `random` never costs a merge -- unlike trim3.
         s1n, k1 = _sub_n(s1, rng_seed, pair_index * 2)
         s2n, k2 = _sub_n(s2, rng_seed, pair_index * 2 + 1)
-        npolicy_bases = k1 + k2
-        if npolicy_bases:
+        npolicy_1, npolicy_2 = k1, k2
+        if k1 or k2:
             s1, s2 = s1n, s2n
             s2rc = reverse_complement(s2)
     elif npolicy == NPOLICY_TRIM3:
         s1t, q1t, k1 = _trim3(s1, q1)
         s2t, q2t, k2 = _trim3(s2, q2)
         if k1 != len1 or k2 != len2:
-            npolicy_bases = (len1 - k1) + (len2 - k2)
+            npolicy_1, npolicy_2 = len1 - k1, len2 - k2
             s1, q1, s2, q2 = s1t, q1t, s2t, q2t
             len1, len2 = k1, k2
             s2rc = reverse_complement(s2)
@@ -461,18 +502,54 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     if will_trim:
         keep1, keep2 = _balanced_split(L, len1, len2)
 
+    # The run-level counters are the per-mate ones summed, so they keep their exact
+    # previous values and the 15-field counter tuple does not grow -- `_fold` in
+    # merge/cli.py sums a fixed prefix, and a counter added past it reports zero.
+    npolicy_bases = npolicy_1 + npolicy_2
+    n_rescued = rescued_1 + rescued_2
+    # Which policy bit a touched record earns, and which token carries its count.
+    rnd = npolicy == NPOLICY_RANDOM
+    npolicy_bit = PROV_NSUBBED if rnd else PROV_NTRIMMED
+
     if will_merge:
         seq, qual, n1, n2 = _build_merged(shift, s1, q1, s2rc, q2, len1, len2)
-        name = strip_pair_suffix(h1) + b" merged_%d_%d" % (n1, n2)
+        # A merged record is built from BOTH mates, so its provenance is the pair's: the
+        # policy counts are the two summed, and the rescues are R1's, the only ones that
+        # reached the emitted bases.
+        bits = ((PROV_RESCUED if n_rescued else 0)
+                | (npolicy_bit if npolicy_bases else 0))
+        # fastp-style merged name, pair suffix stripped, tags preserved. Keeping
+        # `merged_<n1>_<n2>` LAST is fastp's convention and costs nothing, so the
+        # provenance tokens go before it.
+        name = _prov_name(strip_pair_suffix(h1), bits,
+                          0 if rnd else npolicy_bases,
+                          npolicy_bases if rnd else 0,
+                          n_rescued) + b" merged_%d_%d" % (n1, n2)
         cand = [(name, seq, qual)]
         paired, outcome = False, MERGED
     elif will_trim:
-        cand = [(h1, s1[:keep1], q1[:keep1]), (h2, s2[:keep2], q2[:keep2])]
+        b1 = (PROV_TRIMMED | (PROV_RESCUED if rescued_1 else 0)
+              | (npolicy_bit if npolicy_1 else 0))
+        b2 = (PROV_TRIMMED | (PROV_RESCUED if rescued_2 else 0)
+              | (npolicy_bit if npolicy_2 else 0))
+        cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
+                            npolicy_1 if rnd else 0, rescued_1),
+                 s1[:keep1], q1[:keep1]),
+                (_prov_name(h2, b2, 0 if rnd else npolicy_2,
+                            npolicy_2 if rnd else 0, rescued_2),
+                 s2[:keep2], q2[:keep2])]
         paired, outcome = True, TRIMMED
     else:
         if prov_band and not prov_trim:
             trim_guard = 1                                  # guard fired
-        cand = [(h1, s1, q1), (h2, s2, q2)]
+        # No consensus is written on this path, so a kept record can never carry
+        # PROV_RESCUED -- only the N policy can have touched it.
+        b1 = npolicy_bit if npolicy_1 else 0
+        b2 = npolicy_bit if npolicy_2 else 0
+        cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
+                            npolicy_1 if rnd else 0, 0), s1, q1),
+                (_prov_name(h2, b2, 0 if rnd else npolicy_2,
+                            npolicy_2 if rnd else 0, 0), s2, q2)]
         paired, outcome = True, KEPT
 
     if paired:

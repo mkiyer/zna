@@ -533,7 +533,7 @@ class TestCrossBackend:
         assert a[3][0] == 400 and a[3][1] > 100, a[3]      # the fixture proves nothing
         assert a[3][8] > 0, "no consensus changes: the fixture is not exercising it"
 
-    @pytest.mark.parametrize("npolicy", [1, 0])   # trim3, keep
+    @pytest.mark.parametrize("npolicy", [1, 0, 2])   # trim3, keep, random
     def test_chunks_with_no_calls_agree_blob_for_blob(self, npolicy):
         """The differential, on input that actually contains `N`.
 
@@ -567,6 +567,126 @@ class TestCrossBackend:
             and list(a[6]) == list(b[6])
         emitted = b"".join(a[0].split(b"\n")[1::4])
         assert (b"N" not in emitted) == bool(npolicy), "trim3 must leave no N"
+
+    @pytest.mark.parametrize("npolicy", [1, 0, 2])   # trim3, keep, random
+    def test_provenance_tokens_agree_across_backends(self, npolicy):
+        """The header tokens are built in two places and must agree byte for byte.
+
+        `merge_core.hpp::build_name` and `_pymerge._prov_name` are one specification with
+        two implementations, exactly like the scan. This fixture drives every token —
+        trimmed, rescued, trim3 — through both, on a library engineered so all three
+        outcomes and both no-call fates occur, and compares the HEADERS specifically so a
+        failure names the token rather than "blobs differ".
+        """
+        py, cc = _chunk_backends()
+        rng = random.Random(23)
+        r1s, r2s = [], []
+        for i in range(400):
+            # Sweep the fragment length across merge / trim / keep territory.
+            frag = draw(rng, rng.randrange(40, 320))
+            l1, l2 = rng.randrange(60, 151), rng.randrange(60, 151)
+            a = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01))
+            b = bytearray(mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01))
+            # N in the overlap gets rescued; N past it survives to meet the policy.
+            for _ in range(rng.randrange(0, 3)):
+                if a: a[rng.randrange(len(a))] = ord("N")
+                if b: b[rng.randrange(len(b))] = ord("N")
+            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(a)))
+            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(b)))
+            r1s.append(b"@f%d/1\tZI:i:%d\n%b\n+\n%b\n" % (i, i, bytes(a), q1))
+            r2s.append(b"@f%d/2\tZI:i:%d\n%b\n+\n%b\n" % (i, i, bytes(b), q2))
+        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q,
+                True, 0, npolicy, 42)
+        a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+        b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+
+        ha = a[0].split(b"\n")[0::4]
+        hb = b[0].split(b"\n")[0::4]
+        assert ha == hb, "provenance tokens differ between backends"
+        assert a[0] == b[0] and a[3] == b[3]
+
+        # The fixture has to actually produce the tokens, or it proves nothing.
+        seen = set()
+        for h in ha:
+            for tok in h.split()[1:]:
+                if b"_" in tok and not tok.startswith(b"merged_"):
+                    seen.add(tok.split(b"_")[0])
+        want = {b"rescued"} | ({b"subn"} if npolicy == 2 else
+                               {b"trim3"} if npolicy == 1 else set())
+        assert want <= seen, f"fixture produced only {seen}"
+        assert any(t.startswith(b"ZN:i:") for h in ha for t in h.split()), "no ZN tag"
+
+    def test_a_rescue_is_charged_to_the_mate_it_repaired(self, any_backend):
+        """Each record's `rescued_<n>` counts ITS OWN recovered no-calls, not the pair's.
+
+        The trim path is the only one that repairs R2 — a merged pair discards R2's copy
+        of the overlap — so R1-rescues-R2 happens in exactly one branch, and a fixture
+        that never lands there cannot see the charge go to the wrong mate. It is a real
+        blind spot: charging both directions to mate 1 leaves the randomised
+        cross-backend fixtures green under `--npolicy trim3`, because they produce
+        R2-rescues-R1 in bulk and R1-rescues-R2 almost never.
+
+        Insert 48 with 30 bp reads gives a 12 bp overlap at 23.8 bits — real, but under
+        the 28 needed to merge, so the pair trims and both copies reach the output.
+        """
+        frag = rand_seq(48, 13)
+        (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
+        # R2 covers fragment [18, 48), so fragment position p is R2 index 47 - p. Put a
+        # no-call at R2 index 25 — fragment position 22, inside the overlap, where R1
+        # holds a real call.
+        s2 = s2[:25] + b"N" + s2[26:]
+        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
+        assert outcome == PairOutcome.TRIMMED, "the fixture stopped trimming"
+        r1_out, r2_out = recs[0], recs[1]
+        # R1 repaired R2, so R2 is the record that reports the rescue — and R1, which
+        # was not repaired, must not claim it.
+        assert r2_out[0] == h2 + b" ZN:i:3 rescued_1", r2_out[0]
+        assert r1_out[0] == h1 + b" ZN:i:1", r1_out[0]
+        # ...and the rescue actually happened: no N survives into the emitted mate.
+        assert b"N" not in r2_out[1]
+
+    def test_provenance_never_disturbs_the_id_or_the_tags(self):
+        """Merge ADDS header fields; it never removes or rewrites one.
+
+        That is what lets `zna encode --label` read the same `KEY:T:VALUE` tags off an
+        emitted record that it would have read off the input, and it has to hold on all
+        three outcomes — not just the merged one, which is the only path that rebuilds a
+        name for any other reason.
+        """
+        py, cc = _chunk_backends()
+        rng = random.Random(24)
+        r1s, r2s = [], []
+        for i in range(200):
+            frag = draw(rng, rng.randrange(40, 320))
+            a = bytearray((frag + ADAPTER1 + draw(rng, 160))[:100])
+            b = bytearray((rc(frag) + ADAPTER2 + draw(rng, 160))[:100])
+            for _ in range(rng.randrange(0, 3)):
+                a[rng.randrange(len(a))] = ord("N")
+                b[rng.randrange(len(b))] = ord("N")
+            r1s.append(b"@f%d/1\tZI:i:%d\tRX:Z:ACGT\n%b\n+\n%b\n"
+                       % (i, i, bytes(a), b"I" * len(a)))
+            r2s.append(b"@f%d/2\tZI:i:%d\tRX:Z:ACGT\n%b\n+\n%b\n"
+                       % (i, i, bytes(b), b"I" * len(b)))
+        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q,
+                True, 0, 1, 42)
+        a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+        assert a[0] == cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)[0]
+
+        headers = [h for h in a[0].split(b"\n")[0::4] if h]
+        assert headers, "the fixture emitted nothing"
+        for h in headers:
+            body = h[1:]
+            # Both original tags survive verbatim, in their original tab-separated form.
+            assert b"\tRX:Z:ACGT" in body, body
+            assert b"\tZI:i:" in body, body
+            # The ID is untouched apart from a stripped /1 /2 on a merged record, so
+            # ZNA's pairing rule still sees the same fragment.
+            assert base_name(body).startswith(b"f"), body
+            # Whatever we appended came after the tags, never inside them.
+            idtok = body.split(None, 1)[0]
+            assert b"ZN:i:" not in idtok and b"trim3_" not in idtok
 
     @pytest.mark.parametrize("payload", [
         b"",                                             # empty buffer
@@ -1624,7 +1744,11 @@ class TestProcessPair:
         assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
         assert len(recs) == 2
         r1_out, r2_out = recs[0], recs[1]
-        assert r1_out[0] == h1 and r2_out[0] == h2                 # /1,/2 kept
+        # /1,/2 kept, the header passed through verbatim, and the trim recorded: a
+        # trimmed pair is emitted as an ordinary pair, so PROV_TRIMMED is the only place
+        # the split is written down.
+        assert r1_out[0] == h1 + b" ZN:i:1" and r2_out[0] == h2 + b" ZN:i:1"
+        assert base_name(r1_out[0]) == base_name(h1)               # pairing unaffected
         # The overlap is split between the two 3' ends, not taken entirely off R2, so
         # the emitted reads come out the same length: 12 redundant bases, 6 off each.
         assert len(r1_out[1]) == len(r2_out[1]) == 24

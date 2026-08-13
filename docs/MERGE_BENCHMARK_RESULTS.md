@@ -6,6 +6,23 @@ the 0.4.0 benchmark plan specified, and it gates the 0.4.0
 tag. Everything before it proved that `zna merge` matches *itself*; this is the first
 thing that asks whether its answers are **true**.
 
+> **Re-verified 2026-08-13 at the 0.4.0 release commit.** Every number in this document
+> was reproduced exactly — `summary.json` and `report.md` diff clean against the run
+> above apart from output paths and the throughput line, which is run-to-run noise on a
+> shared machine (zna 1.86 → 1.66 µs/pair, fastp 2.83 → 2.93). Per-record provenance
+> changes headers only, never a merge decision, so nothing here was expected to move and
+> nothing did. The re-run also confirmed the two structural properties the corpus rests
+> on: flag byte 24 survives `--shuffle` on 291,810 records, and `--restore-strand`
+> reproduces the original base multiset over all 1,416,630.
+>
+> The simulator emits no `N`, so the N policy is exercised by injecting one no-call into
+> ~1.5% of reads, 3'-biased. At that rate, of 30,000 injected: **5,879 rescued from the
+> mate** under *both* policies (rescue precedes the policy, so this must agree), then
+> `random` substituted exactly the remaining **24,121**, and `trim3` removed 913,823
+> bases — 0.43% of emitted bases, below the 1% warning. `trim3` also costs ~1,900 merges
+> against `random` (580,971 vs 582,777), which is D4a's coverage retry declining to
+> merge a pair that no longer tiles its fragment.
+
 Reproduce with [`scripts/merge_bench/simulate.py`](../scripts/merge_bench/simulate.py)
 and [`compare.py`](../scripts/merge_bench/compare.py) — see that directory's README. The
 simulator is deterministic in its seed (verified byte-identical across runs), so the

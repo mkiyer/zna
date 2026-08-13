@@ -1,78 +1,71 @@
-# Handoff: finishing 0.4.0
+# Handoff: 0.4.0 is done; what the next session needs
 
-Written 2026-08-13. Branch `zna-0.4.0-hardening`, two commits, working tree clean,
-609 tests green compiled / 562 + 47 skipped extension-less.
+Updated 2026-08-13. Branch `zna-0.4.0-hardening`, working tree clean, **627 tests green
+compiled / 574 + 53 skipped extension-less**.
 
-This is what is left, why it is left, and the traps between here and the tag.
-
----
-
-## 1. What remains
-
-### 1.1 Per-record provenance — the only real feature left
-
-Agreed but not built. Run-level reporting landed (`--merge-json`, the merge summary, a
-warning above 1% of emitted bases), so a *library* now says what happened to it. A
-*read* does not.
-
-Two halves, for two different readers:
-
-- **Header tokens on the merged FASTQ**, for human inspection: `trim3_<n>` for bases cut
-  and `rescued_<n>` for no-calls recovered, beside the existing `merged_<n1>_<n2>`.
-  Verified safe against label extraction — a token with no colon is skipped by the tag
-  parser, exactly as `merged_150_87` is:
-
-  ```
-  f12  ZI:i:7 merged_90_0 trim3_12   ->   labels (7,)   unaffected
-  ```
-
-  The construction lives in `merge_core.hpp::process_pair` (the `snprintf` into
-  `sc.name`), mirrored in `_pymerge.process_pair`. **Both must change together** or the
-  cross-backend differential fails — which is the system working.
-
-- **An optional provenance label for the corpus.** ZNA does not store headers, so the
-  tokens above vanish at encode time, and under `--merge-pairs` (0.5.0) there is no
-  intermediate FASTQ at all. One `C` (uint8) column, one byte per record, with bits for
-  merged / trimmed / N-rescued / N-trimmed, is the only per-record provenance that
-  survives into the corpus.
-
-  This one needs a decision before it is built: it adds a column to every labeled file.
-
-### 1.2 The encode-side `--npolicy` summary
-
-`zna merge` reports what its policy did; `zna encode --npolicy trim3` does not. The merge
-side is `src/zna/merge/cli.py` (search `no-calls:`); encode's summary is the
-`[ZNA] Done. Wrote N records` line in `encode_command`. It needs a counter threaded
-through the write loop, which is straightforward — `_trim3` is already a local function
-there.
-
-### 1.3 Before tagging
-
-- Re-run the 1M benchmark end to end and record the numbers in
-  `MERGE_BENCHMARK_RESULTS.md` if any moved.
-- `docs/RELEASING.md` for the PyPI/Bioconda steps.
-- Decide whether the conda recipe and CI need anything for the changed policy set.
+Sections 3–5 are the durable part — the traps, the ground truth, and the two properties
+worth re-checking after *any* change to the merge or encode path. They cost real time to
+learn and they outlive this release.
 
 ---
 
-## 2. Decisions already taken — do not reopen without new evidence
+## 1. What 0.4.0 shipped
 
-Each of these was argued and closed with a measurement. `docs/NPOLICY_PLAN.md` and
-`docs/METHODS.md` carry the reasoning.
+Everything the previous handoff listed as remaining is built and measured.
 
-| Decision | Why |
-|---|---|
-| **`--merge-pairs` deferred to 0.5.0** | The one-step and two-step paths produce the *identical* corpus on the 1M library — same 1,416,630 records, same flag histogram. No correctness reason to rush. `docs/MERGE_PAIRS_PLAN.md` is execution-ready. |
-| **No `--max-n`** | It is a *substitution* knob. Under trim3 the output has zero N by construction and the loss is set by the *position* of the first N, not the count. No intuition for how a user would set it. |
-| **A pair with a surviving N is not merged** (option C) | Worked example: merging then trimming keeps 40 of 220 fragment bases; not merging keeps 190. C wins on data retention *and* flag honesty. A merged record's 3' end **is R2's 5' end**, so trimming it discards the anchor the 3'-only rule exists to protect. |
-| **The post-trim retry reuses the original shift** | trim3 cuts 3' ends, which is where a normal overlap lives. At one fixture the residual overlap collapses 80 → 10 bases; a re-scan would refuse a merge there was 80 bases of evidence for. The shift is a claim about fragment *length*, and trimming interior bases does not change a length. |
-| **No consensus on a kept pair** | Of 3,068 kept pairs with a detected overlap, **none** found the true shift and 97.3% had no true overlap. Wrong emitted bases: 208 correcting neither, 1,509 correcting R1 only, 17,870 correcting both. |
-| **Stumps are allowed** | ZNA stores 1-base and 0-base records (verified). `--min-read-length` handles them on the merge path. A core read-processing tool reports what it did and leaves the length decision to the consumer. |
-| **Breaking backwards compatibility is fine** | Explicitly authorised. Every unstranded-normalized file changes under the new RC coin. |
+- **Per-record provenance** (`docs/NPOLICY_PLAN.md` D5). Header tokens
+  `trim3_<n>` / `subn_<n>` / `rescued_<n>` on **every** outcome, not only merged ones,
+  built in `merge_core.hpp::build_name` and mirrored in `_pymerge._prov_name`. A record
+  nothing happened to is emitted byte-unchanged and stays zero-copy — 1,332,353 of
+  1,418,525 records on the 1M library at a 1.5% no-call rate.
+- **The corpus column**, as a `ZN:i:<bits>` SAM tag read through the `--label` machinery
+  that already shipped: `--label provenance:C:ZN`. This is what closed the open question
+  "does it add a column to every labeled file?" — it does not, because declaring it is
+  per file and an absent tag resolves to 0. Bits: trimmed 1, rescued 2, N-trimmed 4,
+  N-substituted 8, and **deliberately no "merged"** — see D5 for why that bit was
+  dropped after it turned out to put ` ZN:i:1` on 82% of records to repeat
+  `IS_FULL_FRAGMENT`.
+- **The encode-side `--npolicy` summary**, so both halves of the seam are accountable.
+  `trim3`'s count is free; `random` substitutes inside the codec, so encode counts the
+  no-calls itself rather than widening the codec ABI across two backends for a statistic.
+- **`docs/RELEASING.md`** corrected against two real defects in `scripts/release.sh`
+  (below), and the benchmark re-verified at the release commit.
+
+### Two things found by auditing, not by testing
+
+- `scripts/release.sh` hardcoded `git push origin main` while all work was on a feature
+  branch — it would have pushed local `main` and then tagged a commit `main` did not
+  contain. It now refuses unless you are on `main`.
+- The same script's version bump is a no-op when `__init__.py` is already at the target
+  (the normal case), and `git commit` with nothing staged exits non-zero, which under
+  `set -e` aborted the release *after* the confirmation prompt. Now handled.
+
+### One superstition retired
+
+`merge_core.hpp` claimed khorana's `parse_merged_fastq` required `merged_<n1>_<n2>` to
+be the last header token. khorana consumes `.zna` through `ZnaReader`; `seq.py`'s FASTQ
+path is stale. The tokens are still ordered to keep `merged_` last, because that is
+fastp's convention and costs nothing — but it is a convention now, not a constraint, and
+the comment says so.
 
 ---
 
-## 3. Traps — these cost real time in the last session
+## 2. What is next
+
+`docs/MERGE_PAIRS_PLAN.md` is execution-ready and unchanged: `zna encode --merge-pairs`
+for 0.5.0, deferred because the one-step and two-step paths produce the *identical*
+corpus on the 1M library. Its provenance story is already settled — it computes the same
+`PairResult` and writes the same `PROV_*` bits directly, with no FASTQ in between.
+
+Decisions closed by measurement, **not to be reopened without new evidence** — the table
+in `docs/NPOLICY_PLAN.md` §2 and `docs/METHODS.md` carry the reasoning: no `--max-n`; a
+pair with a surviving N is not merged; the post-trim retry reuses the original shift; no
+consensus on a kept pair; stumps are allowed; breaking backwards compatibility is
+authorised.
+
+---
+
+## 3. Traps — these cost real time
 
 1. **Rebuild command.** `pip install -e . --no-build-isolation`, with that env's pip.
    `--no-build-isolation` is load-bearing: without it scikit-build-core rewrites
@@ -85,7 +78,9 @@ Each of these was argued and closed with a measurement. `docs/NPOLICY_PLAN.md` a
 
 3. **`touch` a `.hpp` after restoring it with `cp`.** CMake's dependency scan can miss a
    `cp`-restored header, so a mutation test runs against the *mutated* `.so` and the fix
-   looks broken. This also happened.
+   looks broken. This also happened — and it matters specifically when you are checking
+   that a new fixture actually catches something, which is the one time you are relying
+   on a rebuild you did not read.
 
 4. **The ambient `PATH` starts with `envs/zna/bin`** — the py3.14 extension-less install,
    which refuses to merge by design. Use absolute paths or prepend `envs/zna_merge/bin`.
@@ -99,12 +94,15 @@ Each of these was argued and closed with a measurement. `docs/NPOLICY_PLAN.md` a
    mv "$M" "$M.disabled"
    ```
 
-   Confirm with `available_merge_backends() == ['python']`. Expect ~47 skips.
+   Confirm with `available_merge_backends() == ['python']`. Expect ~53 skips. Note
+   `zna.is_accelerated()` stays **True** there — that is the *codec* extension, which is
+   a different build target and is not what this env disables.
 
 6. **`_fold` in `merge/cli.py` sums a fixed prefix** of the counter tuple and
    special-cases the maximum. A counter added past that point silently reports **zero** —
    the first version of the N-policy counters did exactly that on a library that was
-   visibly being trimmed. Extend the loop.
+   visibly being trimmed. The per-mate provenance counters avoid this entirely by
+   summing to the existing totals rather than extending the tuple; keep it that way.
 
 7. **`backend._REQUIRED_FUNCTIONS` is validated by `_load` but not by
    `available_merge_backends`**, so adding a name there against a stale `.so` leaves
@@ -117,11 +115,16 @@ Each of these was argued and closed with a measurement. `docs/NPOLICY_PLAN.md` a
 
 - `~/proj/zna_merge_bench/run1M/` — `sim_1.fq.gz`, `sim_2.fq.gz`, `sim.truth.tsv`,
   1M pairs from hg38. The simulator emits **no N**, so anything about the N policy needs
-  N injected (there is a recipe in the last session's scratch; ~1.5% of reads with one
-  no-call, biased 3', is realistic).
+  N injected: one no-call in ~1.5% of reads, placed uniformly over the read's 3' half,
+  is realistic and is what the numbers in `MERGE_BENCHMARK_RESULTS.md` were re-verified
+  against. That placement is not decoration — an N inside the overlap is rescued from the
+  mate, one past it survives to meet the policy, so a 3' bias is what makes both fates
+  occur.
 - `~/proj/zna_merge_bench/refs/hg38.fa`.
 - `scripts/merge_bench/` — `simulate.py` and `compare.py` score merged FASTQ against the
   truth sidecar. **Neither reads `.zna`**; a `.zna`-level comparator is new tooling.
+  `compare.py` takes ~4 minutes end to end and diffs cleanly against the recorded run
+  apart from paths and the throughput line.
 
 ---
 
@@ -134,7 +137,31 @@ PATH=$Z:$PATH $Z/zna encode --interleaved --treat-unpaired-as-merged \
                             --strand-normalize --shuffle --seed 7 -o out.zna m.fq.gz
 ```
 
-1. **Flag byte 24 survives `--shuffle`** — ~291,810 records. It is the bit that three
+1. **Flag byte 24 survives `--shuffle`** — 291,810 records. It is the bit that three
    separate copy paths used to destroy.
 2. **`--restore-strand` reproduces the original base multiset exactly**, all 1,416,630
-   records. That is the property the lossless copy path exists for.
+   records. That is the property the lossless copy path exists for. Check it as an
+   order-independent checksum (XOR of per-record digests), not a set — `--shuffle`
+   reorders, and holding 1.4M sequences twice proves nothing extra.
+
+Both verified at the 0.4.0 release commit.
+
+---
+
+## 6. What the cross-backend fixtures are actually for
+
+Two real bugs in the last session, and one in this one, were caught by cross-backend
+fixtures that did not previously exist — and in every case the mutation left the *rest*
+of the suite green.
+
+The lesson that generalises: **a differential is only as good as the branch its fixture
+reaches.** When per-mate rescue counting was added here, charging both directions to
+mate 1 left the randomised N-bearing differential green under `--npolicy trim3`, because
+random fixtures produce R2-rescues-R1 in bulk and R1-rescues-R2 almost never — and
+R1-rescues-R2 only happens on the trim path at all, since a merged pair discards R2's
+copy of the overlap. It took a hand-built pair
+(`test_a_rescue_is_charged_to_the_mate_it_repaired`) to pin it.
+
+So: when you add a counter or a branch, ask which fixture *reaches* it, and if the
+answer is "a random one, sometimes", write the deterministic one too. Then verify the
+fixture by mutating the C++ and watching it fail — with trap 3 in mind.

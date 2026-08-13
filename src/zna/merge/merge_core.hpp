@@ -40,6 +40,7 @@
 #define ZNA_MERGE_CORE_HPP
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 // 16-byte vectors are baseline on every target we build for: NEON on aarch64, SSE2 on
@@ -215,6 +216,32 @@ constexpr int NPOLICY_KEEP = 0;
 constexpr int NPOLICY_TRIM3 = 1;
 constexpr int NPOLICY_RANDOM = 2;
 
+/// Per-record provenance bits, emitted as the `ZN:i:<bits>` header tag.
+///
+/// ZNA does not store headers, so the human-readable tokens beside this tag vanish at
+/// encode time. This byte is the only per-record provenance that reaches the corpus:
+/// `zna encode --label prov:C:ZN` turns it into a `C` (uint8) column, and an absent tag
+/// resolves to 0 -- "nothing happened" -- so declaring the column is opt-in and costs
+/// files that do not ask for it nothing.
+///
+/// **There is deliberately no "merged" bit.** This tag carries what would otherwise be
+/// LOST, and "merged" is not lost: it is `merged_<n1>_<n2>` in the FASTQ and
+/// `IS_FULL_FRAGMENT` in the corpus. Spending a bit on it would put ` ZN:i:1` on ~82% of
+/// emitted records to say something two other places already say. The consequence worth
+/// knowing: `IS_FULL_FRAGMENT` is only set when `zna encode` is given
+/// `--treat-unpaired-as-merged`, so an encode that omits that flag records neither --
+/// which is what asking for it means.
+///
+/// So an absent tag means "nothing happened to this record that you could not already
+/// see", and every set bit is a fact with no other home.
+///
+/// The vocabulary is shared with `zna encode --merge-pairs` (0.5.0), which computes the
+/// same `PairResult` and writes the same bits with no FASTQ in between.
+constexpr int PROV_TRIMMED   = 1;   ///< from a pair whose redundant overlap was split
+constexpr int PROV_RESCUED   = 2;   ///< >=1 no-call recovered from the mate
+constexpr int PROV_NTRIMMED  = 4;   ///< >=1 base removed by --npolicy trim3
+constexpr int PROV_NSUBBED   = 8;   ///< >=1 base substituted by --npolicy random
+
 /// splitmix64's finalizer -- the same function as `zna_mix64` in `_accel.cpp` and
 /// `_mix64` in `_pycodec.py`. Substitution is position-derived rather than drawn from a
 /// running stream, so it cannot depend on how pairs were batched into chunks.
@@ -231,12 +258,24 @@ inline uint8_t merge_sub_base(uint64_t seed, uint64_t rec, uint64_t off) noexcep
                                    + 0x94D049BB133111EBULL * (off + 1)) & 3ULL];
 }
 
+/// Bytes reserved past the header for the provenance tokens appended below.
+///
+/// Bound, with 11-digit ints: " ZN:i:15"(8) " trim3_N"(18) " subn_N"(17)
+/// " rescued_N"(20) " merged_N_N"(31) = 94. That over-counts -- `trim3_` and `subn_` are
+/// mutually exclusive, and only a merged record carries `merged_` -- which is the right
+/// direction for a buffer bound. 128 is that with room.
+///
+/// It is a *constant*: the name buffer is sized from the HEADER plus this, never from
+/// the read arena. Sizing it from the arena is what overflowed the heap on any FASTQ
+/// whose headers outran its reads -- see `Scratch::ensure_name`.
+constexpr size_t NAME_RESERVE = 128;
+
 /// One scratch arena per worker. Starts at 1024 bases and doubles when a longer read
 /// turns up, so nothing needs to know the read length up front and the per-pair path
 /// never allocates. Measured 27% faster than sizing buffers per pair, because dropping
 /// the fixed-size assumption is what makes the copy-on-write below natural.
 struct Scratch {
-    std::vector<uint8_t> s2rc, q2r, s1b, q1b, s2b, q2b, seq, qual, name;
+    std::vector<uint8_t> s2rc, q2r, s1b, q1b, s2b, q2b, seq, qual, name, name2;
     size_t cap = 0;
 
     void ensure(size_t n) {
@@ -265,6 +304,19 @@ struct Scratch {
         while (c < n) c <<= 1;
         name.resize(c);
     }
+
+    /// The second name buffer, for R2 of an unmerged pair.
+    ///
+    /// A merged pair emits one record and needs one buffer; a kept or trimmed pair emits
+    /// two, and both mates can carry provenance of their own. Sizing this from R2's
+    /// header rather than R1's matters -- the two are usually the same length, but
+    /// nothing guarantees it.
+    void ensure_name2(size_t n) {
+        if (n <= name2.size()) return;
+        size_t c = name2.size() ? name2.size() : 1088;
+        while (c < n) c <<= 1;
+        name2.resize(c);
+    }
 };
 
 struct PairResult {
@@ -282,6 +334,16 @@ struct PairResult {
     int npolicy_bases;
     /// No-calls the overlap recovered from the mate, which cost nothing.
     int n_rescued;
+    /// The same two quantities split per MATE, for the per-record header tokens.
+    ///
+    /// `npolicy_bases == npolicy_1 + npolicy_2` and `n_rescued == n_rescued_1 +
+    /// n_rescued_2` always, so the run-level counters keep their exact previous values
+    /// and the 15-field counter tuple does not grow. That is deliberate: `_fold` in
+    /// merge/cli.py sums a fixed prefix, and a counter added past it reports zero.
+    int npolicy_1, npolicy_2;
+    int n_rescued_1, n_rescued_2;
+    /// Provenance bits per emitted record, parallel to `recs`. See PROV_* above.
+    int prov[2];
 };
 
 /// Resolve overlap disagreements into R1 alone, by posterior. Returns bases *changed*.
@@ -351,7 +413,8 @@ inline int consensus_r1(uint8_t* s1, uint8_t* q1, const uint8_t* s2rc,
 /// stored there is the complement of the resolved call.
 inline int consensus_pair(uint8_t* s1, uint8_t* q1, uint8_t* s2rc, uint8_t* q2r,
                           uint8_t* s2, uint8_t* q2, int len2, int s, int olen,
-                          const uint8_t* disagree_q, int* rescued) noexcept {
+                          const uint8_t* disagree_q,
+                          int* rescued1, int* rescued2) noexcept {
     const int a0 = s > 0 ? s : 0;      // mirrors the scan's overlap alignment
     const int b0 = s < 0 ? -s : 0;
     int changed = 0;
@@ -362,12 +425,15 @@ inline int consensus_pair(uint8_t* s1, uint8_t* q1, uint8_t* s2rc, uint8_t* q2r,
             const int j2 = len2 - 1 - ib;                  // same base, R2's frame
             const bool a_is_n = s1[ia] == 'N', b_is_n = s2rc[ib] == 'N';
             if (a_is_n != b_is_n) {             // rescue: a real call beats an N
-                ++*rescued;
+                // Charged to the mate that was REPAIRED, so each emitted record's
+                // `rescued_<n>` token counts only its own recovered no-calls.
                 if (a_is_n) {                   // R2 rescues R1
+                    ++*rescued1;
                     s1[ia] = s2rc[ib];
                     q1[ia] = qb;
                     ++changed;                  // `changed` counts R1 only, by contract
                 } else {                        // R1 rescues R2
+                    ++*rescued2;
                     s2rc[ib] = s1[ia];
                     q2r[ib] = qa;
                     s2[j2] = complement_base(s1[ia]);
@@ -437,6 +503,90 @@ inline void balanced_split(int L, int len1, int len2, int& keep1, int& keep2) no
 ///     with no true overlap at all.
 inline bool trim_is_allowed(int L, int len1, int len2, int lr) noexcept {
     return (L - len1) >= lr && (L - len2) >= lr;
+}
+
+/// Build one emitted record's name: the input header, then its provenance tokens.
+///
+/// **Tags pass through untouched.** Everything already in the header is copied verbatim
+/// and the tokens are *appended*; nothing is ever removed or rewritten. That is what lets
+/// `zna encode --label` read the same `KEY:T:VALUE` tags off a merged record that it
+/// would have read off R1, and it is a contract, not an accident -- `strip_suffix` drops
+/// only the two bytes of a `/1`/`/2` pair suffix from the ID token itself.
+///
+/// Token order is fixed, and `merged_<n1>_<n2>` is appended by the caller AFTER these so
+/// it stays the final token -- fastp's convention, which costs nothing to keep.
+///
+/// The colon-less tokens are invisible to ZNA's tag parser, which requires `KEY:T:VALUE`
+/// and skips anything else; `ZN:i:<bits>` is the one that is meant to be read, and it is
+/// emitted only when some bit is set, so an absent tag resolves to 0 through the label
+/// machinery's own missing-value path.
+///
+/// `cap` is the buffer's capacity; every write is bounded by it. Callers reserve
+/// `header + NAME_RESERVE`.
+inline int build_name(uint8_t* nm, size_t cap, const Span& h, bool strip_suffix,
+                      int bits, int trim3_n, int subn_n, int rescued_n) noexcept {
+    int nl = 0;
+    if (strip_suffix) {
+        int cut = h.n;                  // id_end: first space or tab, else all of it
+        for (int i = 0; i < h.n; ++i) {
+            if (h.p[i] == ' ' || h.p[i] == '\t') { cut = i; break; }
+        }
+        int idlen = cut;
+        if (idlen >= 2 && h.p[idlen - 2] == '/' &&
+            (h.p[idlen - 1] == '1' || h.p[idlen - 1] == '2')) {
+            idlen -= 2;
+        }
+        std::memcpy(nm, h.p, static_cast<size_t>(idlen));                  nl += idlen;
+        std::memcpy(nm + nl, h.p + cut, static_cast<size_t>(h.n - cut));
+        nl += h.n - cut;
+    } else {
+        std::memcpy(nm, h.p, static_cast<size_t>(h.n));                    nl = h.n;
+    }
+    if (bits) {
+        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), cap - nl,
+                            " ZN:i:%d", bits);
+    }
+    if (trim3_n) {
+        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), cap - nl,
+                            " trim3_%d", trim3_n);
+    }
+    if (subn_n) {
+        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), cap - nl,
+                            " subn_%d", subn_n);
+    }
+    if (rescued_n) {
+        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), cap - nl,
+                            " rescued_%d", rescued_n);
+    }
+    return nl;
+}
+
+/// The name for one emitted mate of an UNMERGED pair: its header, plus whatever
+/// provenance tokens it earned.
+///
+/// Returns the input span **untouched** when there is nothing to say. That is the common
+/// case by a wide margin, and it keeps the record zero-copy -- a pointer straight into
+/// the caller's input buffer, with no scratch touched and no bytes moved. Only a record
+/// the pipeline actually did something to pays for a name.
+///
+/// `which` selects the buffer: mate 0 uses `name`, mate 1 uses `name2`. A merged pair
+/// emits one record and uses `name` alone.
+inline Span name_for(Scratch& sc, int which, const Span& h, int bits, int npolicy,
+                     int npolicy_n, int rescued_n) {
+    if (!bits) return h;
+    const int trim3_n = (npolicy == NPOLICY_RANDOM) ? 0 : npolicy_n;
+    const int subn_n  = (npolicy == NPOLICY_RANDOM) ? npolicy_n : 0;
+    const size_t want = static_cast<size_t>(h.n) + NAME_RESERVE;
+    uint8_t* nm;
+    size_t room;
+    if (which == 0) {
+        sc.ensure_name(want);  nm = sc.name.data();  room = sc.name.size();
+    } else {
+        sc.ensure_name2(want); nm = sc.name2.data(); room = sc.name2.size();
+    }
+    const int nl = build_name(nm, room, h, /*strip_suffix=*/false,
+                              bits, trim3_n, subn_n, rescued_n);
+    return {nm, nl};
 }
 
 /// Classify one pair and build its output records.
@@ -531,13 +681,15 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
             out.bases_consensus_changed =
                 consensus_pair(s1b, q1b, s2rc, q2r, s2b, q2b, len2,
                                r.shift, r.overlap_len, p.disagree_q,
-                               &out.n_rescued);
+                               &out.n_rescued_1, &out.n_rescued_2);
             S2 = s2b;
             Q2 = q2b;
         } else {
+            // The merged path rescues into R1 only -- R2's copy of the overlap is
+            // discarded -- so every rescue here is charged to mate 1.
             out.bases_consensus_changed =
                 consensus_r1(s1b, q1b, s2rc, q2r, r.shift, r.overlap_len, p.disagree_q,
-                             &out.n_rescued);
+                             &out.n_rescued_1);
         }
         S1 = s1b;
         Q1 = q1b;
@@ -566,11 +718,11 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
             const uint64_t k1 = static_cast<uint64_t>(pair_index) * 2;
             for (int i = 0; i < elen1; ++i) {
                 if (s1b[i] == 'N') { s1b[i] = merge_sub_base(p.rng_seed, k1, i);
-                                     ++out.npolicy_bases; }
+                                     ++out.npolicy_1; }
             }
             for (int i = 0; i < elen2; ++i) {
                 if (s2b[i] == 'N') { s2b[i] = merge_sub_base(p.rng_seed, k1 + 1, i);
-                                     ++out.npolicy_bases; }
+                                     ++out.npolicy_2; }
             }
             S1 = s1b; S2 = s2b;
             revcomp_into(S2, elen2, s2rc);
@@ -580,7 +732,8 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
         for (int i = 0; i < elen1; ++i) { if (S1[i] == 'N') { k1 = i; break; } }
         for (int i = 0; i < elen2; ++i) { if (S2[i] == 'N') { k2 = i; break; } }
         if (k1 != elen1 || k2 != elen2) {
-            out.npolicy_bases = (elen1 - k1) + (elen2 - k2);
+            out.npolicy_1 = elen1 - k1;
+            out.npolicy_2 = elen2 - k2;
             elen1 = k1;
             elen2 = k2;
             // `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to
@@ -601,6 +754,15 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
     const bool will_trim = !will_merge && prov_band && (elen1 + elen2) > L &&
                            trim_is_allowed(L, elen1, elen2, lr);
 
+    // The run-level counters are the per-mate ones summed, so they keep their exact
+    // previous values and the counter tuple does not grow. See PairResult.
+    out.npolicy_bases = out.npolicy_1 + out.npolicy_2;
+    out.n_rescued = out.n_rescued_1 + out.n_rescued_2;
+
+    // Which policy bit a touched record earns. Set per RECORD, from that record's own
+    // count -- a kept pair whose R1 lost bases and whose R2 did not says exactly that.
+    const int npolicy_bit = (p.npolicy == NPOLICY_RANDOM) ? PROV_NSUBBED : PROV_NTRIMMED;
+
     bool paired;
     int n_cand;
 
@@ -620,34 +782,26 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
                 qual[take1 + i] = Q2[elen2 - 1 - (b + i)];
             }
         }
+        // A merged record is built from BOTH mates, so its provenance is the pair's:
+        // the trim3/random counts are the two summed, and the rescues are R1's, which
+        // are the only ones that reached the emitted bases (consensus_r1 above).
+        out.prov[0] = (out.n_rescued ? PROV_RESCUED : 0)
+                    | (out.npolicy_bases ? npolicy_bit : 0);
+
         // fastp-style merged name: "<id> merged_<n1>_<n2>", pair suffix stripped, tags
-        // preserved. ZNA ignores it; khorana's parse_merged_fastq requires it.
+        // preserved. ZNA ignores the token itself; keeping it LAST is fastp's convention
+        // and costs nothing, so the provenance tokens go before it.
         //
-        // Sized from the header, not the read: `nl` below reaches `r1.h.n` and the
-        // snprintf may add 64 more. See `Scratch::ensure_name`.
-        sc.ensure_name(static_cast<size_t>(r1.h.n) + 64);
+        // Sized from the header, not the read: `build_name` reaches `r1.h.n` and the
+        // tokens may add NAME_RESERVE more. See `Scratch::ensure_name`.
+        const bool rnd = (p.npolicy == NPOLICY_RANDOM);
+        sc.ensure_name(static_cast<size_t>(r1.h.n) + NAME_RESERVE);
         uint8_t* nm = sc.name.data();
-        int cut = 0;
-        {   // id_end: first space or tab, else the whole header
-            const uint8_t* h = r1.h.p;
-            int sp = -1, tb = -1;
-            for (int i = 0; i < r1.h.n; ++i) {
-                if (h[i] == ' ' && sp < 0) sp = i;
-                if (h[i] == '\t' && tb < 0) tb = i;
-                if (sp >= 0 && tb >= 0) break;
-            }
-            cut = (sp < 0) ? (tb < 0 ? r1.h.n : tb) : (tb < 0 ? sp : (sp < tb ? sp : tb));
-        }
-        int idlen = cut;
-        if (idlen >= 2 && r1.h.p[idlen - 2] == '/' &&
-            (r1.h.p[idlen - 1] == '1' || r1.h.p[idlen - 1] == '2')) {
-            idlen -= 2;
-        }
-        int nl = 0;
-        std::memcpy(nm, r1.h.p, static_cast<size_t>(idlen));               nl += idlen;
-        std::memcpy(nm + nl, r1.h.p + cut, static_cast<size_t>(r1.h.n - cut));
-        nl += r1.h.n - cut;
-        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), 64,
+        int nl = build_name(nm, sc.name.size(), r1.h, /*strip_suffix=*/true, out.prov[0],
+                            /*trim3_n=*/rnd ? 0 : out.npolicy_bases,
+                            /*subn_n=*/rnd ? out.npolicy_bases : 0,
+                            /*rescued_n=*/out.n_rescued);
+        nl += std::snprintf(reinterpret_cast<char*>(nm + nl), sc.name.size() - nl,
                             " merged_%d_%d", take1, take2);
 
         out.recs[0] = {{nm, nl}, {seq, L}, {qual, L}};
@@ -660,19 +814,34 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
         // once and the two emitted reads stay the same length.
         int keep1, keep2;
         balanced_split(L, elen1, elen2, keep1, keep2);
-        out.recs[0] = {r1.h, {S1, keep1}, {Q1, keep1}};
-        out.recs[1] = {r2.h, {S2, keep2}, {Q2, keep2}};
+        out.prov[0] = PROV_TRIMMED | (out.n_rescued_1 ? PROV_RESCUED : 0)
+                                   | (out.npolicy_1 ? npolicy_bit : 0);
+        out.prov[1] = PROV_TRIMMED | (out.n_rescued_2 ? PROV_RESCUED : 0)
+                                   | (out.npolicy_2 ? npolicy_bit : 0);
+        out.recs[0] = {name_for(sc, 0, r1.h, out.prov[0], p.npolicy,
+                                out.npolicy_1, out.n_rescued_1),
+                       {S1, keep1}, {Q1, keep1}};
+        out.recs[1] = {name_for(sc, 1, r2.h, out.prov[1], p.npolicy,
+                                out.npolicy_2, out.n_rescued_2),
+                       {S2, keep2}, {Q2, keep2}};
         n_cand = 2;
         paired = true;
         out.outcome = OUTCOME_TRIMMED;
     } else {
         // No detectable overlap, an unmergeable read-through, or a trim blocked by the
         // guard: keep both reads exactly as they are.
+        //
+        // No consensus is written on this path, so a kept record can never carry
+        // PROV_RESCUED -- only the N policy can have touched it.
         if (prov_band && !prov_trim) {
             out.trim_guard_fired = 1;
         }
-        out.recs[0] = {r1.h, {S1, elen1}, {Q1, elen1}};
-        out.recs[1] = {r2.h, {S2, elen2}, {Q2, elen2}};
+        out.prov[0] = out.npolicy_1 ? npolicy_bit : 0;
+        out.prov[1] = out.npolicy_2 ? npolicy_bit : 0;
+        out.recs[0] = {name_for(sc, 0, r1.h, out.prov[0], p.npolicy, out.npolicy_1, 0),
+                       {S1, elen1}, {Q1, elen1}};
+        out.recs[1] = {name_for(sc, 1, r2.h, out.prov[1], p.npolicy, out.npolicy_2, 0),
+                       {S2, elen2}, {Q2, elen2}};
         n_cand = 2;
         paired = true;
         out.outcome = OUTCOME_KEPT;

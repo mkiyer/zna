@@ -274,3 +274,197 @@ class TestMergeToZna:
         assert subprocess.run(cmd, capture_output=True, text=True).returncode == 0
         singles = [r for r in read_back(out) if not r[2]]
         assert singles and all(r[5] != r[6] for r in singles)   # one end only
+
+
+# --------------------------------------------------------------------------- #
+# per-record provenance: the only thing about a record's history that survives
+# encoding, since ZNA does not store headers
+# --------------------------------------------------------------------------- #
+
+def write_fastqs_with_no_calls(tmp_path, frags, rng):
+    """As :func:`write_fastqs`, but with no-calls injected 3'-biased.
+
+    The simulator emits no ``N`` at all, so nothing downstream of it can exercise the
+    N policy or the provenance it produces. Real no-calls cluster at the 3' end (later
+    cycles are the worse ones), and that placement matters here rather than being
+    decoration: an ``N`` inside the overlap gets rescued from the mate and one past it
+    survives to meet the policy, so a 3' bias is what makes both fates occur.
+    """
+    in1, in2 = tmp_path / "n1.fastq.gz", tmp_path / "n2.fastq.gz"
+    with gzip.open(in1, "wb") as f1, gzip.open(in2, "wb") as f2:
+        for fid, frag in frags.items():
+            r1 = bytearray((frag + ADAPTER1 + _draw(rng, READLEN))[:READLEN])
+            r2 = bytearray((rc(frag) + ADAPTER2 + _draw(rng, READLEN))[:READLEN])
+            for read in (r1, r2):
+                if rng.random() < 0.35:
+                    lo = int(len(read) * 0.5)              # 3'-biased, as instruments are
+                    read[rng.randrange(lo, len(read))] = ord("N")
+            tags = b"\tZI:i:%d" % fid
+            f1.write(b"@f%d/1%b\n%b\n+\n%b\n" % (fid, tags, bytes(r1), b"I" * len(r1)))
+            f2.write(b"@f%d/2%b\n%b\n+\n%b\n" % (fid, tags, bytes(r2), b"I" * len(r2)))
+    return in1, in2
+
+
+@pytest.fixture(scope="module")
+def n_corpus(tmp_path_factory):
+    """Merge an N-bearing library, then encode it with the provenance column declared."""
+    tmp_path = tmp_path_factory.mktemp("prov")
+    rng = random.Random(20260813)
+    frags = simulate(rng)
+    in1, in2 = write_fastqs_with_no_calls(tmp_path, frags, rng)
+    merged, stats = run_merge(tmp_path, in1, in2)
+    out = tmp_path / "prov.zna"
+    cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+           "--treat-unpaired-as-merged", "--seq-len-bytes", "2",
+           "--npolicy", "trim3",
+           "--label", "prov:C:ZN", "--label", "zi:i:ZI",
+           "-o", str(out), str(merged)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    recs = []
+    with open(out, "rb") as fh:
+        for seq, flags, labels in ZnaReader(fh).copy_records():
+            recs.append((seq, flags, labels))
+    return stats, recs
+
+
+class TestProvenanceReachesTheCorpus:
+    """The `ZN:i:<bits>` tag is provenance that survives `zna encode`.
+
+    Header tokens are for a human reading the intermediate FASTQ; they vanish at encode
+    time, and under `--merge-pairs` (0.5.0) there is no intermediate FASTQ at all. A
+    declared `C` column is the only per-record provenance that reaches a model, so what
+    matters is not that the tag is written but that it arrives — through the ordinary
+    `--label` path, with no provenance-specific code in the encoder.
+    """
+
+    def test_the_fixture_actually_produced_provenance(self, n_corpus):
+        """Guard the fixture: a library with no no-calls would prove nothing here."""
+        stats, recs = n_corpus
+        assert stats["npolicy_bases"] > 0 and stats["n_rescued_from_mate"] > 0
+        assert any(r[2][0] for r in recs), "no record carries any provenance bit"
+
+    def test_an_untouched_record_reports_nothing(self, n_corpus):
+        """An absent tag must resolve to 0 through the label machinery's own missing
+        path — that is what makes declaring the column optional rather than a schema
+        change to every labeled file."""
+        _stats, recs = n_corpus
+        assert sum(1 for r in recs if r[2][0] == 0) > 0, "every record was touched"
+
+    def test_the_trimmed_bit_counts_the_trimmed_pairs(self, n_corpus):
+        """PROV_TRIMMED is the one bit with no other home: a trimmed pair is emitted as
+        an ordinary pair, and nothing in the ZNA flag byte distinguishes it from a pair
+        that was kept whole. Both mates of every surviving trimmed pair carry it."""
+        stats, recs = n_corpus
+        from zna.merge._pymerge import PROV_TRIMMED
+        n_trimmed_recs = sum(1 for r in recs if r[2][0] & PROV_TRIMMED)
+        assert n_trimmed_recs == 2 * stats["trimmed_pairs"], (
+            f"{n_trimmed_recs} records carry PROV_TRIMMED but "
+            f"{stats['trimmed_pairs']} pairs were trimmed")
+
+    def test_trim3_never_claims_a_substitution(self, n_corpus):
+        """The two N policies are mutually exclusive per run, and the bits say which
+        one ran. Under trim3 nothing was invented, so PROV_NSUBBED must be absent —
+        this is the bit that would lie about a corpus containing made-up bases."""
+        _stats, recs = n_corpus
+        from zna.merge._pymerge import PROV_NSUBBED, PROV_NTRIMMED
+        assert not any(r[2][0] & PROV_NSUBBED for r in recs)
+        assert any(r[2][0] & PROV_NTRIMMED for r in recs), "trim3 cut nothing"
+
+    def test_no_bit_outside_the_defined_vocabulary(self, n_corpus):
+        """A byte with an undefined bit set means the two sides disagree about what the
+        column means, which is worse than an absent column."""
+        _stats, recs = n_corpus
+        from zna.merge._pymerge import (PROV_NSUBBED, PROV_NTRIMMED, PROV_RESCUED,
+                                        PROV_TRIMMED)
+        known = PROV_TRIMMED | PROV_RESCUED | PROV_NTRIMMED | PROV_NSUBBED
+        assert all(r[2][0] & ~known == 0 for r in recs)
+
+    def test_the_other_labels_are_unaffected(self, n_corpus):
+        """Provenance is added beside the existing tags, never instead of them: the ZI
+        tag merge passed through must still read back on every record."""
+        _stats, recs = n_corpus
+        assert all(r[2][1] >= 0 for r in recs)
+        assert len({r[2][1] for r in recs}) > 1, "the ZI label collapsed to one value"
+
+
+class TestEncodeReportsItsNpolicy:
+    """`zna merge` has always said what its N policy did; `zna encode` did not.
+
+    The same policy on the same library was accountable on one side of the seam and
+    silent on the other, and the failure it guards against is silent by nature: one dark
+    cycle can make a policy consume most of a library while the run still ends with
+    "Done."
+    """
+
+    @staticmethod
+    def _encode(tmp_path, fastq, npolicy, name, extra=()):
+        out = tmp_path / name
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--npolicy", npolicy,
+               *extra, "-o", str(out), *[str(f) for f in fastq]]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stderr
+
+    def test_random_reports_exactly_the_no_calls_it_substituted(self, tmp_path):
+        """The count is checkable against the input rather than against itself: under
+        `random` every no-call becomes exactly one substituted base, so the reported
+        number must equal the number of Ns in the file."""
+        rng = random.Random(11)
+        frags = simulate(rng, n_each=10)
+        in1, _in2 = write_fastqs_with_no_calls(tmp_path, frags, rng)
+        with gzip.open(in1, "rb") as fh:
+            n_calls = sum(line.count(b"N")
+                          for i, line in enumerate(fh.read().splitlines())
+                          if i % 4 == 1)
+        assert n_calls > 0, "the fixture injected no no-calls"
+        err = self._encode(tmp_path, [in1], "random", "r.zna")
+        assert f"substituted {n_calls} bases" in err, err
+
+    def test_trim3_reports_bases_removed_not_no_calls_found(self, tmp_path):
+        """trim3 cuts from the first no-call to the 3' end, so it removes at least as
+        many bases as there are no-calls, and reporting the no-call count instead would
+        understate the loss — which is the whole point of the line."""
+        rng = random.Random(12)
+        frags = simulate(rng, n_each=10)
+        in1, _in2 = write_fastqs_with_no_calls(tmp_path, frags, rng)
+        with gzip.open(in1, "rb") as fh:
+            lines = fh.read().splitlines()
+        seqs = [lines[i] for i in range(1, len(lines), 4)]
+        expect = sum(len(s) - s.find(b"N") for s in seqs if b"N" in s)
+        n_recs = sum(1 for s in seqs if b"N" in s)
+        err = self._encode(tmp_path, [in1], "trim3", "t.zna")
+        assert f"removed {expect} bases in {n_recs} records" in err, err
+        assert expect > n_recs, "the fixture never cut more than one base"
+
+    def test_the_paired_path_counts_both_mates(self, tmp_path):
+        """Two-file input goes through a different write loop than single-end, and an
+        untouched loop reports zero on a library that is visibly being trimmed."""
+        rng = random.Random(13)
+        frags = simulate(rng, n_each=10)
+        in1, in2 = write_fastqs_with_no_calls(tmp_path, frags, rng)
+        one = self._encode(tmp_path, [in1], "random", "p1.zna")
+        both = self._encode(tmp_path, [in1, in2], "random", "p2.zna")
+        n_one = int(one.split("substituted ")[1].split()[0])
+        n_both = int(both.split("substituted ")[1].split()[0])
+        assert n_one > 0 and n_both > n_one, (n_one, n_both)
+
+    def test_a_heavy_policy_warns(self, tmp_path):
+        """Above 1% of encoded bases the line stops being informational: that is a run
+        problem, not ordinary no-calls."""
+        seqs = [b"ACGT" * 20 + b"N" + b"ACGT" * 20 for _ in range(50)]
+        fq = tmp_path / "heavy.fastq"
+        fq.write_bytes(b"".join(b"@r%d\n%b\n+\n%b\n" % (i, s, b"I" * len(s))
+                                for i, s in enumerate(seqs)))
+        err = self._encode(tmp_path, [fq], "trim3", "h.zna")
+        assert "WARNING" in err and "% of encoded bases" in err, err
+
+    def test_reencoding_a_zna_claims_no_policy_ran(self, tmp_path):
+        """ZNA stores two bits per base, so a decoded record cannot contain a no-call
+        and no policy ran. Reporting "removed 0 bases" would imply one had been."""
+        rng = random.Random(14)
+        frags = simulate(rng, n_each=10)
+        in1, _in2 = write_fastqs_with_no_calls(tmp_path, frags, rng)
+        self._encode(tmp_path, [in1], "trim3", "src.zna")
+        err = self._encode(tmp_path, [tmp_path / "src.zna"], "trim3", "re.zna")
+        assert "no-calls:" not in err, err
