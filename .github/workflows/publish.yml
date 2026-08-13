@@ -6,6 +6,48 @@ on:
       - 'v*'
 
 jobs:
+  # The suite has to BLOCK the upload, not merely race it.
+  #
+  # ci.yml runs on `v*` tags now, but it is a separate workflow: nothing makes the
+  # publish job wait for it. On the 0.4.0 tag the margin was 33 seconds -- the slowest
+  # CI leg finished at 21:15:00Z and publish started at 21:15:33Z -- and which one wins
+  # is decided by runner queueing. Invert it once and a red suite publishes to PyPI,
+  # where the version number can never be reused.
+  #
+  # cibuildwheel's CIBW_TEST_COMMAND is a real gate but a narrow one: it imports the
+  # extensions on every wheel, it does not run tests/.
+  test:
+    name: Test before publishing (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two compilers most likely to disagree with a macOS dev machine. macOS is
+        # covered by ci.yml on the same commit; this job exists to gate, not to duplicate.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "scikit-build-core>=0.10" "nanobind>=2.0" pytest
+          python -m pip install . --no-build-isolation -v
+      - name: Both extensions must have built
+        run: |
+          python -c "
+          import zna
+          from zna.merge.backend import available_merge_backends
+          assert zna.is_accelerated(), 'codec extension did not load'
+          assert 'accel' in available_merge_backends(), 'merge extension did not load'
+          print('ok', zna.__version__, available_merge_backends())
+          "
+      - name: Test
+        run: python -m pytest "${{ github.workspace }}/tests" -q
+        working-directory: ${{ runner.temp }}
+
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -65,7 +107,10 @@ jobs:
         path: dist/*.tar.gz
 
   publish:
-    needs: [build_wheels, build_sdist]
+    # `test` is here so a red suite cannot reach PyPI. A version number is spent the
+    # moment it uploads -- PyPI refuses re-uploads -- so this is the one gate in the
+    # pipeline that cannot be undone by fixing it afterwards.
+    needs: [test, build_wheels, build_sdist]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     environment: release

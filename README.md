@@ -13,7 +13,7 @@
 
 - **High Compression**: 2-bit encoding (4 bases per byte) + optional Zstd compression
 - **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
-- **Minimal Dependencies**: `zstandard` only (C++ extension auto-compiled)
+- **Minimal Dependencies**: `zstandard` and `pyyaml` only (C++ extensions ship prebuilt)
 - **Flexible**: Single-end, paired-end, and interleaved reads
 - **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score, with a compiled kernel and byte-identical output on any platform
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
@@ -25,13 +25,35 @@
 ## Installation
 
 ```bash
-# From source (recommended - includes C++ acceleration)
+pip install zna
+# or
+conda install -c bioconda zna
+```
+
+Both ship prebuilt binaries with the C++ extensions already compiled — Linux, macOS
+(Intel and Apple Silicon) and Windows, on CPython 3.10–3.14. Nothing needs a compiler.
+
+**Verify both extensions loaded.** ZNA has two: the codec, and `zna merge`'s overlap
+scan. Either can be absent without an error — the pure-Python fallbacks are correct and
+about 50x slower, so a broken install looks like a slow machine rather than a mistake.
+Check it rather than assume it:
+
+```bash
+python -c "
+import zna
+from zna.merge.backend import available_merge_backends
+print('zna', zna.__version__)
+print('codec accelerated:', zna.is_accelerated())
+print('merge backends:   ', available_merge_backends())   # want 'accel' in here
+"
+```
+
+From source, for development (needs a C++17 compiler and CMake ≥ 3.15):
+
+```bash
 git clone https://github.com/mkiyer/zna.git
 cd zna
 pip install -e .
-
-# Check if C++ acceleration is available
-python -c "from zna.core import is_accelerated; print(f'Accelerated: {is_accelerated()}')"
 ```
 
 **Requirements:**
