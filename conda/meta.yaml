@@ -21,6 +21,11 @@ requirements:
   build:
     - {{ compiler('c') }}
     - {{ compiler('cxx') }}
+    # Required since conda-build's stdlib migration, and already present in the
+    # published recipe -- a PR that drops it regresses that migration. Keep it in step
+    # with upstream: this file is the source the bioconda recipe is copied FROM, so
+    # anything upstream gained and this did not comes straight back out on the next bump.
+    - {{ stdlib('c') }}
     - cmake >=3.15
     - make  # [unix]
     - llvm-tools  # [osx]
