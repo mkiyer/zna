@@ -111,7 +111,8 @@ reference and the Python API are all below.
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
 | [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — specified, not built *(0.5.0)* |
-| [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | `--npolicy trim3` and a reproducible `random` — specified, not built |
+| [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
+| [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | what is left before the 0.4.0 tag, and the traps *(maintainers)* |
 
 ---
 
