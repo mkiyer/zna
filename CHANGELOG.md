@@ -48,6 +48,19 @@ no-calls: 1110 rescued from the mate; --npolicy random then substituted   4,844 
 trim3 discards everything after each surviving no-call, so it costs 37x more sequence than
 random invents. That trade-off was previously invisible.
 
+**`zna encode` now reports its policy too**, in the same shape and with the same >1%
+warning. The same policy on the same library used to be accountable on one side of the
+merge → encode seam and silent on the other:
+
+```
+[ZNA] Done. Wrote 300 records in 0.00s.
+[ZNA] no-calls: --npolicy trim3 removed 11558 bases in 203 records.
+```
+
+Skipped when re-encoding a `.zna`, and that is not an oversight — ZNA stores two bits per
+base, so a decoded record cannot contain a no-call and no policy ran. Reporting
+"removed 0 bases" there would imply one had been applied.
+
 **Four defects fixed with it.** Measured over all 256 byte values x every policy:
 
 - **`--npolicy drop` — the default — silently wrote `A` on the compiled backend.** One
@@ -279,6 +292,40 @@ now covered by a test that fails if the defect is reintroduced.
   Also available in-process as `zna.merge.process_pair` / `zna.merge.find_overlap`,
   and as `python -m zna.merge`.
 
+- **Per-record provenance — what happened to a *read*, not just to a library.**
+
+  `zna merge` appends tokens to each emitted record's header, on all three outcomes.
+  Existing header fields are always passed through untouched — provenance is *appended*,
+  never substituted — so `--label` reads the same tags off an emitted record that it
+  would have read off the input:
+
+  ```
+  @SRR1.7  ZI:i:42 ZN:i:6 trim3_12 rescued_1 merged_90_0
+  ```
+
+  `trim3_<n>` / `subn_<n>` are bases the N policy removed or substituted, `rescued_<n>`
+  is no-calls this record recovered from its mate. A record nothing happened to is
+  emitted byte-unchanged, so a clean library pays nothing: 1,332,353 of 1,418,525
+  records on the 1M benchmark at a 1.5% no-call rate.
+
+  **`ZN:i:<bits>` is the half that survives encoding.** ZNA stores no headers, so it is
+  the only per-record provenance that reaches a corpus, and it gets there as an ordinary
+  label column — declare it and you get one byte per record, omit it and nothing changes:
+
+  ```bash
+  zna encode --interleaved --treat-unpaired-as-merged \
+             --label provenance:C:ZN -o reads.zna merged.fq.gz
+  ```
+
+  Bits: **trimmed 1, rescued 2, N-trimmed 4, N-substituted 8.** There is deliberately no
+  "merged" bit — that fact already has two homes (the `merged_` token, and
+  `IS_FULL_FRAGMENT` in the flag byte), and spending a bit on it would have put
+  ` ZN:i:1` on ~82% of emitted records to repeat them. Every bit above is one with
+  nowhere else to live; `trimmed` above all, since a trimmed pair is emitted as an
+  ordinary pair and no ZNA flag distinguishes it from one kept whole. Note
+  `IS_FULL_FRAGMENT` is set only under `--treat-unpaired-as-merged`, so an encode that
+  omits that flag records neither.
+
 ### Performance
 - **A second compiled extension, `zna.merge._accel`**, carries the whole per-pair
   path: FASTQ parsing, the overlap scan, the posterior consensus, record
@@ -437,6 +484,20 @@ now covered by a test that fails if the defect is reintroduced.
 - `zna merge` **refuses to run on the reference kernel** unless asked by name
   with `--backend python`. It is correct and ~50x slower, and a silently-correct
   50x slowdown at cluster scale is indistinguishable from a slow node.
+- **`scripts/release.sh` had two ways to produce a wrong release**, both found by
+  reading it rather than by running it:
+  - It pushed a hardcoded `main` and then tagged `HEAD`. Run from a feature
+    branch — which is where the work happens — that pushes whatever local `main`
+    points at and then tags a commit `main` does not contain. It now refuses
+    unless you are on `main`, and says how to get there.
+  - Its version bump is a no-op when `src/zna/__init__.py` is already at the
+    target, which is the normal case; `git commit` with nothing staged exits
+    non-zero, and under `set -e` that aborted the release *after* the
+    confirmation prompt and before the tag. Nothing to commit is now a normal
+    state.
+
+  `docs/RELEASING.md` gains the merge-to-`main` step, the two-environment
+  verification, and a post-publish wheel check for the two-extension collision.
 
 ## [0.3.5] - 2026-08-12
 

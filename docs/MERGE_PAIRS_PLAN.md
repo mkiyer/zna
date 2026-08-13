@@ -5,11 +5,33 @@ Status: **specified, not built.** Revision 2, written 2026-08-13 after auditing 
 this one is written from what `src/zna/cli.py`, `src/zna/core.py` and
 `src/zna/merge/` actually do, with the load-bearing claims checked by running them.
 
-Baseline at time of writing: `576 passed, 33 subtests passed` in
+Baseline at revision 3: `627 passed, 156 subtests passed` in
 `/Users/mkiyer/sw/miniforge3/envs/zna_merge` (compiled backend, `zna.is_accelerated()`
 True, `zna.merge` backend `accel`).
 
 ---
+
+## 0.0 What 0.4.0 changed under this plan — read this before §0
+
+Revision 2 was audited against the code *earlier on the same day* that the `--npolicy`
+and provenance work landed, so several of its load-bearing claims are now false. They
+are corrected here rather than quietly edited, because each one is a belief a reader of
+rev 2 would carry into the implementation.
+
+- **`--npolicy drop` no longer exists.** The policy set is `{trim3, random}`, default
+  `trim3`. Every appearance of `drop` below has been rewritten, but if you are working
+  from a rev-2 copy: `trim3` **never orphans a mate**, so the fragment-level atomicity
+  `drop` needed is gone, and the N filter no longer needs to sit inside
+  `_fragment_units` at all. `zna encode` now trims per record.
+- **`zna merge` has a full `--npolicy`.** Rev 2 said "there is no N policy anywhere in
+  `zna merge` (a grep for `npolicy` across `src/zna/merge/` returns nothing)". That was
+  true when written and is now flatly wrong — the policy runs *inside* the kernel, after
+  overlap rescue, with a coverage retry. `--merge-pairs` inherits it through `Params`
+  rather than needing an encode-side filter, which removes an ordering hazard rev 2
+  did not know it had.
+- **Per-record provenance exists**, which answers §8 item 4 below.
+- **`scripts/wheel_smoketest.py` now imports `zna.merge._accel`** and checks both
+  extensions and their collision case, so §8 item 9 is done.
 
 ## 0. Corrections to revision 1 — read this first
 
@@ -90,9 +112,11 @@ for a full-fragment record *regardless* of `IS_RC` — so the caller can own the
 span while the writer owns orientation, and the two compose.
 
 Verified by prototype: `--merge-pairs` + `--label-defs` + `--strand-normalize
---strand-specific --read2-antisense` + `--npolicy drop`, 81 records over all three
-outcomes, **100% geometry-correct against the known fragments**, with `IS_RC` correctly
-set on R2 by the writer and `preserve_normalization` never touched.
+--strand-specific --read2-antisense`, 81 records over all three outcomes, **100%
+geometry-correct against the known fragments**, with `IS_RC` correctly set on R2 by the
+writer and `preserve_normalization` never touched. (The prototype ran under the
+then-default `--npolicy drop`; the geometry it verified is independent of the policy,
+which acts on read *content*, not on flags.)
 
 ### 0.3 `--label-defs` wins the stream selection, so the combination would silently not merge — **blocker**
 
@@ -238,8 +262,12 @@ is_read2, has_start, has_end)`, and the write loop at
 `_RC_FULL_BY_ENDS`. This exists for ZNA→ZNA re-encode. `--merge-pairs` is its second
 caller — but see §0.2: it is the *shape* that is reused, not `preserve_normalization`.
 
-Note the loop already lives **inside** `for unit in _fragment_units(stream)`, which is
-what gives `--npolicy drop` (default `drop`) its pair atomicity. Keep it there.
+Note the loop already lives **inside** `for unit in _fragment_units(stream)`. Rev 2 said
+to keep it there for `--npolicy drop`'s pair atomicity; `drop` is gone and `trim3` never
+orphans a mate, so that reason has expired. Keep it there anyway, for a different and
+still-live one: `_fragment_units` is what groups mates so `_full_fragment_flags` can see
+a whole fragment, and a write loop that hoisted `carries_ends` above it would break the
+grouping (§6 test 8).
 
 ### 2.2 The merge tool already computes the one bit that matters
 
@@ -425,9 +453,10 @@ labeled   + ends:  (seq, is_paired, is_read1, is_read2, has_start, has_end, labe
 carries ends:
 
 ```python
-for unit in _fragment_units(stream):                     # keep: N-drop atomicity
-    if drop_n and any(('N' in r[0] or 'n' in r[0]) for r in unit):
-        continue
+for unit in _fragment_units(stream):                     # keep: mate grouping
+    # No fragment-level N filter here any more: `drop` is gone, and `trim3` cuts per
+    # record because trimming never orphans a mate. Under `--merge-pairs` the policy
+    # has already run inside the kernel, so this path sees no no-calls at all.
     if carries_ends:
         for rec in unit:
             is_rc, is_full = _RC_FULL_BY_ENDS[(2 if rec[4] else 0) | (1 if rec[5] else 0)]
@@ -645,10 +674,12 @@ In the order they should be written.
    `--threshold-merge 28` and at `60`; assert the merged-record count changes. A
    parameter that is parsed and then never reaches `MergeParams` is invisible to every
    other test here.
-8. **`test_merge_pairs_pair_atomicity`** — `--npolicy drop` on a pair whose mate has an
-   N drops both, never one. **Note what this actually tests.** Rev 1 called it "C3 at
-   the encode seam"; it is not. There is no N policy anywhere in `zna merge` (a grep for
-   `npolicy` across `src/zna/merge/` returns nothing) — C3 is the merger's own
+8. **`test_merge_pairs_mate_grouping`** — a pair emitted by the kernel is grouped as one
+   fragment by `_fragment_units`. **Note what this actually tests.** Rev 1 called it "C3
+   at the encode seam" and rev 2 called it `pair_atomicity` and drove it with
+   `--npolicy drop`; both are now wrong. `drop` is gone, and `zna merge` *does* have an
+   N policy (rev 2 said it did not) — but that policy is `trim3`, which never orphans a
+   mate, so there is no atomicity left to test at this seam. C3 is the merger's own
    all-or-nothing `min_read_length` rule at
    [merge_core.hpp:496-502](../src/zna/merge/merge_core.hpp#L496-L502), and it is
    already covered. What this test pins is that the new strategy sets
@@ -769,11 +800,12 @@ the case and it has not been measured yet.
    comparison of label values is not automatically apples to apples.
 8. **A pair can emit zero records** (both mates, or a merged read, below
    `--min-read-length`; counted as `frags_short`). The adapter's `for i < r.n_recs` loop
-   handles it naturally, but the pair-atomicity test and the stats block both need to
-   distinguish "dropped by the merger" from "dropped by `--npolicy`".
-9. **`scripts/wheel_smoketest.py` never imports `zna.merge._accel`** — it asserts only
-   the codec backend. It therefore catches merge-overwrites-codec but not the reverse,
-   nor the merge target failing to build on a platform. Cheap to add while nearby.
+   handles it naturally. Rev 2 added "distinguish dropped-by-the-merger from
+   dropped-by-`--npolicy`" — under `--merge-pairs` there is now only one dropper, since
+   the policy runs inside the kernel and its losses are already in `npolicy_bases`.
+9. ~~**`scripts/wheel_smoketest.py` never imports `zna.merge._accel`**~~ — **done in
+   0.4.0.** It now asserts both extensions load *and* that neither target overwrote the
+   other, so a wheel missing the merge kernel fails before publication.
 10. **A merged record can be twice a read long, and encode's only length check is a
     *maximum*.** There is no minimum-length filter anywhere in encode — `--min-read-length`
     is the sole floor on this path, which is another reason it must be mirrored. The
@@ -834,16 +866,25 @@ columnar fast path or §3.6's threading.
    `gather/tools/read_merge.py` consumes these blocks and may key on it. Recommend
    keeping every existing key, setting `"tool": "zna-encode --merge-pairs"`, and
    checking `read_merge.py` before landing.
-2. **Counting.** `--merge-json` counts records the *merger* emitted; `--npolicy drop`
-   (default) then drops fragments afterwards, so `emitted_records` will not equal the
-   records in the `.zna`. Add a separate `records_written`, or document the difference.
+2. **Counting.** `--merge-json` counts records the *merger* emitted. Rev 2's reason for
+   the gap (`--npolicy drop` dropping fragments afterwards) is gone with `drop`, and on
+   the one-step path the policy runs inside the kernel, so `emitted_records` *should*
+   equal the records in the `.zna`. Assert that rather than documenting a difference —
+   it is now a real invariant, and a cheap one to check.
 3. **Two `.zna` inputs write a 0-record file at exit 0.** Verified: `zna encode a.zna
    b.zna` takes the two-file branch (the ZNA check is `len(files) == 1`), hands binary
    to the FASTQ parser, and succeeds with 0 records. It does warn — but only about
    *format inference*, not about the real problem. Pre-existing and unrelated to this
    change; found while enumerating the reject matrix, and worth a one-line guard beside
    the new ones.
-4. **No provenance in the container.** The ZNA header has no field distinguishing a
-   `--merge-pairs` corpus from a two-step one, and §7 asks for exactly that comparison.
-   If khorana wants to tell them apart after the fact, it needs a header field or a
-   `--description` convention — decide before the rebuild, not after.
+4. **No provenance in the container**, at the *file* level. Still true and still worth
+   deciding before the rebuild: the ZNA header has no field distinguishing a
+   `--merge-pairs` corpus from a two-step one, so telling them apart after the fact
+   needs a header field or a `--description` convention.
+
+   *Per-record* provenance is no longer missing — 0.4.0 added the `ZN:i:<bits>` tag and
+   its optional `C` column (`docs/NPOLICY_PLAN.md` D5). `--merge-pairs` must write the
+   same `PROV_*` bits directly off `PairResult`, with no tag round-trip, and a test
+   should assert the one-step and two-step provenance columns agree — which is the
+   sharpest available version of the §7 comparison, since it comes per record rather
+   than per run.
