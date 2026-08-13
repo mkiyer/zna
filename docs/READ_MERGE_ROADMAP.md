@@ -28,8 +28,13 @@ ranked against those two, and (1) beats (2) whenever they conflict.
 | M3 — statistics reach the cohort; provenance recorded | **done** (2026-08-12) |
 | M4 — intermediate size and pool scaling | **done**; raw-blob IPC deferred, see R7 |
 | M5 — freeze, then MOVE to the zna package | **done** (2026-08-12) |
-| M6 — numba → C++ | **done** (0.4.0); [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) |
-| M7 — `zna encode --merge-pairs` | **next** |
+| M6 — numba → C++ | **done**; [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) |
+| M7 — benchmark against fastp on ground truth | **next**, and it gates the 0.4.0 tag |
+| M8 — `zna encode --merge-pairs` | after M7, also in 0.4.0 |
+
+**Everything through M6 is committed and unreleased.** `main` is ahead of `origin/main`
+and nothing is tagged; `v0.3.5` is still the latest tag. The remaining path to the 0.4.0
+tag is §"Remaining work" at the end of this document.
 
 **M6 and M7 swapped order (2026-08-12).** The C++ design was measured first and the
 measurement changed the sequencing: at `--processes 8` the merge computation already
@@ -388,3 +393,73 @@ measurements corrected along the way.
    test must be **order-independent** (assert the returned shift is *an* argmax with
    matching n/d/score): ties occur on 0.845% of real pairs, and an order-replicating
    reference would break on exactly the SIMD rewrite it exists to guard.
+
+---
+
+## Remaining work to the 0.4.0 tag
+
+In order. Nothing here is blocked on anything outside this repo.
+
+### 1. Histogram bins, and one redundant JSON key  *(small)*
+
+`fastq_chunk.hpp` clamps all three histograms at `HIST_MAX = 1024`, so with reads longer
+than that the length and insert distributions silently aggregate into the last bin.
+Since read length is otherwise uncapped (see below), **grow the three dense arrays with
+the `Scratch` arena** — a merged record is at most `len1 + len2`, so `2 * cap + 1` bins
+suffice. Not a sparse dict: that puts a hash lookup in the per-record path, where a
+dense index is one instruction. Wants a test at a read length past 1024.
+
+While there: `insert_size_censoring.floor` duplicates `params.min_read_length`. Drop it
+or document it as a convenience copy.
+
+### 2. Benchmark against fastp on simulated ground truth  *(the big one)*
+
+Fully specified in [MERGE_BENCHMARK_PLAN.md](MERGE_BENCHMARK_PLAN.md). **This gates the
+tag.** Everything verified so far proves the tool matches *itself*; nothing has checked
+whether its answers are *true*. In particular contract C1/C2 — base 0 of every emitted
+read is a real fragment boundary — has only ever been checked against the tool's own
+inferences, and independent truth can check it properly.
+
+### 3. `zna encode --merge-pairs`  *(in 0.4.0, after the benchmark)*
+
+Merging becomes an input strategy feeding the geometry-carrying 6-tuple path that
+already exists for ZNA→ZNA re-encode (`cli.py`, `_flags_from_ends`). The C++ core is
+already I/O-agnostic for exactly this: `merge_core.hpp` knows nothing about FASTQ, and
+`fastq_chunk.hpp` is one adapter over it — the second adapter emits records instead of
+text (see [MERGE_CPP_DESIGN.md](MERGE_CPP_DESIGN.md) §7.2).
+
+Deletes the FASTQ intermediate, its pigz write, its gzip read and its full re-parse —
+which is most of what remains, since the tool is now I/O bound (0.42 µs/pair of compute
+against 1.40 end to end). Also deletes the `/1`,`/2`-suffix re-pairing and the need for
+`--treat-unpaired-as-merged`, since the geometry is passed in process.
+
+Deliberately **after** the benchmark: if the merger has an accuracy problem, fix it
+before wiring it into the encoder.
+
+### 4. Ship
+
+- `scripts/release.sh 0.4.0` — tags, pushes, and triggers the PyPI publish. Irreversible.
+- `scripts/update-conda-sha.sh 0.4.0` — `conda/meta.yaml` is already at 0.4.0 but its
+  `sha256` still points at the 0.3.5 tarball, which is the documented order.
+- Consider pushing `main` without a tag first, so CI runs the suite before anything is
+  published.
+- **The history contains a `0.3.6` that will never exist** (commit `b312c19`), renumbered
+  to 0.4.0 in phase F. The tree is correct and no tag was cut; decide whether to squash
+  that detour before pushing or leave it as honest history.
+
+## Beyond 0.4.0
+
+- **0.4.1 — x86 tuning.** Every measurement behind the C++ kernel is aarch64/NEON. The
+  SSE2 path is written but **has never executed**. Confirm it, evaluate AVX2, and re-tune
+  the bail granularity, which is a hardware property (32 bases won on Apple silicon).
+  Specified in [FUTURE.md](FUTURE.md); `scripts/merge_bench/bench_simd.cpp` builds every
+  variant.
+- **Faster inflate.** Decompression is the floor at 1.42 µs/pair against 1.40 end to end.
+  libdeflate or ISA-L inside the extension would move it — but `--merge-pairs` may moot
+  it first by deleting the intermediate.
+- **hulkrna.** Only after a zna release ships: repin `workflow/envs/read_merge.yaml`,
+  switch `rigel_read_merge` to `zna merge` (note `--processes` is now `--threads`, and
+  `--length-required` is gone), delete `scripts/hulkrna-merge`, `lib/hulkrna/merge/` and
+  the two test files. Keep one test that the *rule* invokes the tool correctly. The JSON
+  key `numba` is now `backend`, which `gather/tools/read_merge.py` will pick up as a new
+  string field once its filter accepts `str`.
