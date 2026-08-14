@@ -134,6 +134,23 @@ Do this **after** the PyPI release is live and the GitHub tag exists.
 >
 > **Always overwrite `recipes/zna/meta.yaml` wholesale with this repo's
 > `conda/meta.yaml`.** Never hand-edit just the hash.
+>
+> **And do it before the bot's PR goes green.** On 0.4.0 it did not work out that way:
+> the tag had been re-cut, so the bot's hash was stale and CI was failing — then the bot
+> re-ran autobump on its own, force-pushed the corrected hash, and that push retriggered
+> CI. It went green, and because `@BiocondaBot please add label` had already put
+> "please review & merge" on it, a maintainer merged it within the hour. Adding that
+> label is a request to merge on green: **do not add it until the recipe body is the one
+> you want shipped.**
+
+#### Fixing a recipe after it has merged
+
+The recipe changed but the source did not, so bump `build: number` and submit again.
+Bioconda accepts this routinely; it rebuilds and republishes the same version.
+
+**The bump belongs only in the bioconda copy, not in `conda/meta.yaml` here.** This
+file is the template for the *next* version, where the number resets to 0. Keep it at 0
+and bump it as you copy.
 
 ### Update the SHA256 hash
 
