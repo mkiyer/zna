@@ -58,7 +58,7 @@ if [ "$(head -c 2 "${TMP_FILE}" | xxd -p)" != "1f8b" ]; then
 fi
 
 SHA256=$(shasum -a 256 "${TMP_FILE}" | cut -d' ' -f1)
-CURRENT=$(grep -E '^\s*sha256:' "$META" | head -1 | awk '{print $2}')
+CURRENT=$(grep -E '^[[:space:]]*sha256:' "$META" | head -1 | awk '{print $2}')
 
 echo ""
 echo "✅ SHA256: ${SHA256}"
@@ -82,7 +82,7 @@ fi
 # Exactly one sha256 line must exist, because the rewrite below is a blanket
 # substitution. If the recipe ever grows a second source, this is the guard that
 # stops both being overwritten with the same hash.
-N=$(grep -cE '^\s*sha256:' "$META")
+N=$(grep -cE '^[[:space:]]*sha256:' "$META")
 if [ "$N" -ne 1 ]; then
     echo "❌ Expected exactly one sha256: line in ${META}, found ${N}."
     echo "   Refusing to rewrite; update it by hand."
@@ -97,11 +97,15 @@ fi
 echo "📝 Updating ${META}..."
 echo "   ${CURRENT}"
 echo "-> ${SHA256}"
-sed -i.bak -E "s|^(\s*)sha256:.*|\1sha256: ${SHA256}|" "$META"
+# POSIX class, not \s: BSD sed (the macOS default) has no \s in ERE and treats it as a
+# literal 's', so this pattern silently matched nothing on the maintainer's own machine
+# while working fine under GNU sed on Linux. BSD *grep* does accept \s, which is why the
+# reads below looked correct and only the rewrite failed. The verify block caught it.
+sed -i.bak -E "s|^([[:space:]]*)sha256:.*|\1sha256: ${SHA256}|" "$META"
 rm -f "${META}.bak"
 
 # Confirm the edit actually landed, rather than trusting sed.
-WROTE=$(grep -E '^\s*sha256:' "$META" | head -1 | awk '{print $2}')
+WROTE=$(grep -E '^[[:space:]]*sha256:' "$META" | head -1 | awk '{print $2}')
 if [ "$WROTE" != "$SHA256" ]; then
     echo "❌ Rewrite did not take: ${META} still says ${WROTE}"
     exit 1

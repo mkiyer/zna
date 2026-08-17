@@ -8,6 +8,24 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
+## [Unreleased]
+
+### Fixed — `update-conda-sha.sh` silently rewrote nothing on macOS
+
+The rewrite used `sed -E "s|^(\s*)sha256:.*|…|"`. **BSD sed — the macOS default — has no
+`\s` in ERE and treats it as a literal `s`**, so the pattern required the line to *begin*
+with the letter s and matched nothing on a normally-indented recipe. GNU sed on Linux
+accepts `\s`, so it worked everywhere except the machine releases are actually cut from.
+
+BSD *grep* does accept `\s`, which is what made this confusing: every read in the script
+(the current hash, the one-sha256-line guard, the post-write verify) found the line
+correctly, and only the write failed. Now `[[:space:]]` throughout.
+
+Caught by the script's own post-write verify — the check added in 0.4.0 for exactly this,
+"confirm the edit actually landed rather than trusting sed". Without it the recipe would
+have gone to bioconda carrying 0.4.0's hash under 0.4.1's version, and bioconda CI would
+have been the first thing to notice.
+
 ## [0.4.1] - 2026-08-17
 
 > **This is a patch release that breaks the on-disk format.** That is deliberate and it
