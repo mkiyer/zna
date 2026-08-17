@@ -2,8 +2,65 @@
 
 All notable changes to the ZNA project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
+version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) —
+**except that ZNA is alpha and has broken the on-disk format in a patch release** (0.4.1)
+rather than hold the change. Read the notes, not the number: a release that breaks your
+files says so in its first paragraph.
+
+## [0.4.1] - 2026-08-17
+
+> **This is a patch release that breaks the on-disk format.** That is deliberate and it
+> is not what the version number would normally tell you: ZNA is alpha, has no legacy
+> support to keep, and the release number was chosen over the convention. Read the next
+> section before upgrading — **every existing `.zna` file must be re-encoded from
+> FASTQ**, and any downstream consumer reading them (hulkrna, khorana) will hit the
+> version error on first contact rather than reading anything.
+
+### Changed — blocks are fragment-complete (breaking; format version 3)
+
+**A fragment's reads are now stored consecutively, R1 immediately followed by R2, and
+never span a block boundary.** A block is therefore a self-contained set of molecules,
+and any subset of blocks decodes independently of the rest of the file. That is the
+premise `blocks(stride=…)` sharding and every block-parallel consumer was already
+written against; until now the format did not actually provide it.
+
+- **The on-disk version is 3, and version 2 files are refused** with an error that says
+  why. They can hold split fragments, so they cannot be read as though they cannot.
+  Re-encode from FASTQ.
+- **`ZnaWriter` enforces the contract on every write path** — `write_record`,
+  `write_records` (both modes), and `write_copy`. A paired R1 not followed by its R2, an
+  R2 with no R1 in front of it, or a stream ending on an R1 raises `ValueError` naming
+  the record. `zna encode` and `zna shuffle` already grouped their output this way, so
+  no CLI behaviour changes; direct API callers writing half fragments now find out.
+- Unpaired and merged reads are one-record fragments and need nothing special.
+
+**What was wrong.** The writer held a block open for a pending R1 only when the header
+asked for *unstranded* strand normalization, where the codec's pair detection requires
+it. Every other configuration — no normalization, stranded normalization, the bulk
+`write_records` path, and the `write_copy` path that `zna shuffle` and ZNA → ZNA
+re-encode run through — split fragments freely. Measured at the default 4 MiB block
+size over 600k pairs of varied length: **44% of blocks ended mid-fragment.** Fixed-length
+reads hid it completely, because a constant per-record size estimate lands every
+boundary on an even record count.
+
+**Two defects fixed along the way.**
+
+- *Unbounded memory.* The old deferral was not bounded: it held the block open without
+  requiring the mate to arrive, so a run of consecutive paired R1s buffered the entire
+  stream and wrote nothing. Fifty thousand such records produced a 16-byte file — the
+  header alone — with every record still in memory. Enforcing the contract bounds the
+  hold at one record, because a fragment is at most two records long.
+- *Backend divergence.* For a pair split across blocks under unstranded normalization,
+  the Python codec gave the orphaned R2 its own coin flip and the C++ codec gave it
+  none, so the two backends would have written different files. Unreachable in practice
+  only because that was exactly the case the deferral prevented. Both backends now share
+  one rule and raise if a paired R1's mate is not in the block.
+
+Dead code removed: the second arm of the old deferral in `write_record` was unreachable
+(the size estimate grows monotonically until a flush zeroes it, so it could not be below
+`block_size` while an R1 was pending). Verified across 160k records over the config
+matrix before deleting.
 
 ## [0.4.0] - 2026-08-13
 

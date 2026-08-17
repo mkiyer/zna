@@ -4,8 +4,10 @@
 > They were measured in March 2026 against the 0.3.x codec, before the 0.3.4
 > rewrite roughly doubled decode and cut encode substantially. The dataset is a
 > real 10.76 GB library that is not reproducible here, so the numbers are left
-> as recorded rather than guessed at; the compression figures are unaffected
-> (the on-disk format did not change).
+> as recorded rather than guessed at; the compression figures still hold. Format
+> version 3 changed only *which* record lands in which block — a block now ends
+> where a fragment does, so it overruns its size target by at most one record —
+> and left the block payload's layout untouched.
 >
 > For current throughput see the table in [`../README.md`](../README.md), and
 > [`../CHANGELOG.md`](../CHANGELOG.md) for the per-path deltas.

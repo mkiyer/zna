@@ -10,7 +10,9 @@ algorithms work is [METHODS.md](METHODS.md).
 
 ## Scheduled
 
-### 0.4.1 — x86 tuning for the merge kernel
+### 0.4.2 — x86 tuning for the merge kernel
+
+*(Was scheduled for 0.4.1, which went to the format-version-3 break instead.)*
 
 The scan uses a byte-wise 16-byte vector comparison, which is baseline on every target:
 NEON on aarch64, SSE2 on x86-64 — no `-march` flag, no runtime dispatch. That is
@@ -74,6 +76,11 @@ pinning an evaluation set that must not vary between runs.
 through without decoding, rewriting only block headers. Record granularity needs a
 decode/re-encode pass. Start with blocks, and treat `--records N` as rounding to whole
 blocks. Both require a shuffled input to be statistically meaningful.
+
+Since format version 3 a block holds whole fragments, so the block-granular path cannot
+orphan a mate and needs no fragment logic of its own — it copies payloads and is done.
+The record-granular path would have to group mates itself, which is the second reason to
+start with blocks.
 
 ### Stored block index (sidecar)
 

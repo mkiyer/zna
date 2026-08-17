@@ -259,9 +259,9 @@ class TestLabeledHeader(unittest.TestCase):
                 r = ZnaReader(fh)
                 self.assertEqual(r.header.labels[0].missing, 0)
 
-    def test_version_is_2(self):
-        """The on-disk version byte should be 2."""
-        h = ZnaHeader(read_group="v2")
+    def test_version_is_3(self):
+        """The on-disk version byte should be 3."""
+        h = ZnaHeader(read_group="v3")
         with tempfile.TemporaryDirectory() as d:
             path = f"{d}/test.zna"
             with open(path, "wb") as fh:
@@ -271,7 +271,7 @@ class TestLabeledHeader(unittest.TestCase):
                 fixed = fh.read(_FILE_HEADER_SIZE)
                 vals = struct.unpack(_FILE_HEADER_FMT, fixed)
                 self.assertEqual(vals[0], _MAGIC)
-                self.assertEqual(vals[1], 2)  # version byte
+                self.assertEqual(vals[1], 3)  # version byte
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +546,10 @@ class TestWriterReaderLabels(unittest.TestCase):
             labels=defs,
         )
         original_seq = "AAAACCCC"
+        # Both mates: a fragment is atomic, and the label under test rides on the R1.
         records_in = [
             (original_seq, True, True, False, (42,)),
+            ("TTTTGGGG", True, False, True, (43,)),
         ]
         with tempfile.TemporaryDirectory() as d:
             path = f"{d}/test.zna"
@@ -558,9 +560,10 @@ class TestWriterReaderLabels(unittest.TestCase):
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 recs = list(reader.records(restore_strand=True))
-        self.assertEqual(len(recs), 1)
+        self.assertEqual(len(recs), 2)
         self.assertEqual(recs[0][0], original_seq)
         self.assertEqual(recs[0][4], (42,))
+        self.assertEqual(recs[1][4], (43,))
 
     def test_int64_uint64_labels(self):
         """Test 8-byte integer labels."""

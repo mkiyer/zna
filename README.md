@@ -15,6 +15,7 @@
 - **Ultra-Fast I/O**: C++ accelerated encode/decode with block-based architecture
 - **Minimal Dependencies**: `zstandard` and `pyyaml` only (C++ extensions ship prebuilt)
 - **Flexible**: Single-end, paired-end, and interleaved reads
+- **Block-Parallel**: fragments never split across blocks, so any subset of blocks decodes independently — shard a file by block without splitting a pair
 - **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score, with a compiled kernel and byte-identical output on any platform
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
@@ -134,7 +135,7 @@ reference and the Python API are all below.
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
 | [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — specified, not built *(0.5.0)* |
 | [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
-| [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | what 0.4.0 shipped, what is next, and the build traps *(maintainers)* |
+| [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | a record of the 0.4.0 release; its build traps and ground-truth notes are still current *(maintainers)* |
 
 ---
 
@@ -147,9 +148,10 @@ ZNA files use a binary format optimized for nucleic acid sequences:
 - **File Extension**: `.zna` (for both compressed and uncompressed files)
 - **Default Compression**: Zstd level 9 (use `--uncompressed` to disable)
 - **Magic Number**: `ZNA\x1A` (4 bytes)
-- **Version**: 2 (1 byte)
+- **Version**: 3 (1 byte)
 - **2-bit Encoding**: A=00, C=01, G=10, T=11
 - **Block Structure**: Columnar blocks, compressed as one Zstd frame each
+- **Fragment-complete blocks**: a fragment's reads are consecutive and never split
 - **Metadata**: Read groups, descriptions, and custom information
 
 ### File Structure
@@ -158,7 +160,7 @@ ZNA files use a binary format optimized for nucleic acid sequences:
 ┌─────────────────────────────────────────┐
 │  File Header (15 bytes fixed)           │
 │   - Magic "ZNA\x1A" (4 bytes)           │
-│   - Version = 2 (1 byte)                │
+│   - Version = 3 (1 byte)                │
 │   - Sequence length width (1 byte)      │
 │   - Flags (1 byte)                      │
 │   - Compression method (1 byte)         │
@@ -195,6 +197,16 @@ skip label columns.
 **The file header stores no record or block count.** Each *block* header carries
 its own count, so totals come from walking the block chain — see
 [`block_index()`](#sizing-a-file-before-reading-it-block_index).
+
+**A block holds whole fragments.** A fragment's reads are stored consecutively,
+R1 immediately followed by R2, and never span a block boundary — so a block is a
+self-contained set of molecules, and any subset of blocks decodes independently
+of the rest of the file. That is what makes block sharding
+([`blocks(stride=…)`](#batch-reading-with-blocks)) and every block-parallel
+consumer sound: a worker never receives one mate of a pair whose other mate went
+to a different worker. `ZnaWriter` enforces it on write, so it is a property of
+every ZNA file rather than one that happens to hold. Blocks are flushed on an
+estimated byte size, so a block overruns `--block-size` by at most one record.
 
 ### Record Format
 
@@ -419,6 +431,13 @@ edge of the stored sequence is a true fragment boundary. Use it rather than
 inferring from the mate number: under unstranded normalization ZNA
 reverse-complements one mate per pair *at random*, so the boundary edge is a
 per-record fact, not a property of R1 versus R2.
+
+**A block holds whole fragments.** Paired reads sit consecutively, R1 then R2,
+and a fragment never straddles a block boundary — so a worker handed a block
+never sees one mate of a pair whose other mate went to a different worker. This
+is a guarantee of the format, enforced by `ZnaWriter` on every write path, not a
+property that happens to hold for a given file. It is what makes block-parallel
+consumers safe to write at all.
 
 `stride`/`offset` shard **by block**, and — the point — seek past the blocks
 this shard does not want instead of decoding and discarding them:
@@ -1297,6 +1316,14 @@ with open("output.zna", "wb") as f:
         writer.write_record("TGCATGCA", is_paired=False,
                           is_read1=False, is_read2=False)
 
+# Paired reads: write the fragment whole, R1 immediately followed by R2.
+with open("paired.zna", "wb") as f:
+    with ZnaWriter(f, header) as writer:
+        writer.write_record("ACGTACGT", is_paired=True,
+                          is_read1=True, is_read2=False)     # R1
+        writer.write_record("TGCATGCA", is_paired=True,
+                          is_read1=False, is_read2=True)     # its R2
+
 # Reading
 with open("output.zna", "rb") as f:
     reader = ZnaReader(f)
@@ -1312,6 +1339,13 @@ with open("output.zna", "rb") as fin, open("copy.zna", "wb") as fout:
         for rec in reader.copy_records():
             writer.write_copy(rec)
 ```
+
+**The writer requires whole fragments.** A paired R1 must be followed immediately
+by its R2 — on `write_record`, `write_records`, and `write_copy` alike — and the
+stream may not end on an R1. Anything else raises `ValueError` naming the record.
+This is what lets the writer keep every fragment inside one block, which the
+`blocks()` sharding above depends on. Unpaired and merged reads are one-record
+fragments and need nothing special.
 
 `records()` yields a 4-tuple, or a 5-tuple ending in `labels` for labeled files.
 Two options change what it yields:

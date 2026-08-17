@@ -55,9 +55,11 @@ import sys
 import unittest
 
 from zna.core import (
+    CLOSES_FRAGMENT,
     COMPRESSION_NONE,
     COMPRESSION_ZSTD,
     FLAG_FIELDS,
+    OPENS_FRAGMENT,
     _BLOCK_HEADER_FMT,
     _BLOCK_HEADER_SIZE,
     ZnaHeader,
@@ -76,7 +78,7 @@ SEED = int(os.environ.get("ZNA_FUZZ_SEED", "20260811"))
 ITERS = int(os.environ.get("ZNA_FUZZ_ITERS", "1"))
 
 #: Small enough that every fuzz file spans several blocks, so block boundaries,
-#: the paired-R1 flush deferral, and multi-block decode are all on the hot path.
+#: the fragment-boundary flush rule, and multi-block decode are all on the hot path.
 BLOCK_SIZE = 512
 
 BACKENDS = tuple(available_backends())
@@ -167,8 +169,14 @@ def gen_records(rng: random.Random, layout: str, n: int, seq_len_bytes: int,
                 *, allow_n: bool, allow_lower: bool) -> list[tuple]:
     """Build ``(seq, is_paired, is_read1, is_read2, is_full_fragment)`` records.
 
-    Paired records are emitted strictly as adjacent R1/R2, which is what the
-    unstranded normalizer requires to pick exactly one mate per fragment.
+    Paired records are emitted strictly as adjacent R1/R2, which is the writer's
+    fragment contract and what the unstranded normalizer requires to pick exactly one
+    mate per fragment.
+
+    *n* is therefore a floor, not an exact count: a layout that emits pairs overshoots
+    it by one when *n* is odd.  Truncating back to *n* is what this used to do, and it
+    cut the R2 off the last pair — generating, on every odd *n*, exactly the half
+    fragment these tests exist to prove cannot be written.
     """
     lengths = _LENGTHS[seq_len_bytes]
     recs: list[tuple] = []
@@ -195,7 +203,7 @@ def gen_records(rng: random.Random, layout: str, n: int, seq_len_bytes: int,
                 recs.append(one(True, False, True))
             else:
                 recs.append(one(False, False, False, is_full=rng.random() < 0.5))
-    return recs[:n]
+    return recs
 
 
 _LABEL_RANGES = {
@@ -1242,6 +1250,280 @@ class TestDecoderMemory(FuzzCase):
             after - before, 1000,
             f"decode_block_labeled leaked {after - before} allocated blocks",
         )
+
+
+# ---------------------------------------------------------------------------
+# Fragment integrity
+# ---------------------------------------------------------------------------
+
+def assert_blocks_are_fragment_complete(testcase, data, ctx=""):
+    """Every block holds whole fragments, R1 immediately followed by R2.
+
+    This is the property that makes :meth:`ZnaReader.blocks` a parallelism primitive:
+    a consumer handed one block sees entire molecules, and never half of one whose
+    other half is in a block some other worker got.
+    """
+    n_blocks = 0
+    for seqs, flags in ZnaReader(io.BytesIO(data)).blocks():
+        n_blocks += 1
+        expect_mate = False
+        for i, flag in enumerate(flags):
+            testcase.assertEqual(
+                CLOSES_FRAGMENT[flag], expect_mate,
+                f"{ctx} block {n_blocks - 1} record {i}: flags=0x{flag:02x} cannot "
+                f"follow {'a paired R1' if expect_mate else 'a completed fragment'}",
+            )
+            expect_mate = OPENS_FRAGMENT[flag]
+        testcase.assertFalse(
+            expect_mate,
+            f"{ctx} block {n_blocks - 1} ends on a paired R1: its mate is in the "
+            f"next block, so the two blocks cannot be processed independently",
+        )
+    return n_blocks
+
+
+class TestFragmentIntegrity(FuzzCase):
+    """A fragment's reads are consecutive, R1 then R2, and never span a block.
+
+    The writer used to hold a block open for a pending R1 only under *unstranded*
+    normalization, where the codec's pair detection needs it; every other
+    configuration split roughly half its block boundaries mid-fragment.  Read
+    lengths hid it: with fixed-length records the per-record size estimate is
+    constant, so boundaries land on even record counts and no pair ever splits.
+    These files therefore use varied lengths on purpose.
+    """
+
+    def _pairs(self, rng, n):
+        """``n`` fragments of paired reads, at lengths that put a boundary anywhere."""
+        recs = []
+        for _ in range(n):
+            for is_read1 in (True, False):
+                recs.append((gen_seq(rng, rng.randint(1, 200), allow_n=False,
+                                     allow_lower=False),
+                             True, is_read1, not is_read1, False))
+        return recs
+
+    def test_every_write_path_keeps_fragments_whole(self):
+        """write_record, write_records (both modes), and write_copy alike."""
+        rng = random.Random(SEED + 41)
+        for backend in BACKENDS:
+            for strand_cfg in STRAND_CONFIGS:
+                for block_size in (64, 512, 4096):
+                    ctx = (f"backend={backend} strand={strand_cfg} "
+                           f"block_size={block_size}")
+                    recs = self._pairs(rng, 120)
+                    with force_backend(backend), self.subTest(ctx):
+                        header = make_header(2, strand_cfg, COMPRESSION_ZSTD)
+
+                        buf = io.BytesIO()
+                        with ZnaWriter(buf, header, block_size=block_size) as w:
+                            for seq, ip, r1, r2, full in recs:
+                                w.write_record(seq, ip, r1, r2, is_full_fragment=full)
+                        one_at_a_time = buf.getvalue()
+                        n = assert_blocks_are_fragment_complete(
+                            self, one_at_a_time, f"write_record {ctx}")
+                        self.assertGreater(
+                            n, 1, f"{ctx}: single-block file proves nothing")
+
+                        buf = io.BytesIO()
+                        with ZnaWriter(buf, header, block_size=block_size) as w:
+                            w.write_records([r[:4] for r in recs])
+                        assert_blocks_are_fragment_complete(
+                            self, buf.getvalue(), f"write_records {ctx}")
+
+                        # And the two copy paths, fed from the file just written.
+                        src = ZnaReader(io.BytesIO(one_at_a_time))
+                        buf = io.BytesIO()
+                        with ZnaWriter(buf, src.header, block_size=block_size,
+                                       preserve_normalization=True) as w:
+                            for rec in src.copy_records():
+                                w.write_copy(rec)
+                        assert_blocks_are_fragment_complete(
+                            self, buf.getvalue(), f"write_copy {ctx}")
+
+                        src = ZnaReader(io.BytesIO(one_at_a_time))
+                        buf = io.BytesIO()
+                        with ZnaWriter(buf, src.header, block_size=block_size,
+                                       preserve_normalization=True) as w:
+                            w.write_records(
+                                list(src.records(with_rc=True)))
+                        assert_blocks_are_fragment_complete(
+                            self, buf.getvalue(), f"write_records/copy {ctx}")
+
+    def test_holds_across_the_layout_matrix(self):
+        """Singles and merged reads interleaved with pairs, at every width."""
+        rng = random.Random(SEED + 42)
+        for backend in BACKENDS:
+            for seq_len_bytes in (1, 2, 4):
+                for layout in LAYOUTS:
+                    ctx = f"backend={backend} slb={seq_len_bytes} layout={layout}"
+                    recs = gen_records(rng, layout, 300, seq_len_bytes,
+                                       allow_n=False, allow_lower=False)
+                    with force_backend(backend), self.subTest(ctx):
+                        header = make_header(seq_len_bytes, STRAND_CONFIGS[4],
+                                             COMPRESSION_ZSTD)
+                        buf = io.BytesIO()
+                        with ZnaWriter(buf, header, block_size=BLOCK_SIZE) as w:
+                            for seq, ip, r1, r2, full in recs:
+                                w.write_record(seq, ip, r1, r2, is_full_fragment=full)
+                        assert_blocks_are_fragment_complete(self, buf.getvalue(), ctx)
+
+    def test_a_block_overruns_by_at_most_one_record(self):
+        """Holding a block open for an R2 is bounded, so memory is too.
+
+        The old code deferred without enforcing the contract, so a run of paired R1s
+        buffered the whole stream and wrote nothing.  Enforcing it caps the overrun at
+        one record, because a fragment is at most two records long.
+        """
+        rng = random.Random(SEED + 43)
+        header = make_header(2, STRAND_CONFIGS[0], COMPRESSION_ZSTD)
+        buf = io.BytesIO()
+        block_size = 1024
+        with ZnaWriter(buf, header, block_size=block_size) as w:
+            for seq, ip, r1, r2, _full in self._pairs(rng, 400):
+                w.write_record(seq, ip, r1, r2)
+        index = ZnaReader(io.BytesIO(buf.getvalue())).block_index()
+        self.assertGreater(len(index), 4)
+        for b in index[:-1]:                      # the last block is a partial
+            self.assertLessEqual(
+                b.n_records * 2, block_size,
+                f"block {b.index} holds {b.n_records} records, far past the "
+                f"{block_size}-byte target: the flush is not bounded",
+            )
+
+    def test_shuffle_output_is_fragment_complete(self):
+        """`zna shuffle` permutes fragments, so its output must satisfy this too."""
+        import tempfile
+        from zna._shuffle import shuffle_zna
+
+        rng = random.Random(SEED + 44)
+        recs = gen_records(rng, "mixed", 3000, 2, allow_n=False, allow_lower=False)
+        header = make_header(2, STRAND_CONFIGS[4], COMPRESSION_ZSTD)
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = f"{d}/in.zna", f"{d}/out.zna"
+            with open(src, "wb") as fh:
+                with ZnaWriter(fh, header, block_size=2048) as w:
+                    for seq, ip, r1, r2, full in recs:
+                        w.write_record(seq, ip, r1, r2, is_full_fragment=full)
+            shuffle_zna(src, dst, seed=1, buffer_bytes=1 << 16,
+                        block_size=2048, tmp_dir=d, quiet=True)
+            with open(dst, "rb") as fh:
+                data = fh.read()
+        n = assert_blocks_are_fragment_complete(self, data, "shuffled")
+        self.assertGreater(n, 1, "shuffled output landed in a single block")
+
+
+class TestFragmentContractIsEnforced(FuzzCase):
+    """A caller that breaks the contract gets an error, not a split file."""
+
+    HEADER = ZnaHeader(read_group="contract", seq_len_bytes=2,
+                       compression_method=COMPRESSION_ZSTD)
+
+    def _writer(self, **kw):
+        return ZnaWriter(io.BytesIO(), self.HEADER, **kw)
+
+    def test_r1_must_be_followed_by_its_r2(self):
+        for second in (("ACGT", True, True, False),    # another R1
+                       ("ACGT", False, False, False),  # a single
+                       ("ACGT", False, True, False)):  # an unpaired read1
+            with self.subTest(second=second):
+                w = self._writer()
+                w.write_record("ACGT", True, True, False)
+                with self.assertRaisesRegex(ValueError, "expected the paired R2"):
+                    w.write_record(*second)
+
+    def test_r2_needs_an_r1_in_front_of_it(self):
+        w = self._writer()
+        with self.assertRaisesRegex(ValueError, "no R1 in front of it"):
+            w.write_record("ACGT", True, False, True)
+
+        w = self._writer()
+        w.write_record("ACGT", True, True, False)
+        w.write_record("ACGT", True, False, True)   # closes the fragment
+        with self.assertRaisesRegex(ValueError, "no R1 in front of it"):
+            w.write_record("ACGT", True, False, True)
+
+    def test_stream_may_not_end_on_an_r1(self):
+        w = self._writer()
+        w.write_record("ACGT", True, True, False)
+        with self.assertRaisesRegex(ValueError, "ended on a paired R1"):
+            w.close()
+
+        with self.assertRaisesRegex(ValueError, "ended on a paired R1"):
+            with self._writer() as w:
+                w.write_record("ACGT", True, True, False)
+
+    def test_a_real_error_is_not_masked_by_the_pairing_check(self):
+        """Leaving the block open is a symptom when the body already failed."""
+        with self.assertRaisesRegex(RuntimeError, "the actual problem"):
+            with self._writer() as w:
+                w.write_record("ACGT", True, True, False)
+                raise RuntimeError("the actual problem")
+
+    def test_write_records_enforces_it_on_both_paths(self):
+        with self.assertRaisesRegex(ValueError, "expected the paired R2"):
+            with self._writer() as w:
+                w.write_records([("ACGT", True, True, False),
+                                 ("ACGT", False, False, False)])
+
+        norm = ZnaHeader(read_group="contract", seq_len_bytes=2,
+                         compression_method=COMPRESSION_ZSTD,
+                         strand_normalized=True)
+        with self.assertRaisesRegex(ValueError, "no R1 in front of it"):
+            with ZnaWriter(io.BytesIO(), norm, preserve_normalization=True) as w:
+                w.write_records([("ACGT", True, False, True, False)])
+
+    def test_write_copy_enforces_it(self):
+        buf = io.BytesIO()
+        with ZnaWriter(buf, self.HEADER, block_size=64) as w:
+            for i in range(20):
+                w.write_record("ACGTACGT", True, True, False)
+                w.write_record("TTTTGGGG", True, False, True)
+
+        src = list(ZnaReader(io.BytesIO(buf.getvalue())).copy_records())
+        # Dropping one R2 is exactly what a half-fragment source looks like.
+        broken = src[:1] + src[2:]
+        with self.assertRaisesRegex(ValueError, "expected the paired R2"):
+            with ZnaWriter(io.BytesIO(), self.HEADER,
+                           preserve_normalization=True) as w:
+                for rec in broken:
+                    w.write_copy(rec)
+
+    def test_both_backends_reject_a_block_that_splits_a_fragment(self):
+        """The codec relies on the contract to find a pair, so it checks it.
+
+        Reaching a backend directly bypasses the writer.  Under unstranded
+        normalization the coin is applied to a fragment as a unit, so a paired R1
+        without its mate in the block has no defined answer — and the two backends used
+        to *disagree* about the orphan on the other side of such a split: the Python
+        codec gave a lone R2 its own coin and the C++ codec gave it none.
+        """
+        R1, R2 = 0x05, 0x06
+        for name in BACKENDS:
+            backend = get_backend(name)
+            with self.subTest(backend=name):
+                # A well-formed pair encodes.
+                backend.encode_block(["ACGT", "TTTT"], [R1, R2], 2, "",
+                                     False, False, True, 0, 0)
+                # An R1 whose mate is not in this block does not.
+                with self.assertRaises(ValueError):
+                    backend.encode_block(["ACGT"], [R1], 2, "",
+                                         False, False, True, 0, 0)
+                with self.assertRaises(ValueError):
+                    backend.encode_block(["ACGT", "TTTT"], [R1, 0x00], 2, "",
+                                         False, False, True, 0, 0)
+
+    def test_a_rejected_record_is_not_buffered(self):
+        """The batch must not keep a record the writer refused."""
+        w = self._writer()
+        w.write_record("ACGTACGT", True, True, False)
+        w.write_record("TTTTGGGG", True, False, True)
+        with self.assertRaises(ValueError):
+            w.write_record("AAAA", True, False, True)   # orphan R2
+        w.write_record("CCCC", False, False, False)     # recover with a single
+        w.close()
+        seqs = [r[0] for r in ZnaReader(io.BytesIO(w._fh.getvalue())).records()]
+        self.assertEqual(seqs, ["ACGTACGT", "TTTTGGGG", "CCCC"])
 
 
 def _main(argv):

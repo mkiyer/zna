@@ -620,13 +620,17 @@ class TestCppEncodeLabeledStrandNorm(unittest.TestCase):
             path = f"{d}/test.zna"
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, h) as w:
+                    # Both mates: a fragment is atomic, and the label under test
+                    # rides on the R1.
                     w.write_record(original_seq, True, True, False, labels=(42,))
+                    w.write_record("TTTTGGGG", True, False, True, labels=(43,))
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 recs = list(reader.records(restore_strand=True))
-        self.assertEqual(len(recs), 1)
+        self.assertEqual(len(recs), 2)
         self.assertEqual(recs[0][0], original_seq)
         self.assertEqual(recs[0][4], (42,))
+        self.assertEqual(recs[1][4], (43,))
 
     def test_npolicy_with_labels(self):
         """N-policy should work correctly with C++ labeled encoder."""

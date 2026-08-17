@@ -14,6 +14,13 @@ Binary layout::
 
 Each block payload contains three concatenated columnar streams
 (flags, lengths, sequences) compressed as a single ZSTD frame.
+
+**Blocks are fragment-complete.**  A fragment's reads are stored consecutively,
+R1 immediately followed by R2, and never span a block boundary.  So a block is a
+self-contained unit of molecules, and any set of blocks can be decoded
+independently of the rest of the file — which is what makes :meth:`ZnaReader.blocks`
+usable as a parallelism and sharding primitive.  :class:`ZnaWriter` enforces both
+halves of this on every write path; see :data:`OPENS_FRAGMENT`.
 """
 from __future__ import annotations
 
@@ -54,8 +61,8 @@ reverse_complement = _codec.reverse_complement
 
 _MAGIC = b"ZNA\x1A"
 
-_VERSION = 2
-_SUPPORTED_VERSIONS = frozenset({2})
+_VERSION = 3
+_SUPPORTED_VERSIONS = frozenset({3})
 
 # File header: Magic(4s) Ver(B) LenBytes(B) Flags(B) CompMethod(B) CompLevel(B) NumLabels(H) RGLen(H) DescLen(H)
 _FILE_HEADER_FMT = "<4sBBBBBHHH"
@@ -164,6 +171,28 @@ FLAG_FIELDS = tuple(
 )
 
 
+#: ``flag byte -> True`` for a paired R1: the record that *opens* a two-read fragment.
+#: Its mate must be the very next record, and must land in the same block — so this is
+#: exactly the record a block may not end on.
+OPENS_FRAGMENT = tuple((f & 0x05) == 0x05 for f in range(256))
+
+#: ``flag byte -> True`` for a paired R2: the record that *closes* a two-read fragment.
+#: It is the only record that may follow a paired R1, and may not appear anywhere else.
+CLOSES_FRAGMENT = tuple((f & 0x06) == 0x06 for f in range(256))
+
+# Together these are the whole fragment contract, and the writer needs no other state to
+# enforce it than "did the last record open a fragment".  ``CLOSES_FRAGMENT[flag] must
+# equal that bit`` rejects both halves of a broken stream in one comparison -- an R1
+# followed by anything but its R2, and an R2 with no R1 in front of it -- and deciding
+# the flush on ``OPENS_FRAGMENT[flag]`` keeps every fragment whole, because the only
+# record a block is forbidden to end on is the one whose mate has not arrived yet.
+#
+# That bound is why no deferral bookkeeping is needed: a fragment is at most two
+# records, so a block overruns ``block_size`` by at most one record.  The older code
+# deferred a flush *without* enforcing the contract, which had no such bound -- a run of
+# consecutive paired R1s buffered the entire stream in memory and wrote nothing.
+
+
 class ZnaRecord(NamedTuple):
     """One record as it is **stored**, for copying between ZNA files.
 
@@ -259,6 +288,12 @@ class ZnaWriter:
 
     The labels column is present only for a labeled file, and the column order is
     the compression order -- flags first because they are the most redundant.
+
+    **Fragments are written whole.**  Every write path here requires a paired R1 to be
+    followed immediately by its R2, and refuses to end a block between them, so a block
+    always holds entire molecules.  Callers that group their input already satisfy this;
+    one that does not gets a :exc:`ValueError` naming the record, rather than a file
+    whose blocks cannot be processed independently.
     """
 
     __slots__ = (
@@ -276,7 +311,7 @@ class ZnaWriter:
         "_batch_seqs",
         "_batch_flags",
         "_size_estimate",
-        "_pending_r1",
+        "_expect_mate",
         "_rng_seed",
         "_records_written",
         "_label_defs",
@@ -319,7 +354,9 @@ class ZnaWriter:
         self._batch_seqs: list[str] = []
         self._batch_flags = bytearray()
         self._size_estimate = 0
-        self._pending_r1 = False  # True when last buffered record is a paired R1
+        # True when the last buffered record was a paired R1, i.e. a fragment is open
+        # and the next record must be the R2 that closes it.
+        self._expect_mate = False
         # Both random decisions -- which mate unstranded normalization flips, and the
         # base substituted for a no-call -- are derived from `rng_seed` and the record's
         # GLOBAL index, never from a running stream. That is what makes the output
@@ -343,9 +380,28 @@ class ZnaWriter:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # noqa: ANN001
+        # An exception on the way out already explains why the stream stopped mid
+        # fragment; raising the pairing error on top of it would replace the cause
+        # with its symptom.
+        if exc_type is not None:
+            self._expect_mate = False
         self.close()
 
     def close(self) -> None:
+        """Flush the final block.
+
+        Raises if the stream ended on a paired R1 — its mate never arrived, so the
+        file would close with half a fragment in its last block.  The buffered tail is
+        *not* written in that case: every block already on disk is whole, and the
+        caller has an exception telling it the file is short.
+        """
+        if self._expect_mate:
+            self._expect_mate = False  # do not re-raise if close() is called again
+            raise ValueError(
+                "the record stream ended on a paired R1 whose R2 never arrived. "
+                "Every fragment must be written whole, R1 immediately followed by R2; "
+                "write the mate, or write the read unpaired (is_paired=False)."
+            )
         self._flush_block()
 
     # -- public --------------------------------------------------------------
@@ -355,7 +411,10 @@ class ZnaWriter:
         labels: tuple | None = None, is_rc: bool = False,
         is_full_fragment: bool = False,
     ) -> None:
-        """Buffer a single record.  Flushes automatically when the block is full.
+        """Buffer a single record.  Flushes at the next fragment boundary once full.
+
+        A paired R1 must be followed immediately by its R2 — see :class:`ZnaWriter` —
+        and anything else raises :exc:`ValueError`.
 
         ``is_rc`` records that *seq* is already in its normalized frame and was
         reverse-complemented to get there.  It requires
@@ -384,6 +443,13 @@ class ZnaWriter:
                 f"allowed by header (seq_len_bytes={self._seq_len_bytes})"
             )
 
+        flag = (
+            (1 if is_read1 else 0) | (2 if is_read2 else 0) | (4 if is_paired else 0)
+            | (8 if is_rc else 0) | (16 if is_full_fragment else 0)
+        )
+        if CLOSES_FRAGMENT[flag] != self._expect_mate:
+            raise self._bad_fragment(flag)
+
         if self._label_defs:
             if labels is None or len(labels) != len(self._label_defs):
                 raise ValueError(
@@ -394,25 +460,14 @@ class ZnaWriter:
                 self._batch_labels[i].append(val)
 
         self._batch_seqs.append(seq)
-        # Single expression, no follow-up statements: this runs on every record.
-        self._batch_flags.append(
-            (1 if is_read1 else 0) | (2 if is_read2 else 0) | (4 if is_paired else 0)
-            | (8 if is_rc else 0) | (16 if is_full_fragment else 0)
-        )
+        self._batch_flags.append(flag)
 
         self._size_estimate += (seq_len // 4) + 1 + self._seq_len_bytes
-        # Defer flush when the last record is a paired R1 to keep pairs together
-        if self._size_estimate >= self._block_size:
-            if is_paired and is_read1 and self._do_random_norm:
-                self._pending_r1 = True
-            else:
-                self._pending_r1 = False
-                self._flush_block()
-        elif self._pending_r1 and not (is_paired and is_read1):
-            # R2 (or SE) arrived after a deferred R1 — safe to flush now
-            self._pending_r1 = False
-            if self._size_estimate >= self._block_size:
-                self._flush_block()
+        # A block may only end where a fragment does, so the size test is asked at
+        # fragment boundaries and nowhere else.
+        self._expect_mate = OPENS_FRAGMENT[flag]
+        if not self._expect_mate and self._size_estimate >= self._block_size:
+            self._flush_block()
 
     def write_copy(self, rec: ZnaRecord) -> None:
         """Buffer a record read from another ZNA file, flag byte verbatim.
@@ -441,6 +496,9 @@ class ZnaWriter:
                 f"Sequence length {seq_len} exceeds maximum {self._max_len} "
                 f"allowed by header (seq_len_bytes={self._seq_len_bytes})"
             )
+        flag = rec[1]
+        if CLOSES_FRAGMENT[flag] != self._expect_mate:
+            raise self._bad_fragment(flag)
         if self._label_defs:
             labels = rec[2]
             if len(labels) != len(self._label_defs):
@@ -451,9 +509,10 @@ class ZnaWriter:
                 self._batch_labels[i].append(val)
 
         self._batch_seqs.append(seq)
-        self._batch_flags.append(rec[1])
+        self._batch_flags.append(flag)
         self._size_estimate += (seq_len // 4) + 1 + self._seq_len_bytes
-        if self._size_estimate >= self._block_size:
+        self._expect_mate = OPENS_FRAGMENT[flag]
+        if not self._expect_mate and self._size_estimate >= self._block_size:
             self._flush_block()
 
     def write_records(
@@ -487,6 +546,11 @@ class ZnaWriter:
         block_size = self._block_size
         flush = self._flush_block
         size_est = self._size_estimate
+        # Bound in the loop, not looked up per record: the fragment contract is checked
+        # on every record here, and this is the bulk path.
+        opens_fragment = OPENS_FRAGMENT
+        closes_fragment = CLOSES_FRAGMENT
+        expect_mate = self._expect_mate
 
         if self._preserve_normalization:
             # Pass-through. Accepts:
@@ -534,19 +598,26 @@ class ZnaWriter:
                         f"Sequence length {seq_len} exceeds maximum {max_len} "
                         f"allowed by header (seq_len_bytes={seq_len_bytes})"
                     )
-                append_seq(seq)
-                append_flag(
+                flag = (
                     (1 if is_read1 else 0)
                     | (2 if rec[3] else 0)
                     | (4 if is_paired else 0)
                     | rc_bit
                 )
+                if closes_fragment[flag] != expect_mate:
+                    self._expect_mate = expect_mate
+                    self._size_estimate = size_est
+                    raise self._bad_fragment(flag)
+                append_seq(seq)
+                append_flag(flag)
                 size_est += (seq_len >> 2) + 1 + seq_len_bytes
-                if size_est >= block_size:
+                expect_mate = opens_fragment[flag]
+                if not expect_mate and size_est >= block_size:
                     self._size_estimate = size_est
                     flush()
                     size_est = self._size_estimate  # reset after flush
             self._size_estimate = size_est
+            self._expect_mate = expect_mate
             return
 
         for seq, is_paired, is_read1, is_read2 in records:
@@ -556,24 +627,41 @@ class ZnaWriter:
                     f"Sequence length {seq_len} exceeds maximum {max_len} "
                     f"allowed by header (seq_len_bytes={seq_len_bytes})"
                 )
-            append_seq(seq)
-            append_flag(
+            flag = (
                 (1 if is_read1 else 0)
                 | (2 if is_read2 else 0)
                 | (4 if is_paired else 0)
             )
+            if closes_fragment[flag] != expect_mate:
+                self._expect_mate = expect_mate
+                self._size_estimate = size_est
+                raise self._bad_fragment(flag)
+            append_seq(seq)
+            append_flag(flag)
             size_est += (seq_len >> 2) + 1 + seq_len_bytes
-            if size_est >= block_size:
-                if is_paired and is_read1 and self._do_random_norm:
-                    pass  # defer flush — keep pair together
-                else:
-                    self._size_estimate = size_est
-                    flush()
-                    size_est = self._size_estimate  # reset after flush
+            expect_mate = opens_fragment[flag]
+            if not expect_mate and size_est >= block_size:
+                self._size_estimate = size_est
+                flush()
+                size_est = self._size_estimate  # reset after flush
 
         self._size_estimate = size_est
+        self._expect_mate = expect_mate
 
     # -- private -------------------------------------------------------------
+
+    def _bad_fragment(self, flag: int) -> ValueError:
+        """The error for a record that cannot legally follow the previous one."""
+        if self._expect_mate:
+            return ValueError(
+                f"expected the paired R2 completing the preceding R1, got flags="
+                f"0x{flag:02x}. A fragment's reads must be written consecutively, R1 "
+                f"immediately followed by R2, so that no block ever splits a fragment."
+            )
+        return ValueError(
+            f"paired R2 (flags=0x{flag:02x}) with no R1 in front of it. A fragment's "
+            f"reads must be written consecutively, R1 immediately followed by R2."
+        )
 
     def _write_file_header(self) -> None:
         rg_bytes = self._header.read_group.encode("utf-8")
@@ -914,6 +1002,13 @@ class ZnaReader:
         which is most of what is left in :meth:`records` once the sequence itself
         is cheap to produce.
 
+        **A block holds whole fragments.**  Paired reads appear consecutively, R1
+        then R2, and a fragment never straddles a block boundary — so a worker
+        handed a block never sees half a molecule whose other half went to some
+        other worker.  That is what makes sharding here safe to do at all, and it
+        is a guarantee of the format, enforced by :class:`ZnaWriter` on write, not
+        a property that happens to hold for a particular file.
+
         ``stride``/``offset`` shard **by block**: with ``stride=8, offset=3``
         this yields every eighth block starting at the fourth, and — the point —
         seeks past the others without decompressing or decoding them.  A sharded
@@ -1231,7 +1326,13 @@ class ZnaReader:
         if magic != _MAGIC:
             raise ValueError("Not a ZNA file")
         if ver not in _SUPPORTED_VERSIONS:
-            raise ValueError(f"Unsupported ZNA version: {ver}")
+            raise ValueError(
+                f"Unsupported ZNA version: {ver} (this build reads version "
+                f"{_VERSION}). Version 3 made blocks fragment-complete — a "
+                f"fragment's reads are consecutive and never span a block "
+                f"boundary — which version 2 files do not satisfy, so they "
+                f"cannot be read as if they did. Re-encode from FASTQ."
+            )
 
         read_group = self._read_exact(rg_len).decode("utf-8")
         description = self._read_exact(desc_len).decode("utf-8")

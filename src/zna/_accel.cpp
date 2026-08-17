@@ -610,11 +610,23 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
         bool needs_rc = false;
 
         if (do_random_rc) {
-            // Unstranded random normalization
-            if (is_paired && is_read1 && (i + 1 < count) && (flags[i + 1] & IS_PAIRED)) {
-                // Paired R1+R2: which mate is flipped. Derived from the pair's GLOBAL
-                // record index, not from a running stream, so the assignment cannot
-                // depend on how records were batched into blocks.
+            // Unstranded random normalization: exactly one mate of each pair is flipped.
+            if (is_paired && is_read1) {
+                // The writer guarantees a paired R1's mate is the next record in this
+                // same block, which is what lets the coin be applied to the pair as a
+                // unit. A caller reaching the backend directly can still break it, and
+                // gets this rather than a silent half-normalized fragment -- or, without
+                // the bounds half, a read past the end of the flags buffer.
+                if (i + 1 >= count || !(flags[i + 1] & IS_READ2)) {
+                    throw std::invalid_argument(
+                        "record " + std::to_string(base_index + i) + " is a paired R1 "
+                        "whose R2 does not follow it in this block; a fragment's reads "
+                        "must be consecutive and in the same block"
+                    );
+                }
+                // Which mate is flipped is derived from the pair's GLOBAL record index,
+                // not from a running stream, so the assignment cannot depend on how
+                // records were batched into blocks.
                 if (zna_rc_coin(rng_seed, base_index + i)) {
                     needs_rc = true;
                     flags_out[i] = static_cast<char>(flag | IS_RC_BIT);
@@ -622,7 +634,9 @@ static void encode_core(PyObject* seqs, const std::vector<uint8_t>& flags,
                     flags_out[i + 1] = static_cast<char>(flags[i + 1] | IS_RC_BIT);
                 }
             } else if (!(is_paired && is_read2)) {
-                // Unpaired/SE or lone R1 (no following R2): random RC
+                // A single or merged read -- a one-record fragment.  A paired R2 is
+                // skipped here because the branch above already flipped the coin for
+                // its fragment; it picks up the result via the IS_RC recovery below.
                 if (zna_rc_coin(rng_seed, base_index + i)) {
                     needs_rc = true;
                     flags_out[i] = static_cast<char>(flag | IS_RC_BIT);

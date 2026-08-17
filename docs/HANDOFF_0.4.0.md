@@ -1,7 +1,14 @@
 # Handoff: 0.4.0 is done; what the next session needs
 
-Updated 2026-08-13. Merged to `main`, working tree clean, **630 tests green compiled /
-574 + 56 skipped extension-less**, and CI green on Linux, macOS and Windows.
+> **This is a record of the 0.4.0 release, not a current status.** Sections 1 and 2
+> describe that release and what was next *at the time*; the suite has grown since and
+> the on-disk format has moved to version 3 (blocks are now fragment-complete — see
+> [CHANGELOG.md](../CHANGELOG.md)). Sections 3–5 are the durable part and are still
+> accurate.
+
+Written 2026-08-13. Merged to `main`, working tree clean, **630 tests green compiled /
+574 + 56 skipped extension-less** at that commit, and CI green on Linux, macOS and
+Windows.
 
 Sections 3–5 are the durable part — the traps, the ground truth, and the two properties
 worth re-checking after *any* change to the merge or encode path. They cost real time to

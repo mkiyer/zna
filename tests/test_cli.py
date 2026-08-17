@@ -2541,3 +2541,70 @@ class TestEncodeShuffleBufferSize:
                     if i % 4 == 1:
                         expected.append(line.strip())
             assert sorted(got) == sorted(expected)
+
+
+class TestFormatErrorsReachTheUser:
+    """A file this build cannot read must produce a message, not a traceback.
+
+    The version-3 break makes this the *first* thing anyone with older files sees, and
+    it used to be a stack trace from `main()` on three of the four commands — `inspect`
+    caught its own, `decode`, `encode` and `shuffle` did not.
+    """
+
+    #: argv tail per command; only `inspect` takes no output path.
+    _ARGV = {
+        "decode": lambda src, out: [src, "-o", out],
+        "encode": lambda src, out: [src, "-o", out],
+        "shuffle": lambda src, out: [src, "-o", out],
+        "inspect": lambda src, out: [src],
+    }
+
+    def _v2_file(self, tmp) -> str:
+        """A well-formed file with its version byte set back to 2."""
+        path = str(Path(tmp) / "old.zna")
+        buf = BytesIO()
+        header = ZnaHeader(read_group="old", seq_len_bytes=2,
+                           compression_method=COMPRESSION_ZSTD)
+        with ZnaWriter(buf, header) as w:
+            w.write_record("ACGTACGT", True, True, False)
+            w.write_record("TTTTGGGG", True, False, True)
+        data = bytearray(buf.getvalue())
+        data[4] = 2                      # version byte
+        Path(path).write_bytes(bytes(data))
+        return path
+
+    @pytest.mark.parametrize("command", ["decode", "encode", "inspect", "shuffle"])
+    def test_an_unreadable_file_exits_cleanly(self, command, monkeypatch, capsys):
+        from zna import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._v2_file(tmp)
+            out = str(Path(tmp) / "out.zna")
+            argv = ["zna", command] + self._ARGV[command](src, out)
+            monkeypatch.setattr("sys.argv", argv)
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+            captured = capsys.readouterr()
+
+        code = exc.value.code
+        # argparse also exits non-zero; make sure we failed on the FILE, not the argv.
+        assert code != 2, f"{command}: argparse rejected {argv!r}"
+        assert code not in (0, None), f"{command} exited successfully"
+        text = f"{code}{captured.out}{captured.err}"
+        assert "version" in text.lower(), (
+            f"{command} did not name the version as the problem: {text!r}"
+        )
+        assert "Traceback" not in text
+
+    def test_a_readable_file_is_unaffected(self, monkeypatch):
+        """The handler must not swallow a successful run."""
+        from zna import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = str(Path(tmp) / "good.zna")
+            buf = BytesIO()
+            with ZnaWriter(buf, ZnaHeader(read_group="x", seq_len_bytes=2)) as w:
+                w.write_record("ACGTACGT", False, False, False)
+            Path(src).write_bytes(buf.getvalue())
+            monkeypatch.setattr("sys.argv", ["zna", "inspect", src])
+            cli.main()          # must not raise

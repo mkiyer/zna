@@ -18,20 +18,23 @@ class TestZnaIO(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/sample.zna"
             with open(path, "wb") as out_fh:
-                # Mock records logic for test:
-                # i=0: paired=True, r1=True, r2=False (Paired R1)
-                # i=1: paired=True, r1=False, r2=True (Paired R2)
-                # i=2: paired=False, r1=False, r2=False (Singleton)
+                # Cycle paired R1, paired R2, singleton -- so every roundtrip covers
+                # all three flag shapes.  A fragment is atomic, so a sequence that
+                # would land on the R1 slot with nothing after it is emitted as a
+                # singleton instead: the cycle used to run off the end of the list
+                # whenever len(sequences) % 3 == 1, writing a lone R1.
                 records = []
+                last = len(sequences) - 1
                 for i, seq in enumerate(sequences):
                     mode = i % 3
-                    if mode == 0:
-                        records.append((seq, True, True, False))
+                    if mode == 0 and i < last:
+                        records.append((seq, True, True, False))    # paired R1
                     elif mode == 1:
-                        records.append((seq, True, False, True))
+                        records.append((seq, True, False, True))    # its R2
                     else:
-                        records.append((seq, False, False, False))
-                        
+                        records.append((seq, False, False, False))  # singleton
+
+
                 with ZnaWriter(out_fh, header, npolicy=npolicy) as writer:
                     for seq, is_paired, is_r1, is_r2 in records:
                         writer.write_record(seq, is_paired, is_r1, is_r2)
@@ -237,11 +240,13 @@ class TestStrandSpecific(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/strand.zna"
             
-            # Write
+            # Write.  A fragment is atomic, so the mate goes in too even though only
+            # the header is under test here.
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record("ACGT", True, True, False)  # R1
-            
+                    writer.write_record("ACGT", True, True, False)   # R1
+                    writer.write_record("TTTT", True, False, True)   # R2
+
             # Read and check header
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
@@ -266,18 +271,22 @@ class TestStrandSpecific(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/strand.zna"
             
-            # Write R1 (should be reverse complemented)
+            # Write the fragment.  R1 is antisense here and should be flipped; its
+            # sense R2 rides along because a fragment cannot be written half.
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record(r1_seq, True, True, False)  # R1
-            
+                    writer.write_record(r1_seq, True, True, False)   # R1
+                    writer.write_record("TTTTGGGG", True, False, True)  # R2
+
             # Read without strand restoration
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 records = list(reader.records(restore_strand=False))
-                self.assertEqual(len(records), 1)
-                # Stored as reverse complement (sense strand)
+                self.assertEqual(len(records), 2)
+                # R1 stored as reverse complement (sense strand)
                 self.assertEqual(records[0][0], r1_rc)
+                # R2 was already sense — stored untouched
+                self.assertEqual(records[1][0], "TTTTGGGG")
     
     def test_r2_antisense_normalization(self):
         """Test that R2 antisense reads are normalized during encoding."""
@@ -295,16 +304,19 @@ class TestStrandSpecific(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/strand.zna"
             
-            # Write R2 (should be reverse complemented)
+            # Write the fragment.  R2 is antisense here and should be flipped; the
+            # sense R1 in front of it is what makes the fragment whole.
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record(r2_seq, True, False, True)  # R2
-            
+                    writer.write_record("TTTTGGGG", True, True, False)  # R1
+                    writer.write_record(r2_seq, True, False, True)      # R2
+
             # Read without strand restoration
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 records = list(reader.records(restore_strand=False))
-                self.assertEqual(records[0][0], r2_rc)
+                self.assertEqual(records[0][0], "TTTTGGGG")  # sense R1, untouched
+                self.assertEqual(records[1][0], r2_rc)
     
     def test_sense_reads_not_modified(self):
         """Test that sense reads are not reverse complemented."""
@@ -321,16 +333,18 @@ class TestStrandSpecific(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = f"{tmpdir}/strand.zna"
             
-            # Write R2 (should NOT be reverse complemented)
+            # Write the fragment.  Its R1 is antisense and gets flipped; the R2 under
+            # test is sense and must come back untouched.
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record(r2_seq, True, False, True)  # R2
-            
-            # Read - should be unchanged
+                    writer.write_record("TTTTGGGG", True, True, False)  # R1
+                    writer.write_record(r2_seq, True, False, True)      # R2
+
+            # Read - the R2 should be unchanged
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 records = list(reader.records(restore_strand=False))
-                self.assertEqual(records[0][0], r2_seq)
+                self.assertEqual(records[1][0], r2_seq)
     
     def test_restore_strand_roundtrip(self):
         """Test that restore_strand=True recovers original sequences."""
@@ -421,8 +435,9 @@ class TestStrandSpecific(unittest.TestCase):
             
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record(test_seq, True, True, False)
-            
+                    writer.write_record(test_seq, True, True, False)   # R1
+                    writer.write_record("TTTGGGCCC", True, False, True)  # R2
+
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 self.assertFalse(reader.header.strand_specific)
@@ -449,8 +464,9 @@ class TestStrandSpecific(unittest.TestCase):
             
             with open(path, "wb") as fh:
                 with ZnaWriter(fh, header) as writer:
-                    writer.write_record(r1_seq, True, True, False)
-            
+                    writer.write_record(r1_seq, True, True, False)      # R1
+                    writer.write_record("TTTTGGGG", True, False, True)  # R2
+
             with open(path, "rb") as fh:
                 reader = ZnaReader(fh)
                 self.assertTrue(reader.header.strand_specific)

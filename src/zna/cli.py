@@ -501,12 +501,16 @@ def load_label_file(path: str) -> tuple[LabelDef, ...]:
     Returns a tuple of :class:`LabelDef` objects.  Raises
     ``SystemExit`` with a user-friendly message on errors.
     """
+    # Imported here rather than at module scope on purpose: `import yaml` costs ~15 ms,
+    # and `--label-defs` is the only thing in zna that wants it.  Every `zna decode`,
+    # `zna inspect` and unlabeled `zna encode` would otherwise pay it.  Keep it local.
     try:
         import yaml
     except ImportError:
         sys.exit(
-            "Error: PyYAML is required for --label-defs.\n"
-            "Install it with:  pip install pyyaml"
+            "Error: PyYAML is missing.  It is a required dependency of zna, so this "
+            "install is incomplete rather than merely missing an extra -- reinstall "
+            "with `pip install zna` or `conda install -c bioconda zna`."
         )
 
     try:
@@ -2118,17 +2122,27 @@ def main():
     add_merge_parser(subparsers)
 
     args = parser.parse_args()
-    if args.command == "encode":
-        encode_command(args)
-    elif args.command == "decode":
-        decode_command(args)
-    elif args.command == "inspect":
-        inspect_command(args)
-    elif args.command == "shuffle":
-        shuffle_command(args)
-    elif args.command == "merge":
-        from .merge.cli import run_command
-        sys.exit(run_command(args))
+    try:
+        if args.command == "encode":
+            encode_command(args)
+        elif args.command == "decode":
+            decode_command(args)
+        elif args.command == "inspect":
+            inspect_command(args)
+        elif args.command == "shuffle":
+            shuffle_command(args)
+        elif args.command == "merge":
+            from .merge.cli import run_command
+            sys.exit(run_command(args))
+    except ValueError as e:
+        # Everything the format rejects -- an unsupported version, a base outside ACGTN,
+        # a record longer than seq_len_bytes allows, a half-written fragment -- arrives
+        # as a ValueError carrying a message written for a person to read.  A traceback
+        # buries that message under a stack the user cannot act on.  `inspect` and
+        # `shuffle` already caught their own; this is what `decode` and `encode` were
+        # missing, and the version error most of all, since that is the one every pre-3
+        # file produces on first contact.
+        sys.exit(f"Error: {e}")
 
 
 if __name__ == "__main__":

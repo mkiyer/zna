@@ -158,9 +158,18 @@ def encode_block(
         seq = seqs[i]
 
         if do_random_rc:
-            # Unstranded normalization: random RC
-            if is_paired and is_read1 and (i + 1 < n) and (flags[i + 1] & IS_PAIRED):
-                # Process R1+R2 pair together
+            # Unstranded normalization: exactly one mate of each pair is flipped.
+            if is_paired and is_read1:
+                # The writer guarantees a paired R1's mate is the next record in this
+                # same block, which is what lets the coin be applied to the pair as a
+                # unit.  A caller reaching the backend directly can still break it, and
+                # gets this rather than a silent half-normalized fragment.
+                if i + 1 >= n or not (flags[i + 1] & IS_READ2):
+                    raise ValueError(
+                        f"record {base_index + i} is a paired R1 whose R2 does not "
+                        f"follow it in this block; a fragment's reads must be "
+                        f"consecutive and in the same block"
+                    )
                 seq2 = seqs[i + 1]
                 # Derived from the pair's GLOBAL record index, so the assignment cannot
                 # depend on how records were batched into blocks.
@@ -184,7 +193,8 @@ def encode_block(
                 i += 2
                 continue
             else:
-                # Unpaired read: same position-derived coin.
+                # A single or merged read -- a one-record fragment.  A paired R2 never
+                # reaches here: its R1 consumed it above.
                 if _rc_coin(rng_seed, base_index + i):
                     seq = reverse_complement(seq)
                     flags[i] |= IS_RC_BIT

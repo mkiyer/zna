@@ -460,7 +460,7 @@ Two implementation notes. The compiled backend applies the policy to *any* unenc
 A file is a 15-byte fixed header, then variable-length read group and description, then one 89-byte definition per label, then a chain of blocks.
 
 ```
-file header   magic "ZNA\x1A" | version=2 | seq_len_bytes | header flags |
+file header   magic "ZNA\x1A" | version=3 | seq_len_bytes | header flags |
               compression method | compression level | label count |
               read-group length | description length            (15 bytes, LE)
 label def     name (16 B, NUL-padded UTF-8) | description (64 B) |
@@ -473,6 +473,12 @@ block payload one zstd frame:  flags ‖ labels ‖ lengths ‖ sequences
 Compression is zstd at `DEFAULT_ZSTD_LEVEL = 9` unless `--level` says otherwise (`src/zna/core.py:81`, `src/zna/cli.py:1965`). `seq_len_bytes` (1, 2, or 4; CLI default 2) fixes the width of the lengths column and hence the maximum record length — 255, 65535, or 4294967295 bases. A longer record raises rather than truncating.
 
 **The file header stores no record or block count.** Every block header carries its own, so totals come from walking the chain and seeking over each payload — measured at 2.3 µs per block, or 1.4 ms for a 38 MB / 611-block file, against 89 ms to reach the same counts by decoding. That walk is `block_index()`, which returns per-block offsets and record counts without decompressing anything (`core.py:818`); `blocks(indices=…)` then seeks past unselected blocks. Random access is therefore **block-granular** — it is per-*record* random access that the format does not provide. Blocks are flushed on an *estimated* byte size (`len/4 + 1 + seq_len_bytes` per record, default 4 MiB), so their record counts are near-uniform for fixed-length reads and vary with variable-length ones.
+
+**A block holds whole fragments.** A fragment's reads are stored consecutively, R1 immediately followed by R2, and a fragment never straddles a block boundary. So a block is a self-contained set of molecules and any subset of blocks decodes independently of the rest of the file — which is the whole basis for `blocks(stride=…)` sharding and for block-parallel consumers: a worker handed a block never sees one mate of a pair whose other mate went to a different worker.
+
+`ZnaWriter` enforces both halves on every write path (`OPENS_FRAGMENT` / `CLOSES_FRAGMENT`, `src/zna/core.py`). It needs no state beyond "did the last record open a fragment": that bit must equal `CLOSES_FRAGMENT[flag]` on the next record, which rejects an R1 followed by anything but its R2 *and* an R2 with no R1 in front of it, in one comparison. The size test is then asked only where a fragment ends, so the only record a block may not end on is the one whose mate has not arrived. Enforcement is what bounds the hold: a fragment is at most two records, so a block overruns its target by at most one record.
+
+Version 2 held a weaker rule — the flush was deferred only under unstranded normalization, where the codec's pair detection requires it — and split roughly half of all block boundaries mid-fragment on every other configuration. Fixed-length reads hid it, because a constant per-record size estimate lands every boundary on an even record count. Deferring *without* enforcing was also unbounded: a run of consecutive paired R1s buffered the entire stream and wrote nothing. Version 3 files satisfy the rule by construction, and version 2 files are not readable.
 
 The payload is columnar, not row-oriented: all flags, then all label values, then all lengths, then all packed sequence. Column order is what makes the block compress. Each stream is homogeneous, so zstd sees long runs instead of an interleave of unrelated byte types. Measured on a 25.4M-read, 150 bp library (10.76 GB FASTQ, zstd level 9, 16.5× overall): the flags stream compresses 500–1000×, the lengths stream ~1000× on uniform 150 bp reads, the label columns compress as contiguous numeric arrays, and only the sequence stream — already near-incompressible after 2-bit packing — compresses just 3–5×. Row-oriented storage would smear the three cheap columns through the expensive one.
 
@@ -488,9 +494,9 @@ Four header bits describe the library: `STRAND_SPECIFIC`, `READ1_ANTISENSE`, `RE
 
 **Stranded.** Each record is reverse-complemented iff its mate number matches an antisense rule. A record that is neither R1 nor R2 — a single-end or overlap-merged read — takes the R1 rule (`src/zna/_accel.cpp:610-614`), because a merged read is R1 followed by the reverse complement of R2's tail and is therefore R1-oriented.
 
-**Unstranded.** There is no sense strand to normalize to, so the rule is symmetry instead. An FR pair covers the two ends of one fragment pointing inward, so as sequenced the mates sit in opposite frames. For each paired R1 immediately followed by a paired record, one fair coin decides which mate to reverse-complement; **exactly one always is** (`src/zna/_accel.cpp:583-596`, `src/zna/_pycodec.py:152-181`), which puts both into a single common frame. Unpaired records get an independent coin.
+**Unstranded.** There is no sense strand to normalize to, so the rule is symmetry instead. An FR pair covers the two ends of one fragment pointing inward, so as sequenced the mates sit in opposite frames. For each paired R1, one fair coin decides which of the two mates to reverse-complement; **exactly one always is**, which puts both into a single common frame. Unpaired records get an independent coin.
 
-This is why the writer defers a block flush when the last buffered record is a paired R1 under random normalization: the codec's pair detection only looks at the next record in the *same* batch, so a pair split across blocks would give R1 a coin and R2 nothing, leaving both mates in the same frame.
+The codec finds a fragment's two mates by looking at adjacent records within one block, which it may do because §4.2 guarantees they are there. It raises rather than guessing if they are not, so a caller reaching the backend directly gets an error instead of a half-normalized fragment.
 
 The resulting geometry is the reason `IS_RC` is stored per record rather than inferred: in the common frame the reverse-complemented mate has its **right** edge on the real fragment boundary and its left edge at a read-length cutoff, and the other mate is the mirror image. §3.3 gives the semantics and §3.5 the read/copy rule that follows from them.
 

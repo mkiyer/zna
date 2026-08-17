@@ -36,6 +36,22 @@ point at and then tag a commit `main` does not contain — a release whose tag a
 branch disagree. The script now refuses rather than doing that, but the merge is still
 yours to do:
 
+**If `_VERSION` in `src/zna/core.py` changed, this is a format break.** That version is
+independent of the package version, moves far more rarely, and every existing `.zna`
+file stops being readable when it does. Two things follow, and neither is automated:
+
+- **The CHANGELOG entry leads with it.** Do not rely on the version number to carry the
+  news — 0.4.1 shipped format version 3 as a *patch* release, deliberately, so a reader
+  comparing version numbers has no way to infer that files broke. Whatever number a
+  future break takes, the release notes are what has to say so, in the first paragraph.
+- **Read the rejection message out loud before tagging.** It is the only thing a user
+  with older files ever sees from the new build, and it is written once and then never
+  looked at again. `inspect` and `shuffle` catch their own; `decode` and `encode` rely
+  on `main`'s `ValueError` handler. All four are pinned by
+  `tests/test_cli.py::TestFormatErrorsReachTheUser`, which asserts a non-zero exit, a
+  message naming the version, and no traceback — but read the sentence yourself anyway,
+  because no test can tell you it is *useful*.
+
 ```bash
 # 1. Verify on the release branch, in BOTH environments (see below)
 pytest
@@ -335,7 +351,8 @@ the *old* commit.)
 
 | File | Purpose |
 |------|---------|
-| `src/zna/__init__.py` | Single source of truth for version |
+| `src/zna/__init__.py` | Single source of truth for the *package* version |
+| `src/zna/core.py` | `_VERSION` — the *on-disk format* version, versioned separately |
 | `pyproject.toml` | Build config; reads version dynamically |
 | `conda/meta.yaml` | Conda recipe (version + SHA256) |
 | `.github/workflows/publish.yml` | CI: build wheels + publish to PyPI |

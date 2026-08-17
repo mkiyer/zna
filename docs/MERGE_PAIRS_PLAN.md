@@ -7,9 +7,41 @@ this one is written from what `src/zna/cli.py`, `src/zna/core.py` and
 
 Baseline at revision 3: `627 passed, 156 subtests passed` in
 `/Users/mkiyer/sw/miniforge3/envs/zna_merge` (compiled backend, `zna.is_accelerated()`
-True, `zna.merge` backend `accel`).
+True, `zna.merge` backend `accel`). The suite has grown since; take the number as the
+baseline it was recorded against, not as a current figure.
+
+**Line references below are to the code as it stood at revision 2 and have since
+shifted.** They are kept because the surrounding prose names what it is pointing at;
+resolve them by symbol, not by line.
 
 ---
+
+## -0.1 What format version 3 changed under this plan — read this before §0.0
+
+Version 3 made blocks **fragment-complete**: a fragment's reads are consecutive, R1
+immediately followed by R2, and never span a block boundary, enforced by `ZnaWriter` on
+every write path. Two consequences for this plan, one benign and one that removes an
+argument it makes.
+
+- **The emitted-record mapping in §0.1 already satisfies it.** `MERGED` is a one-record
+  fragment; `MATE1` and `MATE2` are emitted adjacently and in that order, and the write
+  loop iterates `_fragment_units`, so `--merge-pairs` needs no new grouping logic. What
+  it does gain is a check: if the kernel ever emits a `MATE1` without its `MATE2` — the
+  desync case §5's "Error surface" worries about — the writer now raises instead of
+  writing half a fragment. That is a *better* failure than the one §5 describes ("a
+  complete, plausible-looking output on disk"), though it does not replace the
+  ordering fix that section asks for: the writer catches a *desync*, not a truncated
+  input that happens to end on a complete pair.
+
+- **The 6-tuple argument in §4 is now wrong in one of its two halves.** It says
+  `ZnaWriter.write_records` "reads `rec[4], rec[5]` as the ends whenever `len(rec) > 5`",
+  and uses that as evidence the 6-tuple is the cheaper shape. It has not done so since
+  0.4.0: it **refuses** `n_fields > 5` outright, because `(has_start, has_end)` cannot
+  express `IS_RC` on a full-fragment record and every merged read that passed through it
+  lost its orientation. So of "two of the three existing consumers already fix this
+  shape", only one does. The 6-tuple may still be the right call for the
+  write-loop-symmetry reason given alongside it — but decide it on that reason alone,
+  because the consumer-count argument has evaporated.
 
 ## 0.0 What 0.4.0 changed under this plan — read this before §0
 
