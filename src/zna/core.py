@@ -1411,7 +1411,7 @@ class ZnaReader:
                 "opened on a pipe or socket."
             )
 
-        # A trailer stores the index the scan below would recompute, so a
+        # A trailer stores the index the scan would recompute, so a
         # trailer-bearing file answers in one seek instead of one per block.
         # The scan is retained forever: it is what ``zna inspect --verify``
         # cross-checks the stored index against.
@@ -1427,7 +1427,20 @@ class ZnaReader:
                     trailer.block_records,
                 ))
             ]
+        return self.scan_block_index()
 
+    def scan_block_index(self) -> list[BlockInfo]:
+        """:meth:`block_index` by walking the block headers, trailer ignored.
+
+        One 20-byte read and one seek per block.  This is the ground truth the
+        stored index is checked against — a trailer could describe a different
+        file than the one it rides in, and only a walk can say so.
+        """
+        if self._data_start is None:
+            raise TypeError(
+                "scan_block_index() requires a seekable stream; this reader "
+                "was opened on a pipe or socket."
+            )
         fh = self._fh
         resume = fh.tell()
         try:

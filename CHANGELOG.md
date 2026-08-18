@@ -10,6 +10,76 @@ files says so in its first paragraph.
 
 ## [Unreleased]
 
+### Added — the self-describing container (format extension, additive)
+
+**Every `.zna` file now describes itself: what wrote it, whether its order is
+shuffled, exactly what it holds, and whether it is intact.** The format version
+byte stays 3 and the change is purely additive — a 0.4.1 reader walks a 0.5
+file to a clean stop, reading every record (pinned by a test that emulates the
+0.4.1 walk byte for byte). Files written by 0.5 carry three new structures;
+files without them still read, but no longer certify.
+
+The layout is symmetric, and the split is principled — *position in the file
+follows when the information is knowable*:
+
+```
+[header][PROLOGUE][block 1..N][SENTINEL + trailer][32-byte FOOTER]
+```
+
+- **The prologue** (a count-0 pseudo-block right after the header) carries
+  facts known at encode start: `writer_version`, `shuffled`,
+  `merged_in_process`. It sits at the front so a streaming consumer — pipes
+  included — learns "may this file enter training?" before decoding a single
+  record. `ZnaReader.provenance`.
+- **The trailer** (a count-0 sentinel after the last data block) carries only
+  facts that require the complete encode: record/base/pair counts, the length
+  histogram overall and for unpaired records, per-flag-byte counts, the
+  stored block index (`block_index()` now answers from it in one seek), and
+  the prologue's CRC — the end attests the start. `ZnaReader.trailer`.
+- **The footer** (fixed 32 bytes at EOF) makes discovery O(1): magic, CRC of
+  the trailer payload, and the sentinel offset — which is also the fence a
+  block-packing consumer needs now that "the last block ends exactly at EOF"
+  is no longer true.
+- **Every zstd frame now carries a content checksum**, so each block read is
+  an integrity check. The format's first protection against bit rot.
+
+Stats are tallied from the columns the codec returned, never from the writer's
+inputs — strand normalization and N-policies change bytes after the call — and
+every fuzz-generated file in the suite now recounts itself against its trailer
+across the whole npolicy × strand × compression × layout × backend matrix.
+
+`zna shuffle` stamps `shuffled: true`; ZNA→ZNA re-encode propagates the
+input's attestation; an **aborted encode writes no trailer at all** — the
+trailer is the writer's signature that the encode finished, so a crashed
+encode leaves a readable file that refuses certification.
+
+Encode pays ~8% for the accumulators; decode is untouched.
+
+### Added — `zna inspect --verify`: certification in the tool you already use
+
+No new command. Bare `zna inspect` now reports provenance and trailer facts
+and runs the cheap structural pass for free (footer CRC, stored index against
+a walk of the actual headers — exit non-zero on disagreement).
+`zna inspect --verify` is the paid tier: decode every block, recount every
+stat, compare against the trailer, check fragment adjacency; exit 0 iff the
+file certifies. `--json` splices `provenance`, `trailer`, and the `verify`
+verdict for machine consumers.
+
+The damage matrix is tested case by case: truncation at a block boundary (the
+previously *silent* case — the file read back clean, just shorter), truncation
+mid-block, a flipped trailer byte (CRC), a flipped block byte (zstd content
+checksum), tampered stats (recount), and an aborted encode (no trailer).
+
+### Fixed
+
+- `block_index()` on a file with trailing garbage appended a phantom
+  `BlockInfo`, seeked past EOF without error, and returned success. It now
+  raises a `ValueError` naming the offset.
+- `zna inspect` computed its block-walk seek target from the read group's
+  length in *characters* rather than UTF-8 bytes — wrong on any non-ASCII
+  read group — and stopped silently on a short header read, under-reporting
+  damaged files instead of erroring. It now uses `block_index()`.
+
 ### Fixed — `update-conda-sha.sh` silently rewrote nothing on macOS
 
 The rewrite used `sed -E "s|^(\s*)sha256:.*|…|"`. **BSD sed — the macOS default — has no

@@ -1699,6 +1699,195 @@ def decode_command(args):
 
 # --- COMMAND: INSPECT ---
 
+def _verify_zna(fh, reader) -> dict:
+    """Full certification of one open ZNA file (``zna inspect --verify``).
+
+    Decodes every block and checks, in order, stopping at the first failure:
+
+      1. footer + trailer + prologue present and parse (the reader raises on a
+         corrupt trailer; ABSENCE is the two-cause failure: pre-0.5 writer, or
+         truncation);
+      2. the stored block index matches a walk of the actual headers, and the
+         sentinel sits where the footer says;
+      3. every block decompresses (zstd content checksums verify implicitly)
+         and its columns split cleanly -- including the lengths-vs-sequence
+         cross-check ``sum(ceil(len/4)) == len(seq_stream)``, which validates
+         the lengths column against the sequence bytes without materializing
+         a single string;
+      4. recounted stats equal the trailer: flag counts, both histograms,
+         n_records, n_bases, n_pairs, n_unpaired, and the prologue's crc;
+      5. structural invariants: every paired R1 immediately followed by its
+         R2, no block ending mid-fragment (the 0.4.1 guarantee).
+
+    "Stranded implies exactly one antisense mate" is reported as a WARNING,
+    not a failure: the fuzz matrix deliberately writes both-antisense configs
+    and they are legal files (TRAILER_PLAN §14 A4).
+
+    Returns ``{"passed", "checks", "warnings", "failure"}``; certifies
+    integrity, structure, and stats fidelity.  It cannot prove ``shuffled``
+    (a permutation attests itself no better than a flag) nor that strand
+    normalization was applied correctly; those stay stamped facts.
+    """
+    import zstandard
+    from collections import Counter
+    from zna.core import (CLOSES_FRAGMENT, OPENS_FRAGMENT,
+                          _FOOTER_SIZE as FOOTER_SIZE)
+
+    h = reader.header
+    checks: list = []
+    warnings_: list = []
+    result = {"passed": False, "checks": checks, "warnings": warnings_,
+              "failure": None}
+
+    def fail(check: str, detail: str) -> dict:
+        result["failure"] = {"check": check, "detail": detail}
+        return result
+
+    # -- 1. trailer + prologue presence -----------------------------------
+    try:
+        trailer = reader.trailer
+        prov = reader.provenance
+    except ValueError as e:
+        return fail("trailer", str(e))
+    if trailer is None or prov is None:
+        return fail(
+            "trailer",
+            "no trailer: written by zna < 0.5, or truncated — re-encode "
+            "from source either way.",
+        )
+    checks.append("trailer and prologue present, CRC valid, payloads parse")
+
+    # -- 2. stored index vs the walked file --------------------------------
+    try:
+        scanned = reader.scan_block_index()
+    except (ValueError, EOFError) as e:
+        return fail("index", f"walking the block chain failed: {e}")
+    stored = [(b.offset, b.comp_size, b.uncomp_size, b.n_records)
+              for b in reader.block_index()]
+    walked = [(b.offset, b.comp_size, b.uncomp_size, b.n_records)
+              for b in scanned]
+    if stored != walked:
+        return fail(
+            "index",
+            f"stored block index disagrees with the file: "
+            f"{len(stored)} stored vs {len(walked)} walked block(s), first "
+            f"difference at block "
+            f"{next(i for i, (a, b) in enumerate(zip(stored + [None], walked + [None])) if a != b)}.",
+        )
+    fh.seek(0, 2)
+    file_size = fh.tell()
+    sentinel_offset = (walked[-1][0] + _BLOCK_HEADER_SIZE + walked[-1][1]
+                       if walked else trailer.data_start)
+    fh.seek(sentinel_offset)
+    sent = fh.read(_BLOCK_HEADER_SIZE)
+    sc, su, sn, _sf, _sl = struct.unpack(_BLOCK_HEADER_FMT, sent)
+    if sn != 0:
+        return fail("index", f"no sentinel at offset {sentinel_offset} after "
+                             f"the last data block.")
+    if sentinel_offset + _BLOCK_HEADER_SIZE + sc != file_size:
+        return fail(
+            "index",
+            f"the sentinel's payload does not reach EOF: sentinel at "
+            f"{sentinel_offset}, comp_size {sc}, file size {file_size} — "
+            f"trailing bytes after the footer, or a mis-sized trailer.",
+        )
+    checks.append(f"stored index matches the walk ({len(walked)} blocks); "
+                  f"sentinel and footer agree")
+
+    # -- 3 + 4 + 5. decode every block, recount, check structure -----------
+    dctx = (zstandard.ZstdDecompressor()
+            if h.compression_method == COMPRESSION_ZSTD else None)
+    slb = h.seq_len_bytes
+    len_ch = {1: "B", 2: "H", 4: "I"}[slb]
+    label_bytes_per_rec = sum(ld.dtype.size for ld in h.labels)
+    flag_counts: Counter = Counter()
+    len_hist: Counter = Counter()
+    len_hist_unpaired: Counter = Counter()
+    n_records = n_bases = 0
+    for b in scanned:
+        fh.seek(b.offset)
+        _c, u_size, _n, flags_size, lengths_size = struct.unpack(
+            _BLOCK_HEADER_FMT, fh.read(_BLOCK_HEADER_SIZE))
+        payload = fh.read(b.comp_size)
+        if len(payload) != b.comp_size:
+            return fail("blocks", f"block {b.index}: payload truncated.")
+        if dctx is not None:
+            try:
+                data = dctx.decompress(payload, max_output_size=b.uncomp_size)
+            except zstandard.ZstdError as e:
+                return fail("blocks", f"block {b.index}: {e}")
+        else:
+            data = payload
+        count = b.n_records
+        if len(data) != u_size:
+            return fail("blocks", f"block {b.index}: decompressed to "
+                                  f"{len(data)} bytes, header says {u_size}.")
+        if flags_size != count or lengths_size != count * slb:
+            return fail("blocks", f"block {b.index}: column sizes do not "
+                                  f"match its record count.")
+        flags = data[:flags_size]
+        lengths_off = flags_size + count * label_bytes_per_rec
+        lengths = struct.unpack(
+            f"<{count}{len_ch}", data[lengths_off:lengths_off + lengths_size])
+        seq_stream_len = len(data) - lengths_off - lengths_size
+        if sum((L + 3) >> 2 for L in lengths) != seq_stream_len:
+            return fail("blocks", f"block {b.index}: lengths column does not "
+                                  f"tile its sequence bytes.")
+        expect_mate = False
+        for fl in flags:
+            if CLOSES_FRAGMENT[fl] != expect_mate:
+                return fail("structure", f"block {b.index}: paired R1/R2 "
+                                         f"adjacency violated.")
+            expect_mate = OPENS_FRAGMENT[fl]
+        if expect_mate:
+            return fail("structure", f"block {b.index} ends on an unmatched "
+                                     f"paired R1 (fragment split across blocks).")
+        n_records += count
+        for fl in set(flags):
+            flag_counts[fl] += flags.count(fl)
+        n_bases += sum(lengths)
+        for L, fl in zip(lengths, flags):
+            len_hist[L] += 1
+            if not (fl & 0x04):
+                len_hist_unpaired[L] += 1
+    checks.append(f"{len(walked)} block(s) decode cleanly; columns tile; "
+                  f"fragments whole")
+
+    n_paired = sum(c for f, c in flag_counts.items() if f & 0x04)
+    recount = {
+        "n_records": n_records, "n_bases": n_bases,
+        "n_pairs": n_paired // 2, "n_unpaired": n_records - n_paired,
+        "flag_counts": dict(flag_counts),
+        "length_histogram": dict(len_hist),
+        "length_histogram_unpaired": dict(len_hist_unpaired),
+    }
+    stated = {
+        "n_records": trailer.n_records, "n_bases": trailer.n_bases,
+        "n_pairs": trailer.n_pairs, "n_unpaired": trailer.n_unpaired,
+        "flag_counts": trailer.flag_counts,
+        "length_histogram": trailer.length_histogram,
+        "length_histogram_unpaired": trailer.length_histogram_unpaired,
+    }
+    for key in stated:
+        if stated[key] != recount[key]:
+            return fail("stats", f"trailer's {key} does not match a recount "
+                                 f"of the file.")
+    if trailer.prologue_crc32 != prov.crc32:
+        return fail("stats", "trailer's prologue_crc32 does not match the "
+                             "prologue as stored.")
+    checks.append("recounted stats equal the trailer")
+
+    if (h.strand_specific and h.strand_normalized
+            and h.read1_antisense == h.read2_antisense):
+        warnings_.append(
+            "stranded and normalized, but both mates share one antisense "
+            "setting — legal, but unusual for a real protocol."
+        )
+
+    result["passed"] = True
+    return result
+
+
 def _inspect_json(args, fh, reader, h, file_size) -> None:
     """Emit one machine-readable object describing the file.
 
@@ -1747,6 +1936,15 @@ def _inspect_json(args, fh, reader, h, file_size) -> None:
         out["uncompressed_payload"] / comp if comp else 1.0
     )
 
+    # The two metadata payloads, verbatim -- khorana's indexer reads these.
+    prov = reader.provenance
+    trailer = reader.trailer          # raises on a corrupt trailer, on purpose
+    out["provenance"] = prov.raw if prov is not None else None
+    out["trailer"] = trailer.raw if trailer is not None else None
+
+    if getattr(args, 'verify', False):
+        out["verify"] = _verify_zna(fh, reader)
+
     if getattr(args, 'blocks', False):
         out["blocks"] = [
             {"index": b.index, "offset": b.offset, "n_records": b.n_records,
@@ -1759,6 +1957,8 @@ def _inspect_json(args, fh, reader, h, file_size) -> None:
 
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
+    if getattr(args, 'verify', False) and not out["verify"]["passed"]:
+        sys.exit(1)
 
 
 def _scan_flag_counts(fh, reader, h) -> dict:
@@ -1851,6 +2051,23 @@ def inspect_command(args):
                 miss_str = f"  [missing={ldef.missing}]" if ldef.missing is not None else ""
                 print(f"  [{ldef.label_id}] {ldef.name:<4}{type_info}{desc_str}{miss_str}")
 
+        # Corrupt metadata is an error, not a shrug: a trailer that is
+        # PRESENT but damaged must never read as "absent".
+        try:
+            prov = reader.provenance
+            trailer = reader.trailer
+        except ValueError as e:
+            sys.exit(f"Error: {e}")
+
+        print("\n--- Provenance ---")
+        if prov is not None:
+            print(f"Writer:           zna {prov.writer_version}")
+            print(f"Shuffled:         {prov.shuffled}")
+            if prov.merged_in_process:
+                print(f"Merged in-process:True")
+        else:
+            print("(none: written by zna < 0.5, or truncated)")
+
         # Block stats come from block_index(): the stored trailer index on a
         # 0.5 file, one 20-byte read per block otherwise.  The hand-rolled walk
         # this replaces seeked to a hand-computed header offset that measured
@@ -1865,6 +2082,29 @@ def inspect_command(args):
         total_records = sum(b.n_records for b in index)
         compressed_payload = sum(b.comp_size for b in index)
         uncompressed_payload = sum(b.uncomp_size for b in index)
+
+        if trailer is not None:
+            # The cheap structural pass every inspect gets for free: the
+            # stored index against a walk of the actual headers.
+            walked = reader.scan_block_index()
+            if [tuple(b) for b in index] != [tuple(b) for b in walked]:
+                sys.exit(
+                    f"Error: stored block index disagrees with the file "
+                    f"({len(index)} stored vs {len(walked)} walked) — "
+                    f"corrupt or truncated. Run --verify for detail."
+                )
+
+        if getattr(args, 'verify', False):
+            v = _verify_zna(f, reader)
+            print("\n--- Verification ---")
+            for c in v["checks"]:
+                print(f"  ok  {c}")
+            for wmsg in v["warnings"]:
+                print(f"  [Warning] {wmsg}")
+            if not v["passed"]:
+                fl = v["failure"]
+                sys.exit(f"  FAILED [{fl['check']}] {fl['detail']}")
+            print("  PASSED: integrity, structure, and stats certified")
 
         count_flags = getattr(args, 'counts', False)
         if count_flags:
@@ -1881,6 +2121,9 @@ def inspect_command(args):
         print("\n--- Content Statistics ---")
         print(f"Total Blocks:       {block_count}")
         print(f"Total Records:      {total_records}")
+        if trailer is not None:
+            print(f"Total Bases:        {trailer.n_bases}")
+            print(f"Pairs / Unpaired:   {trailer.n_pairs} / {trailer.n_unpaired}")
 
         if count_flags:
             print(f"  Paired R1:        {n_paired_r1}")
@@ -2060,6 +2303,11 @@ def main():
     # --- INSPECT ---
     insp = subparsers.add_parser("inspect", help="Show ZNA file statistics")
     insp.add_argument("input", help="Input .zna file")
+    insp.add_argument("--verify", action="store_true",
+                      help="Fully certify the file: decode every block, recount "
+                           "every stat, and compare against its trailer. Exit 0 "
+                           "iff the file passes. A bare inspect already runs the "
+                           "cheap structural checks; this is the paid tier.")
     insp.add_argument("--json", action="store_true",
                       help="Emit machine-readable JSON instead of text. Includes "
                            "n_records and n_blocks, read from block headers "
