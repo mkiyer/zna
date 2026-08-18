@@ -533,13 +533,24 @@ class ZnaWriter:
         # fragment; raising the pairing error on top of it would replace the cause
         # with its symptom.
         if exc_type is not None:
-            self._expect_mate = False
             # Flush what was buffered so every block on disk stays whole, but
             # write NO trailer: the trailer is the writer's signature that the
             # encode finished, and a crashed encode must not produce a file
             # that certifies.  ``records()`` still reads the blocks -- EOF
             # termination is retained for exactly this shape of file -- while
             # ``zna inspect --verify`` refuses it.
+            #
+            # An open fragment cannot be flushed whole: if the buffer ends on
+            # a paired R1 whose mate never arrived, that one record is dropped
+            # rather than written -- a block ending mid-fragment would violate
+            # the very invariant "blocks stay whole" names.
+            if self._expect_mate and self._batch_seqs:
+                self._batch_seqs.pop()
+                self._batch_flags.pop()
+                for col in self._batch_labels:
+                    if col:
+                        col.pop()
+            self._expect_mate = False
             self._flush_block()
             self._closed = True
             return
@@ -559,7 +570,14 @@ class ZnaWriter:
         if self._closed:
             return
         if self._expect_mate:
-            self._expect_mate = False  # do not re-raise if close() is called again
+            # The writer is finished either way: a second close() must be a
+            # no-op, not a flush of the orphaned R1 -- that would write a
+            # block ending mid-fragment AND sign it with a trailer whose
+            # pair counts cannot balance.  The buffered tail dies with the
+            # writer, exactly as this docstring promises, and the file on
+            # disk -- whole blocks, no trailer -- reads but does not certify.
+            self._expect_mate = False
+            self._closed = True
             raise ValueError(
                 "the record stream ended on a paired R1 whose R2 never arrived. "
                 "Every fragment must be written whole, R1 immediately followed by R2; "
@@ -664,6 +682,11 @@ class ZnaWriter:
                 f"allowed by header (seq_len_bytes={self._seq_len_bytes})"
             )
 
+        if self._closed:
+            raise ValueError(
+                "this ZnaWriter is closed; a record written now would land "
+                "after the trailer and be invisible to every reader."
+            )
         flag = (
             (1 if is_read1 else 0) | (2 if is_read2 else 0) | (4 if is_paired else 0)
             | (8 if is_rc else 0) | (16 if is_full_fragment else 0)
@@ -718,6 +741,11 @@ class ZnaWriter:
                 f"allowed by header (seq_len_bytes={self._seq_len_bytes})"
             )
         flag = rec[1]
+        if self._closed:
+            raise ValueError(
+                "this ZnaWriter is closed; a record written now would land "
+                "after the trailer and be invisible to every reader."
+            )
         if CLOSES_FRAGMENT[flag] != self._expect_mate:
             raise self._bad_fragment(flag)
         if self._label_defs:
@@ -755,6 +783,11 @@ class ZnaWriter:
         Note: this method does not support labels. Use :meth:`write_record`
         for labeled files.
         """
+        if self._closed:
+            raise ValueError(
+                "this ZnaWriter is closed; records written now would land "
+                "after the trailer and be invisible to every reader."
+            )
         if self._label_defs:
             raise TypeError(
                 "write_records() does not support labels. "
@@ -1156,12 +1189,12 @@ class ZnaReader:
 
     def _parse_prologue(self, comp_size: int, uncomp_size: int) -> ZnaProvenance:
         payload = self._read_exact(comp_size)
-        if self._header.compression_method == COMPRESSION_ZSTD:
-            raw = zstandard.ZstdDecompressor().decompress(
-                payload, max_output_size=uncomp_size)
-        else:
-            raw = payload
         try:
+            if self._header.compression_method == COMPRESSION_ZSTD:
+                raw = zstandard.ZstdDecompressor().decompress(
+                    payload, max_output_size=uncomp_size)
+            else:
+                raw = payload
             d = json.loads(raw)
             return ZnaProvenance(
                 writer_version=d["writer_version"],
@@ -1170,7 +1203,7 @@ class ZnaReader:
                 crc32=zlib.crc32(payload) & 0xFFFFFFFF,
                 raw=d,
             )
-        except (ValueError, KeyError, TypeError) as e:
+        except (ValueError, KeyError, TypeError, zstandard.ZstdError) as e:
             raise ValueError(
                 f"Corrupt provenance prologue: {e}. The file's data blocks may "
                 f"be intact, but its provenance cannot be trusted."
@@ -1231,7 +1264,8 @@ class ZnaReader:
                 )
             payload_start = sentinel_offset + _BLOCK_HEADER_SIZE
             payload_end = file_size - _FOOTER_SIZE
-            if not (self._data_start <= sentinel_offset < payload_end):
+            if not (self._data_start <= sentinel_offset
+                    and sentinel_offset + _BLOCK_HEADER_SIZE <= payload_end):
                 raise ValueError(
                     f"Trailer footer points at sentinel offset "
                     f"{sentinel_offset}, outside the file's data region — "
@@ -1258,6 +1292,11 @@ class ZnaReader:
             try:
                 d = json.loads(raw)
                 blocks = d["blocks"]
+                if blocks["data_start"] != self._data_start:
+                    raise ValueError(
+                        f"trailer says data starts at {blocks['data_start']}, "
+                        f"but the reader found it at {self._data_start}"
+                    )
                 self._trailer = ZnaTrailer(
                     n_records=d["n_records"],
                     n_bases=d["n_bases"],
@@ -1621,8 +1660,10 @@ class ZnaReader:
             )
             if count == 0:
                 # The trailer sentinel: end of data.  Deliberately not counted
-                # as a block, so the empty-shard warning above reports the
-                # number of DATA blocks a stride could have matched.
+                # as a block, so the empty-shard warning at loop exit reports
+                # the number of DATA blocks a stride could have matched.  The
+                # payload is consumed so a second walk finds a clean EOF.
+                fh_read(comp_size)
                 break
 
             index += 1
@@ -1746,7 +1787,13 @@ class ZnaReader:
             )
             if count == 0:
                 # The trailer sentinel: end of data.  (EOF termination above is
-                # retained for 0.4.1-era files and aborted encodes.)
+                # retained for 0.4.1-era files and aborted encodes.)  The
+                # payload is consumed -- comp_size runs to EOF -- so a second
+                # walk on this reader finds a clean end, not trailer bytes
+                # misread as a block header.  Short reads are fine here: the
+                # records were all delivered, and trailer damage is
+                # ``inspect --verify``'s business, not iteration's.
+                fh_read(comp_size)
                 break
 
             block_payload = read_exact(comp_size)

@@ -259,6 +259,44 @@ class TestWriterEdges(unittest.TestCase):
         self.assertIsNone(r.trailer)                     # not certified...
         self.assertEqual(len(list(r.records())), 1)      # ...but readable
 
+    def test_dangling_r1_poisons_the_writer(self):
+        """After the dangling-R1 error a second close() is a no-op -- it must
+        not flush the orphan (a block ending mid-fragment) nor sign a trailer
+        whose pair counts cannot balance."""
+        buf = io.BytesIO()
+        w = ZnaWriter(buf, ZnaHeader(read_group="x", seq_len_bytes=2,
+                                     compression_method=COMPRESSION_ZSTD))
+        w.write_record("ACGTACGT", True, True, False)
+        w.write_record("TTTTGGGG", True, False, True)
+        w.write_record("CCCCAAAA", True, True, False)      # orphan
+        with self.assertRaisesRegex(ValueError, "R2 never arrived"):
+            w.close()
+        size = len(buf.getvalue())
+        w.close()                                          # silent no-op
+        self.assertEqual(len(buf.getvalue()), size)
+        r = ZnaReader(io.BytesIO(buf.getvalue()))
+        self.assertIsNone(r.trailer)                       # not certified
+        # The whole buffered tail died with the writer, as close() documents.
+        self.assertEqual(list(r.records()), [])
+
+    def test_abort_drops_an_open_fragment_but_flushes_whole_ones(self):
+        """The __exit__ abort path may not write a block ending on a lone R1:
+        the orphan is dropped, everything complete before it survives."""
+        from zna.core import OPENS_FRAGMENT
+        buf = io.BytesIO()
+        with self.assertRaises(RuntimeError):
+            with ZnaWriter(buf, ZnaHeader(read_group="x", seq_len_bytes=2,
+                                          compression_method=COMPRESSION_ZSTD)) as w:
+                w.write_record("ACGTACGT", True, True, False)
+                w.write_record("TTTTGGGG", True, False, True)
+                w.write_record("CCCCAAAA", True, True, False)   # open fragment
+                raise RuntimeError("crash")
+        recs = list(ZnaReader(io.BytesIO(buf.getvalue())).records())
+        self.assertEqual(len(recs), 2)
+        for seqs, flags in ZnaReader(io.BytesIO(buf.getvalue())).blocks():
+            self.assertFalse(OPENS_FRAGMENT[flags[-1]],
+                             "a flushed block ends mid-fragment")
+
     def test_close_is_idempotent(self):
         buf = io.BytesIO()
         w = ZnaWriter(buf, ZnaHeader(read_group="x", seq_len_bytes=2,
@@ -268,6 +306,48 @@ class TestWriterEdges(unittest.TestCase):
         size = len(buf.getvalue())
         w.close()
         self.assertEqual(len(buf.getvalue()), size, "second close wrote bytes")
+
+    def test_a_closed_writer_refuses_writes(self):
+        """A record accepted after close() would land behind the sentinel,
+        invisible to every reader -- silent data loss, so it raises instead."""
+        w = ZnaWriter(io.BytesIO(), ZnaHeader(read_group="x", seq_len_bytes=2,
+                                              compression_method=COMPRESSION_ZSTD))
+        w.write_record("ACGT", False, False, False)
+        w.close()
+        with self.assertRaisesRegex(ValueError, "closed"):
+            w.write_record("ACGT", False, False, False)
+        with self.assertRaisesRegex(ValueError, "closed"):
+            w.write_records([("ACGT", False, False, False)])
+
+    def test_a_second_walk_on_an_exhausted_reader_is_empty(self):
+        """Sentinel termination consumes the trailer bytes, so a re-walk sees
+        a clean EOF -- identical to the 0.4.1 second-walk behavior -- rather
+        than trailer bytes misread as a block header."""
+        data = build()
+        r = ZnaReader(io.BytesIO(data))
+        self.assertEqual(len(list(r.records())), 85)
+        self.assertEqual(list(r.records()), [])
+        r2 = ZnaReader(io.BytesIO(data))
+        self.assertEqual(sum(len(s) for s, _f in r2.blocks()), 85)
+        self.assertEqual(list(r2.blocks()), [])
+
+    def test_corrupt_prologue_raises_valueerror(self):
+        """A flipped prologue byte must surface as the documented ValueError,
+        whatever the underlying decoder raised."""
+        data = build()
+        t = ZnaReader(io.BytesIO(data)).trailer
+        b = bytearray(data)
+        for plen in range(t.data_start):
+            off = t.data_start - _BLOCK_HEADER_SIZE - plen
+            if off < 0:
+                break
+            c, _u, n, f_, l_ = struct.unpack(
+                _BLOCK_HEADER_FMT, bytes(b[off:off + _BLOCK_HEADER_SIZE]))
+            if c == plen and n == 0 and f_ == 0 and l_ == 0:
+                b[off + _BLOCK_HEADER_SIZE + 3] ^= 0xFF
+                break
+        with self.assertRaisesRegex(ValueError, "prologue"):
+            ZnaReader(io.BytesIO(bytes(b)))
 
     def test_every_seq_len_width(self):
         for slb in (1, 2, 4):
