@@ -9,7 +9,8 @@
 > where a fragment does, so it overruns its size target by at most one record —
 > and left the block payload's layout untouched.
 >
-> For current throughput see the table in [`../README.md`](../README.md), and
+> For current throughput see the table in [`../README.md`](../README.md) — its
+> "Re-measured at 0.5.1" note carries fresh 150 bp figures — and
 > [`../CHANGELOG.md`](../CHANGELOG.md) for the per-path deltas.
 
 Benchmarks on Apple Silicon (M-series), Python 3.12, March 2026.

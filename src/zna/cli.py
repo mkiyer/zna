@@ -3,6 +3,7 @@ import argparse
 import gzip
 import io
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -155,43 +156,14 @@ def get_output_handle(filepath: Optional[str]) -> BinaryIO:
         return sys.stdout.buffer
     return open(filepath, "wb")
 
-def open_text_output(filepath: str, compress: bool = False) -> IO[str]:
-    """
-    Opens a file for text writing (FASTA), optionally with gzip.
-    """
-    if compress or filepath.endswith(".gz"):
+def open_text_output(filepath: str) -> IO[str]:
+    """Open a file for text writing (FASTA); gzip inferred from the extension."""
+    if filepath.endswith(".gz"):
         return gzip.open(filepath, "wt")
     return open(filepath, "w")
 
 
 # --- PARSERS ---
-
-def get_base_name(full_name: str) -> str:
-    """
-    Extracts base read ID for pairing verification.
-    Handles headers like: @ID/1 merged_... or @ID comment
-    Returns 'ID' without /1 or /2 suffix and without comments.
-    """
-    # Split on whitespace to remove comments
-    read_id = full_name.split()[0]
-    # Split on slash to remove /1 or /2 pair indicators
-    if "/" in read_id:
-        return read_id.rsplit("/", 1)[0]
-    return read_id
-
-
-def get_read_suffix_number(full_name: str) -> int:
-    """
-    Returns 1 if name ends in /1, 2 if /2, else 0.
-    Considers only the ID part before whitespace.
-    """
-    read_id = full_name.split()[0]
-    if read_id.endswith("/1"):
-        return 1
-    if read_id.endswith("/2"):
-        return 2
-    return 0
-
 
 #: ``suffix_number`` for a record that is a merged read rather than a mate.  Negative so
 #: it can never collide with a real mate number, and so ``if suffix`` still reads as
@@ -273,29 +245,6 @@ def parse_fastq(fh: BinaryIO) -> Iterator[str]:
         readline()  # Quality line (discard)
         if seq_line:
             yield seq_line.rstrip(b"\r\n").decode('ascii')
-
-
-def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
-    """Yields (read_name, sequence) tuples from FASTQ stream.
-    
-    Optimized for minimal overhead.
-    """
-    readline = fh.readline  # Cache method lookup
-    while True:
-        header = readline()
-        if not header: 
-            break
-        if header[0] != 64:  # ord('@') = 64
-            continue
-        # Extract read name (skip @ and strip)
-        read_name = header[1:].rstrip(b"\r\n").decode('ascii')
-        
-        seq_line = readline()
-        readline()  # + line
-        readline()  # Quality line
-        
-        if seq_line:
-            yield read_name, seq_line.rstrip(b"\r\n").decode('ascii')
 
 
 def parse_fastq_keyed(fh: BinaryIO) -> Iterator[Tuple[bytes, int, str]]:
@@ -758,17 +707,16 @@ def is_zna_file(filepath: Optional[str]) -> bool:
 # Each strategy is a focused generator for a specific input mode.
 
 def _stream_zna_reencode(
-    filepath: str, with_ends: bool = False
+    filepath: str
 ) -> Iterator[Tuple[str, bool, bool, bool]]:
     """Stream records from an existing ZNA file for reencoding.
 
-    With *with_ends*, each record carries ``has_start, has_end`` — the lossless
     form of ``IS_RC`` plus ``IS_FULL_FRAGMENT`` — so the writer can copy the
     existing orientation and fragment-span verbatim instead of re-deriving them.
     """
     with open(filepath, "rb") as f:
         reader = ZnaReader(f)
-        for record in reader.records(with_ends=with_ends):
+        for record in reader.records():
             yield record
 
 
@@ -935,7 +883,7 @@ def _infer_format(filepath: Optional[str], format_override: Optional[str]) -> st
     return 'fastq'  # default
 
 
-def stream_inputs(args, with_ends: bool = False) -> Iterator[Tuple[str, bool, bool, bool]]:
+def stream_inputs(args) -> Iterator[Tuple[str, bool, bool, bool]]:
     """
     Uniform generator yielding (sequence, is_paired, is_read1, is_read2).
     Dispatches to appropriate strategy based on input configuration.
@@ -945,7 +893,6 @@ def stream_inputs(args, with_ends: bool = False) -> Iterator[Tuple[str, bool, bo
     - 1 file: read from file (single or interleaved, or ZNA for reencoding)
     - 2 files: paired-end (read1, read2)
 
-    *with_ends* applies to the ZNA re-encode mode only, where it appends each
     record's boundary geometry: ``(seq, is_paired, is_read1, is_read2,
     has_start, has_end)``.  Every other input mode is producing fresh records
     that have no orientation history, so they are unaffected.
@@ -961,7 +908,7 @@ def stream_inputs(args, with_ends: bool = False) -> Iterator[Tuple[str, bool, bo
     
     # Special case: single ZNA file = reencoding mode
     if len(files) == 1 and is_zna_file(files[0]):
-        yield from _stream_zna_reencode(files[0], with_ends=with_ends)
+        yield from _stream_zna_reencode(files[0])
         return
     
     with ExitStack() as stack:
@@ -1128,11 +1075,33 @@ def stream_inputs_labeled(
                          "(labels are parsed from SAM tags in the read header).")
             f1 = stack.enter_context(get_input_handle(files[0]))
             f2 = stack.enter_context(get_input_handle(files[1]))
-            for (s1, l1), (s2, l2) in zip(_labeled_seqs(f1, extract),
-                                          _labeled_seqs(f2, extract)):
-                yield s1, True, True, False, l1
-                yield s2, True, False, True, l2
-            return
+            # Pull BOTH streams explicitly, never ``zip``: zip stops at the
+            # shorter input, so an R2 file with fewer records truncated the
+            # library silently at exit 0.  The unlabeled path replaced this
+            # exact construct for this exact reason (see _stream_paired_files);
+            # the labeled path had drifted back to it.
+            p1 = _labeled_seqs(f1, extract)
+            p2 = _labeled_seqs(f2, extract)
+            end = _END
+            while True:
+                a = next(p1, end)
+                b = next(p2, end)
+                if a is end:
+                    if b is end:
+                        return
+                    longer, shorter = files[1], files[0]
+                    break
+                if b is end:
+                    longer, shorter = files[0], files[1]
+                    break
+                yield a[0], True, True, False, a[1]
+                yield b[0], True, False, True, b[1]
+            sys.exit(
+                f"Error: {_name_of(shorter)} ran out of records before "
+                f"{_name_of(longer)}. Paired-end input must hold the same number "
+                f"of records in both files; encoding what was read would "
+                f"silently drop the rest of the library."
+            )
 
         src = files[0] if len(files) == 1 else None
         if _infer_format(src, format_override) != 'fastq':
@@ -1555,21 +1524,32 @@ def encode_command(args):
             # to the writer's strand-normalization settings, which compose
             # with this stream unchanged (plan §0.2).
             #
-            # _fragment_units still groups mates -- the kernel emits MATE1
-            # immediately followed by MATE2, and grouping is what the writer's
-            # fragment contract expects to see arrive together (plan §6.8).
-            for unit in _fragment_units(stream):
-                npolicy_total_bases += sum(len(rec[0]) for rec in unit)
-                for rec in unit:
-                    writer.write_record(
-                        rec[0], rec[1], rec[2], rec[3],
-                        labels=rec[6] if label_defs else None,
-                        is_full_fragment=rec[4] and rec[5])
-                count += len(unit)
-                if (count % 1_000_000 < len(unit) and count >= 1_000_000
-                        and show_progress):
-                    print(f"      Processed {count//1_000_000}M records...",
-                          end='\r', file=sys.stderr)
+            # A direct loop, no _fragment_units: the kernel emits MATE1
+            # immediately followed by MATE2, and ZnaWriter's own
+            # CLOSES_FRAGMENT check enforces the fragment contract on every
+            # record regardless -- grouping here bought nothing but a
+            # generator resume and a list per fragment (measured 25% of the
+            # write loop).  No npolicy tallying either: under --merge-pairs
+            # the policy ran inside the kernel and the summary reports the
+            # kernel's numbers.
+            write_record = writer.write_record
+            if label_defs:
+                for rec in stream:
+                    write_record(rec[0], rec[1], rec[2], rec[3],
+                                 labels=rec[6],
+                                 is_full_fragment=rec[4] and rec[5])
+                    count += 1
+                    if show_progress and count % 1_000_000 == 0:
+                        print(f"      Processed {count//1_000_000}M records...",
+                              end='\r', file=sys.stderr)
+            else:
+                for rec in stream:
+                    write_record(rec[0], rec[1], rec[2], rec[3],
+                                 is_full_fragment=rec[4] and rec[5])
+                    count += 1
+                    if show_progress and count % 1_000_000 == 0:
+                        print(f"      Processed {count//1_000_000}M records...",
+                              end='\r', file=sys.stderr)
         else:
             for unit in _fragment_units(stream):
                 if trim3:
@@ -1809,6 +1789,12 @@ def decode_command(args):
                     else:
                         outs[0].write(record)
             else:
+                # Records are buffered and written one join per batch: the
+                # per-record ``write()`` call was the measured hot spot of this
+                # loop (11% of a 1M-record decode), not the f-string.
+                split = mode == "split"
+                buf_main: list = []
+                buf_r2: list = []
                 for rec in reader.records(restore_strand=restore_strand):
                     if has_labels:
                         seq, is_paired, is_r1, is_r2, _labels = rec
@@ -1821,10 +1807,20 @@ def decode_command(args):
                     elif is_r2: suffix = "/2"
                     record = f">{rg}:{counter}{suffix}\n{seq}\n"
 
-                    if mode == "split" and is_r2:
-                        outs[1].write(record)
+                    if split and is_r2:
+                        buf_r2.append(record)
+                        if len(buf_r2) >= 8192:
+                            outs[1].write("".join(buf_r2))
+                            buf_r2.clear()
                     else:
-                        outs[0].write(record)
+                        buf_main.append(record)
+                        if len(buf_main) >= 8192:
+                            outs[0].write("".join(buf_main))
+                            buf_main.clear()
+                if buf_main:
+                    outs[0].write("".join(buf_main))
+                if buf_r2:
+                    outs[1].write("".join(buf_r2))
 
     except BrokenPipeError:
         sys.stderr.close()
@@ -1834,6 +1830,24 @@ def decode_command(args):
 
 
 # --- COMMAND: INSPECT ---
+
+#: flag byte -> fragment-adjacency category, for the verify pass:
+#: O opens a fragment (paired R1), C closes one (paired R2), B does both
+#: (a corrupt byte with R1|R2|PAIRED all set), S stands alone.  A valid flags
+#: column is exactly ``(S | O B* C)*`` -- the regex form of the writer's
+#: expect-mate state machine, checked at C speed instead of per record.
+#: Equivalence to the state machine was fuzz-verified over 60k random streams
+#: including B-dense ones; a non-empty remainder matching ``OB*\Z`` is the
+#: "ends on an unmatched R1" case, anything else is an adjacency violation.
+_VERIFY_CAT = bytes(
+    (ord("B") if ((f & 0x05) == 0x05 and (f & 0x06) == 0x06) else
+     ord("O") if (f & 0x05) == 0x05 else
+     ord("C") if (f & 0x06) == 0x06 else ord("S"))
+    for f in range(256)
+)
+_VERIFY_OK = re.compile(rb"(?:S|OB*C)*")
+_VERIFY_TAIL_R1 = re.compile(rb"OB*\Z")
+
 
 def _verify_zna(fh, reader) -> dict:
     """Full certification of one open ZNA file (``zna inspect --verify``).
@@ -1866,8 +1880,8 @@ def _verify_zna(fh, reader) -> dict:
     """
     import zstandard
     from collections import Counter
-    from zna.core import (CLOSES_FRAGMENT, OPENS_FRAGMENT,
-                          _FOOTER_SIZE as FOOTER_SIZE)
+    from itertools import compress
+    from zna.core import _UNPAIRED_SELECTOR
 
     h = reader.header
     checks: list = []
@@ -1966,26 +1980,33 @@ def _verify_zna(fh, reader) -> dict:
         lengths = struct.unpack(
             f"<{count}{len_ch}", data[lengths_off:lengths_off + lengths_size])
         seq_stream_len = len(data) - lengths_off - lengths_size
-        if sum((L + 3) >> 2 for L in lengths) != seq_stream_len:
+        # Everything below runs per DISTINCT value, not per record: a verify
+        # of a 1M-record file spent ~95% of its block pass in the per-record
+        # Python loops this replaces (measured 2.3-2.6x end to end).
+        hist = Counter(lengths)
+        if sum(((L + 3) >> 2) * c for L, c in hist.items()) != seq_stream_len:
             return fail("blocks", f"block {b.index}: lengths column does not "
                                   f"tile its sequence bytes.")
-        expect_mate = False
-        for fl in flags:
-            if CLOSES_FRAGMENT[fl] != expect_mate:
-                return fail("structure", f"block {b.index}: paired R1/R2 "
-                                         f"adjacency violated.")
-            expect_mate = OPENS_FRAGMENT[fl]
-        if expect_mate:
-            return fail("structure", f"block {b.index} ends on an unmatched "
-                                     f"paired R1 (fragment split across blocks).")
+        cats = flags.translate(_VERIFY_CAT)
+        m = _VERIFY_OK.match(cats)
+        if m.end() != len(cats):
+            if _VERIFY_TAIL_R1.fullmatch(cats, m.end()):
+                return fail("structure",
+                            f"block {b.index} ends on an unmatched paired R1 "
+                            f"(fragment split across blocks).")
+            return fail("structure", f"block {b.index}: paired R1/R2 "
+                                     f"adjacency violated.")
         n_records += count
         for fl in set(flags):
             flag_counts[fl] += flags.count(fl)
-        n_bases += sum(lengths)
-        for L, fl in zip(lengths, flags):
-            len_hist[L] += 1
-            if not (fl & 0x04):
-                len_hist_unpaired[L] += 1
+        n_bases += sum(L * c for L, c in hist.items())
+        len_hist.update(hist)
+        selector = flags.translate(_UNPAIRED_SELECTOR)
+        n_unp = selector.count(1)
+        if n_unp == count:
+            len_hist_unpaired.update(hist)
+        elif n_unp:
+            len_hist_unpaired.update(compress(lengths, selector))
     checks.append(f"{len(walked)} block(s) decode cleanly; columns tile; "
                   f"fragments whole")
 
@@ -2098,20 +2119,31 @@ def _inspect_json(args, fh, reader, h, file_size) -> None:
 
 
 def _scan_flag_counts(fh, reader, h) -> dict:
-    """Per-flag record tallies, decompressing only each block's flags column."""
+    """Per-flag record tallies, decompressing only each block's flags column.
+
+    Per-DISTINCT-byte, not per record: the flags column has at most a dozen
+    reachable values, so ``set()`` + ``bytes.count`` keeps the whole tally at C
+    speed and the Python branches run once per distinct value per block — the
+    same idiom ``_flush_block`` uses for the trailer's flag counts.  Measured
+    8.7x on a 1M-record file, and ``inspect --json --counts`` is corpus-
+    cataloguing tooling, so this runs at corpus scale.
+    """
     import zstandard
 
     dctx = (zstandard.ZstdDecompressor()
             if h.compression_method == COMPRESSION_ZSTD else None)
-    tally = {"paired_r1": 0, "paired_r2": 0, "single_or_merged": 0,
-             "reverse_complemented": 0, "full_fragment": 0,
-             "rc_by_mate": {"R1": 0, "R2": 0, "single_or_merged": 0}}
+    by_flag = [0] * 256
 
     fh.seek(reader._data_start)
     while True:
         b_header = fh.read(_BLOCK_HEADER_SIZE)
-        if not b_header or len(b_header) < _BLOCK_HEADER_SIZE:
+        if not b_header:
             break
+        if len(b_header) < _BLOCK_HEADER_SIZE:
+            raise EOFError(
+                f"Incomplete block header while tallying flags "
+                f"({len(b_header)} of {_BLOCK_HEADER_SIZE} bytes) — truncated file."
+            )
         c_size, _u, _n, flags_size, _l = struct.unpack(_BLOCK_HEADER_FMT, b_header)
         if _n == 0:
             break  # the trailer sentinel: end of data
@@ -2120,24 +2152,35 @@ def _scan_flag_counts(fh, reader, h) -> dict:
         else:
             flags_bytes = fh.read(flags_size)
             fh.seek(c_size - flags_size, 1)
-        for fl in flags_bytes:
-            rc = fl & 8
+        if len(flags_bytes) < flags_size:
+            raise EOFError("Block flags column truncated mid-file.")
+        for fl in set(flags_bytes):
+            by_flag[fl] += flags_bytes.count(fl)
+
+    tally = {"paired_r1": 0, "paired_r2": 0, "single_or_merged": 0,
+             "reverse_complemented": 0, "full_fragment": 0,
+             "rc_by_mate": {"R1": 0, "R2": 0, "single_or_merged": 0}}
+    for fl in range(256):
+        n = by_flag[fl]
+        if not n:
+            continue
+        rc = fl & 8
+        if rc:
+            tally["reverse_complemented"] += n
+        if fl & 16:
+            tally["full_fragment"] += n
+        if fl & 1:
+            tally["paired_r1"] += n
             if rc:
-                tally["reverse_complemented"] += 1
-            if fl & 16:
-                tally["full_fragment"] += 1
-            if fl & 1:
-                tally["paired_r1"] += 1
-                if rc:
-                    tally["rc_by_mate"]["R1"] += 1
-            elif fl & 2:
-                tally["paired_r2"] += 1
-                if rc:
-                    tally["rc_by_mate"]["R2"] += 1
-            else:
-                tally["single_or_merged"] += 1
-                if rc:
-                    tally["rc_by_mate"]["single_or_merged"] += 1
+                tally["rc_by_mate"]["R1"] += n
+        elif fl & 2:
+            tally["paired_r2"] += n
+            if rc:
+                tally["rc_by_mate"]["R2"] += n
+        else:
+            tally["single_or_merged"] += n
+            if rc:
+                tally["rc_by_mate"]["single_or_merged"] += n
     return tally
 
 

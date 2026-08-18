@@ -5,7 +5,7 @@ commit, 492 test functions green); implemented the same day — §14 records whe
 implementation overrode the text above, and the owner's rulings on §13. Line references were verified at that commit and will drift;
 resolve them by symbol, not by line.
 
-Companion documents: [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md) (rides the same release, specified
+Companion documents: [MERGE_PAIRS_PLAN.md](archive/MERGE_PAIRS_PLAN.md) (rides the same release, specified
 separately), [RELEASING.md](RELEASING.md) (the release this lands in), and khorana's
 `docs/DATA_SERVICE_DESIGN.md` §6.1/§17 (the consumer whose problem this solves).
 
@@ -259,7 +259,7 @@ after every fetch.
 
 ## 8. `--merge-pairs` rides the same release
 
-[MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md) is the specification; it is not restated here. Three
+[MERGE_PAIRS_PLAN.md](archive/MERGE_PAIRS_PLAN.md) is the specification; it is not restated here. Three
 interactions with this plan, resolving two of its open questions:
 
 - Its output goes through `ZnaWriter`, so the trailer is automatic; it additionally stamps

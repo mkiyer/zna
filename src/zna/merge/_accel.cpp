@@ -264,7 +264,8 @@ NB_MODULE(_accel, m) {
           nb::arg("pair_index") = 0,
           "Classify one pair and build its output records.\n"
           "Returns (records, outcome, n_dropped, score_q, overlap_len, mismatches,\n"
-          "         bases_consensus_changed, trim_guard_fired).");
+          "         bases_consensus_changed, trim_guard_fired, npolicy_bases,\n"
+          "         n_rescued).");
 
     m.def("merge_chunk", &merge_chunk,
           nb::arg("buf1"), nb::arg("start1"), nb::arg("end1"),

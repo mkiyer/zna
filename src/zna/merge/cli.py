@@ -167,9 +167,13 @@ def _run_merge(args, params):
     # has to be comfortably larger than one chunk's worth of them.
     target = max(_READ_BLOCK, args.chunk_size * 1024)
 
-    r1 = _RawStream(args.in1, 1)
-    r2 = _RawStream(args.in2, 1)
+    # Both streams constructed inside the try, closed in a nested finally:
+    # each owns a pigz child and a prefetch thread, and an unreadable in2 (or
+    # an in1 whose close() raises on a corrupt .gz) used to leak in the other.
+    r1 = r2 = None
     try:
+        r1 = _RawStream(args.in1, 1)
+        r2 = _RawStream(args.in2, 1)
         with FastqWriter(args.out, threads=args.io_threads,
                          level=args.compress_level) as w:
             if args.threads > 1:
@@ -186,8 +190,12 @@ def _run_merge(args, params):
         _check_drained(backend, r1, "R1", "R2")
         _check_drained(backend, r2, "R2", "R1")
     finally:
-        r1.close()
-        r2.close()
+        try:
+            if r1 is not None:
+                r1.close()
+        finally:
+            if r2 is not None:
+                r2.close()
     return acc
 
 

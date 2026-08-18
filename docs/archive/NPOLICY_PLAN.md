@@ -39,7 +39,7 @@ Measured directly against both backends (`encode_block` with a single `ACGN` rec
 Four defects:
 
 1. **`drop` silently substitutes `A` on the compiled backend.** Root cause is one
-   reasoning slip in a dispatch chain ([_accel.cpp:553-558](../src/zna/_accel.cpp#L553-L558)):
+   reasoning slip in a dispatch chain ([_accel.cpp:553-558](../../src/zna/_accel.cpp#L553-L558)):
    ```cpp
    const bool has_npolicy = !npolicy.empty();       // "drop" is non-empty -> true
    if (npolicy == "C") … else if ("G") … else if ("T") … else if ("random") …
@@ -270,7 +270,7 @@ codec sees one record and knows nothing about a mate.
 Harder than it looks, and the reason is worth stating: `_accel` substitutes during
 **packing**, advancing a `xorshift32` once per substituted base, in *stored* (post-RC)
 order, with the state **carried across records within a block**
-([_accel.cpp:439-443](../src/zna/_accel.cpp#L439-L443), seeded `0xDEADBEEF` per
+([_accel.cpp:439-443](../../src/zna/_accel.cpp#L439-L443), seeded `0xDEADBEEF` per
 `encode_core` call). `_pycodec` substitutes on the string before packing, per record,
 using the global `random`.
 

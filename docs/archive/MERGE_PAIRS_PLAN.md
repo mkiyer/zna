@@ -88,7 +88,7 @@ emitted in its own orientation and **its base 0 is the fragment's 3' end**" — 
 0 *is* a true boundary, so `has_start` is True).
 
 `has_start`/`has_end` describe the left and right edge of the **stored** sequence, not
-of the fragment ([core.py:110-118](../src/zna/core.py#L110-L118): *"A read begins at a
+of the fragment ([core.py:110-118](../../src/zna/core.py#L110-L118): *"A read begins at a
 fragment boundary and runs inward, so base 0 is a true boundary; storing it
 reverse-complemented moves that boundary to the right edge"*). `IS_RC` is therefore a
 **storage** fact owned by the writer's strand-normalization settings — not a geometry
@@ -130,7 +130,7 @@ true one — §1 is rewritten accordingly.
 ### 0.2 `preserve_normalization=True` would silently disable `--strand-normalize` — **blocker**
 
 Rev 1 §3.4 and trap 2 said to set it, and to "confirm that is harmless for a fresh
-encode". It is not harmless. [core.py:284-298](../src/zna/core.py#L284-L298) uses the
+encode". It is not harmless. [core.py:284-298](../../src/zna/core.py#L284-L298) uses the
 same flag to force `_do_strand_norm_r1 = _do_strand_norm_r2 = _do_random_norm = False`,
 and those three booleans are the codec's **only** path to reverse-complementing
 anything. Meanwhile the `STRAND_NORMALIZED` header bit is still written.
@@ -138,11 +138,11 @@ anything. Meanwhile the `STRAND_NORMALIZED` header bit is still written.
 So `zna encode --merge-pairs --strand-normalize` would have produced a file whose header
 says normalized, whose bases are not, and whose `IS_RC` column is empty — and
 `--strand-normalize` is in the flag set the production pipeline uses
-([tests/test_merge_encode.py:148-158](../tests/test_merge_encode.py#L148-L158)).
+([tests/test_merge_encode.py:148-158](../../tests/test_merge_encode.py#L148-L158)).
 
 **Do not set `preserve_normalization` on this path.** It is not needed: with the
 corrected mapping the adapter never supplies `is_rc=True`, so `write_record`'s guard
-([core.py:349](../src/zna/core.py#L349)) never fires. `IS_FULL_FRAGMENT` and `IS_RC`
+([core.py:349](../../src/zna/core.py#L349)) never fires. `IS_FULL_FRAGMENT` and `IS_RC`
 are independent bits in the flags byte, and `_ends_from_flags` returns `(True, True)`
 for a full-fragment record *regardless* of `IS_RC` — so the caller can own the fragment
 span while the writer owns orientation, and the two compose.
@@ -156,7 +156,7 @@ which acts on read *content*, not on flags.)
 
 ### 0.3 `--label-defs` wins the stream selection, so the combination would silently not merge — **blocker**
 
-[cli.py:1266](../src/zna/cli.py#L1266) is `if label_defs: stream =
+[cli.py:1266](../../src/zna/cli.py#L1266) is `if label_defs: stream =
 stream_inputs_labeled(...)`, tested **before** the geometry branch.
 `stream_inputs_labeled` knows three input modes and, given two files, emits an ordinary
 un-merged R1/R2 stream. So `zna encode --merge-pairs --label-defs ...` — the exact
@@ -171,14 +171,14 @@ written an unmerged corpus with a zero exit status.
   it "stamps IS_FULL_FRAGMENT on every unpaired record including any that were never
   merged (a mate whose partner was filtered)". `merge_core.hpp` guarantees pair
   atomicity (`n_recs` is 0 or 2 for an unmerged pair,
-  [merge_core.hpp:498-502](../src/zna/merge/merge_core.hpp#L498-L502)), and the
+  [merge_core.hpp:498-502](../../src/zna/merge/merge_core.hpp#L498-L502)), and the
   benchmark measured C3 orphans at **0**. So on well-formed merge output the flag is
   *correct*, and §5.1's "assert the difference by name" would have asserted a difference
   that is not there. The real failure mode is the name-based re-pairing in §1, and it is
   worse.
 - **Only two tables derive from `_flags_from_ends`**, not three: `_RC_FULL_BY_ENDS` and
   `_FLAG_BITS_BY_ENDS` (which derives from the first). `ENDS_BY_FLAG`
-  ([core.py:130](../src/zna/core.py#L130)) is an independent restatement on the decode
+  ([core.py:130](../../src/zna/core.py#L130)) is an independent restatement on the decode
   side — a real drift risk rev 1's trap 3 did not name.
 - **`_flags_from_ends` is not a bijection**, and its docstring says it is. See §8.1 —
   a pre-existing corruption, not one this change introduces, but adjacent. It has a
@@ -217,7 +217,7 @@ formatted and parsed for nothing.
 "inferring what the merger knew"; it is re-deriving the *pairing itself* from read
 names, and that inference has a silent failure mode. `zna encode --interleaved` pairs
 **consecutive records whose base names match**
-([cli.py:761-809](../src/zna/cli.py#L761-L809)). Two independently merged molecules that
+([cli.py:761-809](../../src/zna/cli.py#L761-L809)). Two independently merged molecules that
 share a read name are therefore re-paired into one fragment. Reproduced:
 
 ```
@@ -241,7 +241,7 @@ assertion about a whole file, stops being needed at this seam.
 
 **But be honest about the size of the correctness win, because it was measured.** Run on
 the real 1M-pair benchmark, the two-step path emits 1,416,630 records (matching
-[MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md) §4's C1 count) with this
+[MERGE_BENCHMARK_RESULTS.md](../MERGE_BENCHMARK_RESULTS.md) §4's C1 count) with this
 geometry:
 
 ```
@@ -267,7 +267,7 @@ rebuild.
 **A caveat on `IS_FULL_FRAGMENT` itself, which rev 1 cited backwards.** Rev 1 §2.2 said
 the mapping restates "contracts C1/C2/C4 … verified at 0 violations". C1, C3 and C4 are
 0; **C2 is 5,591** per million, and
-[MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md)'s own headline says C2 "does not
+[MERGE_BENCHMARK_RESULTS.md](../MERGE_BENCHMARK_RESULTS.md)'s own headline says C2 "does not
 hold universally". So 0.96% of merged records (5,591 of 582,362) are not their true
 fragment, and their right
 edge is a false boundary. `--merge-pairs` neither creates nor fixes that — the two-step
@@ -294,7 +294,7 @@ above). The thing that *does* want fixing before the rebuild is §8.1.
 
 `stream_inputs(args, with_ends=True)` yields 6-tuples `(seq, is_paired, is_read1,
 is_read2, has_start, has_end)`, and the write loop at
-[cli.py:1307-1314](../src/zna/cli.py#L1307-L1314) turns the last two into flags via
+[cli.py:1307-1314](../../src/zna/cli.py#L1307-L1314) turns the last two into flags via
 `_RC_FULL_BY_ENDS`. This exists for ZNA→ZNA re-encode. `--merge-pairs` is its second
 caller — but see §0.2: it is the *shape* that is reused, not `preserve_normalization`.
 
@@ -315,7 +315,7 @@ always True. That is the whole transfer (§0.1).
 `merge_core.hpp` knows nothing about FASTQ; `fastq_chunk.hpp` is one adapter over it.
 This work adds the second adapter beside it. One caveat rev 1 missed: the fastp-style
 `merged_<n1>_<n2>` name is built **inside the core**
-([merge_core.hpp:441-467](../src/zna/merge/merge_core.hpp#L441-L467)), not in the
+([merge_core.hpp:441-467](../../src/zna/merge/merge_core.hpp#L441-L467)), not in the
 adapter — so "reuse the core untouched" and "no name construction on this path" cannot
 both hold. v1 accepts the wasted snprintf and leaves the core alone; §3.2 says why that
 is nearly free.
@@ -413,7 +413,7 @@ that it is. The flag itself stays — the two-step path is still supported, and
 **A third change, and it is an improvement that will still surprise someone.**
 `--merge-pairs` replaces encode's two-file reader, and that reader does **no name
 checking at all**: `_stream_paired_files` is `for s1, s2 in zip(p1, p2)`
-([cli.py:743-752](../src/zna/cli.py#L743-L752)), so today two files that do not
+([cli.py:743-752](../../src/zna/cli.py#L743-L752)), so today two files that do not
 correspond are silently mispaired and the longer one is silently truncated. The merge
 kernel compares `base_name` per pair and raises `R1/R2 out of sync at pair N`. So
 `--merge-pairs` turns two classes of silent corruption into a hard error — good, but it
@@ -422,7 +422,7 @@ means an input that "worked" before now fails. Say so in the flag's help, and po
 
 **One case rev 1 did not list:** `_full_fragment_flags` today stamps `IS_FULL_FRAGMENT`
 on **both** mates of a pair whose mates are exact reverse complements
-([cli.py:967-972](../src/zna/cli.py#L967-L972)), documented in the README as automatic
+([cli.py:967-972](../../src/zna/cli.py#L967-L972)), documented in the README as automatic
 full-overlap detection. Under `--merge-pairs` such a pair merges instead (150 clean
 bases score ~300 bits against a 28-bit threshold), so it becomes **one** full-fragment
 record rather than two. That is a corpus change, it is the more correct one, and it
@@ -430,7 +430,7 @@ should be asserted rather than discovered.
 
 ### 3.4 The Python seam
 
-Dispatch, at [cli.py:1266](../src/zna/cli.py#L1266) — note `merge_pairs` goes **first**:
+Dispatch, at [cli.py:1266](../../src/zna/cli.py#L1266) — note `merge_pairs` goes **first**:
 
 ```python
 if merge_pairs:
@@ -485,7 +485,7 @@ labeled   + ends:  (seq, is_paired, is_read1, is_read2, has_start, has_end, labe
 
 **The write loop** — the `carries_ends` branch must gain a labeled arm, or
 `write_record` raises `ValueError: Expected N label values, got 0`
-([core.py:363-367](../src/zna/core.py#L363-L367)) the first time a labeled stream
+([core.py:363-367](../../src/zna/core.py#L363-L367)) the first time a labeled stream
 carries ends:
 
 ```python
@@ -503,7 +503,7 @@ for unit in _fragment_units(stream):                     # keep: mate grouping
         ...                                              # unchanged
 ```
 
-Keep the single-end fast path at [cli.py:1283-1302](../src/zna/cli.py#L1283-L1302); it
+Keep the single-end fast path at [cli.py:1283-1302](../../src/zna/cli.py#L1283-L1302); it
 exists to avoid a generator resume and a list allocation per read, and `--merge-pairs`
 never reaches it (two files ⇒ `single_end_input` is False).
 
@@ -523,7 +523,7 @@ from **its own source header**: `MERGED` → R1's header, `MATE1` → R1's, `MAT
 Four reasons, in order of weight:
 
 1. **The production pipeline already does merging and labels together.**
-   [tests/test_merge_encode.py](../tests/test_merge_encode.py) runs `zna merge` →
+   [tests/test_merge_encode.py](../../tests/test_merge_encode.py) runs `zna merge` →
    `zna encode --interleaved --treat-unpaired-as-merged --strand-normalize
    --label-defs`, and exists because a bug in exactly that combination once flagged
    every record unpaired. Rejecting the combination would delete a working capability
@@ -531,10 +531,10 @@ Four reasons, in order of weight:
 2. **The risk rev 1 worried about does not exist.** `--label-defs` is not a pattern
    system — it is a YAML file of column definitions, and extraction is fixed: split the
    header on whitespace, drop token 0, match `KEY` of each `KEY:T:VALUE` token against
-   each label's tag ([cli.py:668-693](../src/zna/cli.py#L668-L693)). The appended
+   each label's tag ([cli.py:668-693](../../src/zna/cli.py#L668-L693)). The appended
    ` merged_<n1>_<n2>` token contains no colon and is rejected by `colon1 < 1` — it is
    *structurally* unmatchable, and the docstring at
-   [cli.py:658-660](../src/zna/cli.py#L658-L660) says so by name. R1's tags survive
+   [cli.py:658-660](../../src/zna/cli.py#L658-L660) says so by name. R1's tags survive
    byte-identically ahead of it, so the one-step and two-step label values are equal by
    construction.
 3. **The adapter cost is one `(offset, length)` pair per record**, into a buffer that
@@ -542,7 +542,7 @@ Four reasons, in order of weight:
 4. **"Labels from R1's header" — rev 1's phrasing — would have been a silent behaviour
    change.** Labels today are per record from that record's own header: the two-file
    path extracts `l1` from R1 and `l2` from R2 independently
-   ([cli.py:1054-1057](../src/zna/cli.py#L1054-L1057)). Applying R1's values to `MATE2`
+   ([cli.py:1054-1057](../../src/zna/cli.py#L1054-L1057)). Applying R1's values to `MATE2`
    would overwrite R2's wherever the two mates' tags differ, and nothing would notice.
 
 **State in the docs:** on a merged record the label values are R1's, and R2's are
@@ -584,9 +584,9 @@ dependency scanning recompiles only `_merge_accel`), ~9 s on cache invalidation.
 
 1. **`merge_chunk_records` in `fastq_chunk.hpp` + binding.** Do **not** add it to
    `backend._REQUIRED_FUNCTIONS` yet. The failure mode is worse than an error: only
-   `_load()` validates the set ([backend.py:89-95](../src/zna/merge/backend.py#L89-L95)),
+   `_load()` validates the set ([backend.py:89-95](../../src/zna/merge/backend.py#L89-L95)),
    while `available_merge_backends()` merely *imports*
-   ([backend.py:49-57](../src/zna/merge/backend.py#L49-L57)) — so against a stale `.so`,
+   ([backend.py:49-57](../../src/zna/merge/backend.py#L49-L57)) — so against a stale `.so`,
    `accel` still shows as available while `get_merge_backend()` catches the ImportError
    and **silently falls through to the reference backend**. That is the 50x slowdown
    `args.py`'s `--backend` help says the design exists to prevent: on a cluster it is
@@ -651,7 +651,7 @@ parsers cannot drift.
 | combination | reason |
 |---|---|
 | `--merge-pairs` with ≠ 2 files | it is a two-file mode |
-| `--merge-pairs --interleaved` | reachable today, but the existing message at [cli.py:1088](../src/zna/cli.py#L1088) names the *wrong* flag ("Cannot use --interleaved with 2 input files"). Add a specific one. |
+| `--merge-pairs --interleaved` | reachable today, but the existing message at [cli.py:1088](../../src/zna/cli.py#L1088) names the *wrong* flag ("Cannot use --interleaved with 2 input files"). Add a specific one. |
 | `--merge-pairs --seq-len-bytes 1` | a merged record is up to 2× a read; see trap 10 |
 | `--merge-pairs --treat-unpaired-as-merged` | the geometry is exact; the assertion is what this deletes |
 | `--merge-pairs` on ZNA input | re-encode has its own geometry source |
@@ -662,7 +662,7 @@ parsers cannot drift.
 `--label`/`--label-defs`/`--label-desc` all remain **supported** and compose (§0.2).
 
 Argparse note: `files` is `nargs="*"`, so "exactly two" is a hand-written check next to
-[cli.py:1085](../src/zna/cli.py#L1085). Also, argparse requires `nargs="*"` positionals
+[cli.py:1085](../../src/zna/cli.py#L1085). Also, argparse requires `nargs="*"` positionals
 to be contiguous, so `zna encode --merge-pairs R1.fq --quiet R2.fq` fails at the
 *top-level* parser with `unrecognized arguments: R2.fq`. Worth one line in the help.
 
@@ -717,7 +717,7 @@ In the order they should be written.
    N policy (rev 2 said it did not) — but that policy is `trim3`, which never orphans a
    mate, so there is no atomicity left to test at this seam. C3 is the merger's own
    all-or-nothing `min_read_length` rule at
-   [merge_core.hpp:496-502](../src/zna/merge/merge_core.hpp#L496-L502), and it is
+   [merge_core.hpp:496-502](../../src/zna/merge/merge_core.hpp#L496-L502), and it is
    already covered. What this test pins is that the new strategy sets
    `is_paired`/`is_read1`/`is_read2` well enough for `_fragment_units` to group mates —
    which is the real risk, and which a write loop that hoisted `carries_ends` above
@@ -729,7 +729,7 @@ In the order they should be written.
     `is_read1 && is_read2`, not `is_paired` consistency — so the tests are the only
     guard.
 
-Home: [tests/test_merge_encode.py](../tests/test_merge_encode.py) already has the
+Home: [tests/test_merge_encode.py](../../tests/test_merge_encode.py) already has the
 `encode()` subprocess helper and `read_back()`. `read_back` unpacks 7 values and so
 requires a labeled file; add an unlabeled variant rather than forcing labels on every
 new test.
@@ -780,7 +780,7 @@ the FASTQ that preceded it.
 Report: records where the two paths disagree and which one truth agrees with; and,
 separately, the residual `IS_FULL_FRAGMENT` records that are **not** the true fragment.
 Expect ~5,591 per million from the wrong-shift merges of
-[MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md) §2 — **both** paths carry
+[MERGE_BENCHMARK_RESULTS.md](../MERGE_BENCHMARK_RESULTS.md) §2 — **both** paths carry
 those, they are a property of the genome, and `--merge-pairs` neither creates nor fixes
 them. Say so, so the number is not read as a regression.
 
@@ -793,7 +793,7 @@ the case and it has not been measured yet.
 
 1. **The consumption protocol is not optional, and it has six parts, not one.** Rev 1
    named only the last. From `_drive_serial`
-   ([merge/cli.py:201-218](../src/zna/merge/cli.py#L201-L218)):
+   ([merge/cli.py:201-218](../../src/zna/merge/cli.py#L201-L218)):
    1. `fill(target)` **both** streams before each call, `target = max(256 KiB,
       chunk_size * 1024)` — a byte count, not a record count.
    2. Stop if either stream has zero available bytes.
@@ -810,9 +810,9 @@ the case and it has not been measured yet.
 4. **`ChunkStats` histograms grow with the arena.** Use the same `ensure_bins`
    discipline or long reads silently re-cap.
 5. **`Scratch::name` heap overflow — verified, live, in shipped compiled code.**
-   [merge_core.hpp:225](../src/zna/merge/merge_core.hpp#L225) sizes `name` as `cap + 64`
+   [merge_core.hpp:225](../../src/zna/merge/merge_core.hpp#L225) sizes `name` as `cap + 64`
    where `cap` is the **read-length** arena (minimum 1024, doubling on read length), but
-   [:461-466](../src/zna/merge/merge_core.hpp#L461-L466) writes `idlen + (h.n - cut)`
+   [:461-466](../../src/zna/merge/merge_core.hpp#L461-L466) writes `idlen + (h.n - cut)`
    bytes plus up to 64 more — all derived from the **header**. Any header longer than
    `arena - 64` writes past the buffer.
 
@@ -846,7 +846,7 @@ the case and it has not been measured yet.
     *maximum*.** There is no minimum-length filter anywhere in encode — `--min-read-length`
     is the sole floor on this path, which is another reason it must be mirrored. The
     ceiling is the hazard: `write_record` raises `ValueError` when `seq_len >
-    (1 << 8*seq_len_bytes) - 1` ([core.py:356-360](../src/zna/core.py#L356-L360)). With
+    (1 << 8*seq_len_bytes) - 1` ([core.py:356-360](../../src/zna/core.py#L356-L360)). With
     `--seq-len-bytes 1` (max 255) and 2×150 input, a merged read of 256–300 bases raises
     **mid-stream**, leaving a structurally valid partial `.zna` on disk. Today every
     record on the two-file path is at most one read long, so this cannot happen. Either

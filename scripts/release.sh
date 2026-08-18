@@ -36,6 +36,15 @@ if [ "$BRANCH" != "main" ]; then
     exit 1
 fi
 
+# The CHANGELOG must have a stamped section for this release BEFORE tagging.
+# 0.5.0 shipped with all its content still under "[Unreleased]" because nothing
+# checked; this is the check.
+if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+    echo "❌ Error: CHANGELOG.md has no '## [${VERSION}]' section."
+    echo "Stamp the [Unreleased] content as [${VERSION}] - $(date +%Y-%m-%d) first."
+    exit 1
+fi
+
 # Update version in __init__.py
 echo "📝 Updating version in src/zna/__init__.py..."
 sed -i.bak "s/__version__ = \".*\"/__version__ = \"${VERSION}\"/" src/zna/__init__.py

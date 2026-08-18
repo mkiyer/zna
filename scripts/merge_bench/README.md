@@ -1,5 +1,9 @@
 # Evidence for `docs/METHODS.md` and `docs/MERGE_BENCHMARK_RESULTS.md`
 
+> "retired-design §N" below refers to `docs/MERGE_CPP_DESIGN.md`, consolidated
+> away in commit 158a204; read it at `git show 158a204^:docs/MERGE_CPP_DESIGN.md`.
+> The surviving algorithmic content is `docs/METHODS.md` §2.
+
 Every number in those documents comes from these scripts. They are kept so the design
 can be re-argued against measurements rather than recollection, and so the same numbers
 can be taken on a Linux/x86 box — this session's were all aarch64, which matters for
@@ -84,21 +88,21 @@ cd scripts/merge_bench
 #    Merges at 88.6% against production's measured 88.8%.
 python gen_library.py 200000 r1.fq.gz r2.fq.gz
 
-# 2. where the per-pair time actually goes  (design §1)
+# 2. where the per-pair time actually goes  (retired-design §1)
 python bench_breakdown.py r1.fq.gz r2.fq.gz
 
-# 3. is the argmax tie-break a specifiable total order?  (design §5)
+# 3. is the argmax tie-break a specifiable total order?  (retired-design §5)
 #    Builds ties deliberately -- random sequence essentially never ties.
 python verify_tiebreak.py r1.fq.gz r2.fq.gz
 
 # 4. scan kernel variants, full pruned scans, packing inside the timed region,
-#    every variant checked against the shipped kernel pair by pair  (design §6.1)
+#    every variant checked against the shipped kernel pair by pair  (retired-design §6.1)
 python dump_pairs.py r1.fq.gz r2.fq.gz 50000 pairs.bin
 c++ -O3 -std=c++17 -o bench_scan bench_scan.cpp && ./bench_scan pairs.bin   # scalar vs 2-bit packed
 c++ -O3 -std=c++17 -o bench_simd bench_simd.cpp && ./bench_simd pairs.bin   # ...vs byte-wise SIMD
 # on x86, add -mavx2 to bench_simd to enable the 32-byte variants (SSE2 needs no flag)
 
-# 5. the whole path in C++, which must be BYTE-IDENTICAL to `zna merge`  (design §3)
+# 5. the whole path in C++, which must be BYTE-IDENTICAL to `zna merge`  (retired-design §3)
 c++ -O3 -std=c++17 -o proto_merge proto_merge.cpp
 ./proto_merge r1.fq.gz r2.fq.gz cpp.fq 40
 zna merge --in1 r1.fq.gz --in2 r2.fq.gz --out py.fq --min-read-length 40 -q
@@ -110,13 +114,13 @@ cmp cpp.fq py.fq        # must be silent
 It is the artifact that proves the design lands where it claims: on 200,000 real pairs
 it emits a byte-identical file to `zna merge` at **2.32 µs/pair against 8.34**. It
 carries the byte-wise SIMD kernel the design settled on (`neq16` + a 32-base bail) and
-the self-sizing `Scratch` arena of design §7.4, and was re-verified byte-identical after
+the self-sizing `Scratch` arena of retired-design §7.4, and was re-verified byte-identical after
 each of those replaced its predecessor — which is the check that matters when swapping a
 kernel or an allocation strategy.
 
 Do **not** read it as a model for the real backend. It is single-threaded, its
-`popen("pigz -dc")` reader is a stand-in for the chunk protocol in design §7.3, and it
-builds the consensus table in C++ where design §4 says to build it once in Python and
+`popen("pigz -dc")` reader is a stand-in for the chunk protocol in retired-design §7.3, and it
+builds the consensus table in C++ where retired-design §4 says to build it once in Python and
 pass it across. It also has no error handling worth the name.
 
 `/tmp/proto_v1.cpp`-style comparisons are how §7.4's arena numbers were taken: the
@@ -138,7 +142,7 @@ the same mistake in the other direction — its 4.8x SWAR figure was a no-bail s
 which is why an earlier sweep found none and proved nothing. The complementary argument
 is arithmetic: a tie across *different* overlap lengths needs `dn = STEP/gcd(M,STEP)`,
 which is ~1.4e8 for the shipped weights, so ties only ever occur at equal `n`. Both are
-design §5.
+retired-design §5.
 
 The fixed-point scale is chosen by exhaustive enumeration rather than taste — see design
 §4 for the table, which is small enough to live as a test.
@@ -147,4 +151,4 @@ The fixed-point scale is chosen by exhaustive enumeration rather than taste — 
 
 Every number in the design is aarch64/NEON. The SSE2 path in `bench_simd.cpp` is written
 but has never been run, the AVX2 variants need `-mavx2`, and the optimal bail
-granularity is hardware-dependent (32 bases won here). This is design phase G.
+granularity is hardware-dependent (32 bases won here). This is retired-design phase G.

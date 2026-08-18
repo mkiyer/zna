@@ -22,9 +22,63 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_ab import ab, header  # noqa: E402
 
 from zna.cli import (  # noqa: E402
-    _fragment_units, _pair_interleaved, _read_key, parse_fastq_keyed,
-    parse_fastq_with_names, get_base_name, get_read_suffix_number,
+    MERGED_SINGLE, _fragment_units, _pair_interleaved, _read_key,
+    parse_fastq_keyed,
 )
+
+
+
+# The 0.3.3 header-parsing path, relocated here from zna.cli when production
+# code dropped it (0.5.1): this bench exists to show _read_key beats it, so the
+# baseline lives with the benchmark rather than shipping in the package.
+def get_base_name(full_name: str) -> str:
+    """
+    Extracts base read ID for pairing verification.
+    Handles headers like: @ID/1 merged_... or @ID comment
+    Returns 'ID' without /1 or /2 suffix and without comments.
+    """
+    # Split on whitespace to remove comments
+    read_id = full_name.split()[0]
+    # Split on slash to remove /1 or /2 pair indicators
+    if "/" in read_id:
+        return read_id.rsplit("/", 1)[0]
+    return read_id
+
+
+def get_read_suffix_number(full_name: str) -> int:
+    """
+    Returns 1 if name ends in /1, 2 if /2, else 0.
+    Considers only the ID part before whitespace.
+    """
+    read_id = full_name.split()[0]
+    if read_id.endswith("/1"):
+        return 1
+    if read_id.endswith("/2"):
+        return 2
+    return 0
+
+
+def parse_fastq_with_names(fh: BinaryIO) -> Iterator[Tuple[str, str]]:
+    """Yields (read_name, sequence) tuples from FASTQ stream.
+    
+    Optimized for minimal overhead.
+    """
+    readline = fh.readline  # Cache method lookup
+    while True:
+        header = readline()
+        if not header: 
+            break
+        if header[0] != 64:  # ord('@') = 64
+            continue
+        # Extract read name (skip @ and strip)
+        read_name = header[1:].rstrip(b"\r\n").decode('ascii')
+        
+        seq_line = readline()
+        readline()  # + line
+        readline()  # Quality line
+        
+        if seq_line:
+            yield read_name, seq_line.rstrip(b"\r\n").decode('ascii')
 from zna.core import (  # noqa: E402
     COMPRESSION_ZSTD, ZnaHeader, ZnaWriter,
 )

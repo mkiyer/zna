@@ -4,8 +4,11 @@
 
 ## Performance
 
-- **1.7 GB/s decode**, **726 MB/s encode** on 150 bp reads (in-memory, single core)
-- **6.6 GB/s decode** on long reads
+- **1.5 GB/s decode** via `records()`, **3.6 GB/s** via `blocks()`, on 150 bp
+  reads (0.5.1, in-memory, single core, Apple Silicon)
+- **455 MB/s encode** on 150 bp reads — the delta from 0.3.x's 726 MB/s is the
+  price of the self-describing container: per-block stats for the trailer and a
+  content checksum in every frame
 - **~4x compression** from 2-bit packing alone, more with Zstd on duplicated data
 - **C++ acceleration** with a pure Python fallback
 
@@ -108,6 +111,12 @@ Measured on ZNA 0.3.5, Apple Silicon, single core, in-memory (`BytesIO`),
 min-of-7. Throughput is sequence bases in/out per second; compression is bases
 per stored byte at Zstd level 9 on random (worst-case, incompressible) sequence.
 
+> **Re-measured at 0.5.1** (same method, 150 bp): encode 455 MB/s, decode
+> 1,486 MB/s via `records()` and 3,621 MB/s via `blocks()`. The encode delta
+> is the self-describing container (trailer stats + frame checksums); decode
+> is within noise of the table. The *scaling with read length* below still
+> holds; the absolute numbers are 0.3.5-era.
+
 | Read Type | Encode (MB/s) | Decode (MB/s) | Encode (rec/s) | Decode (rec/s) | Compression |
 |---|---|---|---|---|---|
 | Short (Illumina, 150 bp) | 726 | 1,718 | 4.8 M | 11.5 M | 3.95x |
@@ -142,8 +151,8 @@ reference and the Python API are all below.
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
 | [docs/TRAILER_PLAN.md](docs/TRAILER_PLAN.md) | the self-describing container: prologue, trailer, footer, `inspect --verify` — executed in 0.5.0; §14 records the amendments |
-| [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — executed in 0.5.0 |
-| [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
+| [docs/archive/MERGE_PAIRS_PLAN.md](docs/archive/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — executed in 0.5.0 |
+| [docs/archive/NPOLICY_PLAN.md](docs/archive/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
 | [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | a record of the 0.4.0 release; its build traps and ground-truth notes are still current *(maintainers)* |
 
 ---
@@ -287,11 +296,8 @@ zna encode sample.fastq --level 5 -o sample.zna
 # Uncompressed (rarely needed)
 zna encode sample.fastq --uncompressed -o sample.zna
 
-# From stdin
+# From stdin (format inferred from content; extensions are used for files)
 cat sample.fastq | zna encode -o sample.zna
-
-# Force format (when extension detection fails)
-cat data.txt | zna encode --fastq -o sample.zna
 ```
 
 #### Paired-End Reads
@@ -377,16 +383,13 @@ zna encode sample.fastq --uncompressed -o sample.zna
 
 # Sequence length encoding (max sequence length)
 zna encode sample.fastq \
-  --seq-len-bytes 1 \  # Max 255 bp
-  -o short_reads.zna
+  --seq-len-bytes 1 -o short_reads.zna    # max 255 bp
 
 zna encode sample.fastq \
-  --seq-len-bytes 2 \  # Max 65,535 bp (default)
-  -o sample.zna
+  --seq-len-bytes 2 -o sample.zna         # max 65,535 bp (the default)
 
 zna encode sample.fastq \
-  --seq-len-bytes 4 \  # Max 4.2 billion bp
-  -o long_reads.zna
+  --seq-len-bytes 4 -o long_reads.zna     # max 4.2 billion bp
 ```
 
 ### Decoding
@@ -586,11 +589,18 @@ Seq Length:       2 bytes (Max: 65535 bp)
 Strand Specific:  True
 R1 Antisense:     True
 R2 Antisense:     False
-Compression:      ZSTD (Level 3)
+Strand Normalized:True
+Compression:      ZSTD (Level 9)
+
+--- Provenance ---
+Writer:           zna 0.5.0
+Shuffled:         True
 
 --- Content Statistics ---
 Total Blocks:       356
 Total Records:      1000000
+Total Bases:        142053188
+Pairs / Unpaired:   417134 / 165732
 Compressed Payload: 42.15 MB
 Uncompressed Data:  125.50 MB
 Compression Ratio:  2.98x
@@ -615,7 +625,9 @@ Positional Arguments:
 Options:
   --interleaved          Treat input as interleaved (auto-detects mixed paired/single reads)
   --shuffle              Shuffle records after encoding (for ML training data)
-  --seed N               Random seed for --shuffle (default: 42)
+  --seed N               One seed for every random decision: --shuffle order,
+                         --npolicy random substitutions, unstranded
+                         normalization's per-pair coin (default: 42)
   --shuffle-buffer-size N
                          Max memory per bucket for encode --shuffle (default: 1G).
                          Accepts K/M/G suffixes.
@@ -656,10 +668,10 @@ Metadata:
 Format Options:
   -o, --output FILE      Output file (default: stdout)
   --seq-len-bytes N      Bytes for sequence length: 1, 2, or 4 (default: 2)
-  --block-size N         Block size in bytes (default: 131072)
+  --block-size SIZE      Block size; accepts K/M/G suffixes (default: 4M)
   --zstd                 Force Zstd compression
   --uncompressed         Force uncompressed
-  --level N              Zstd compression level 1-22 (default: 3)
+  --level N              Zstd compression level 1-22 (default: 9)
 ```
 
 ### `zna decode`
@@ -679,6 +691,8 @@ Options:
   -q, --quiet            Suppress progress messages
   --gzip                 Force gzip compression for stdout
   --restore-strand       Restore original strand orientation for antisense reads
+  --labels               Append each record's label values as SAM-style tags
+                         (labeled files only)
 ```
 
 ### `zna inspect`
@@ -839,7 +853,14 @@ Required:
 Options:
   --json FILE            Write run statistics as JSON (counts, histograms, provenance)
   --threshold-merge BITS Score at or above this merges the pair (default: 28.0)
-  --threshold-trim BITS  Score at or above this (but below merge) trims R2 (default: 8.0)
+  --threshold-trim BITS  Score at or above this (but below merge) keeps both mates
+                         and splits the redundant overlap between their 3' ends
+                         (default: 8.0)
+  --npolicy {trim3,random}
+                         No-call policy for an N the overlap could not rescue
+                         from the mate (default: trim3; same flag and values
+                         as zna encode)
+  --seed N               Seed for --npolicy random (default: 42)
   --min-read-length N    Drop emitted reads shorter than this (default: 40)
   --threads N            Merge worker threads (default: min(4, cpu count))
   --io-threads N         pigz threads for the gzipped output (default: 4)
@@ -1353,7 +1374,7 @@ is_rc, labels)` — so that the unlabeled and labeled tuples agree on where
 | Paired-End | ✅ | ❌ | ❌ | ✅ | ❌ |
 | Random Access | ❌ | ✅ | ✅ | ✅ | ❌ |
 | Streaming | ✅ | ✅ | ✅ | Limited | ✅ |
-| Dependencies | 1 | 0 | 0 | Many | 0 |
+| Dependencies | 2 | 0 | 0 | Many | 0 |
 
 ---
 
@@ -1462,11 +1483,17 @@ mypy src/zna/
 
 ## Limitations
 
-1. **Sequences only**: No quality scores, headers, or annotations
-2. **Sequential access**: No random access without full scan
-3. **DNA/RNA only**: A, C, G, T bases (N or IUPAC codes not supported)
-4. **Case insensitive**: Lowercase converted to uppercase
-5. **No index**: Full file scan required for record counting
+1. **No quality scores or read names**: sequences, flags, and declared numeric
+   labels only. (Per-record numeric metadata IS supported — see
+   [Per-Sequence Labels](#per-sequence-labels).)
+2. **Block-granular access**: random access is by block, not by record —
+   `blocks(indices=…)` seeks straight to any block; there is no per-record
+   index.
+3. **DNA/RNA only**: A, C, G, T stored; `N` handled by `--npolicy` at encode
+   time; other IUPAC codes are rejected.
+4. **Case insensitive**: lowercase is uppercased on encode.
+5. ~~No index~~ Since 0.5.0 the trailer stores record/base counts, length
+   histograms, and the block index — `zna inspect` reads them in O(1).
 
 ---
 

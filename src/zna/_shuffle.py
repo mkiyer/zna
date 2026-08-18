@@ -109,7 +109,7 @@ def shuffle_zna(
     block_size: int = 4 * 1024 * 1024,  # 4 MiB
     tmp_dir: str | None = None,
     quiet: bool = False,
-) -> None:
+) -> tuple[int, int]:
     """Shuffle the records in a ZNA file with bounded memory.
 
     Parameters
@@ -129,6 +129,8 @@ def shuffle_zna(
         system temp directory.
     quiet:
         Suppress progress messages on *stderr*.
+
+    Returns ``(units_written, records_scanned)``.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")

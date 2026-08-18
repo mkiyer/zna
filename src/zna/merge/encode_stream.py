@@ -80,11 +80,21 @@ def stream_merge_pairs(files, params: MergeParams, *, check_sync: bool = True,
     geometry = _GEOMETRY_BY_SLOT
 
     if want_headers:
-        from ..cli import extract_labels_from_header
-    r1 = _RawStream(files[0], 1)
-    r2 = _RawStream(files[1], 1)
+        # The dispatching factory, not the pure-Python parser: it selects the
+        # C++ extract_labels_fast when built (measured 6.1x per record), and
+        # it is what every other labeled input path already uses.
+        from ..cli import _make_label_extractor
+        extract = _make_label_extractor(label_defs, tag_map)
+
+    # Construct both streams INSIDE the try: each owns a pigz child and a
+    # prefetch thread, and an unreadable second path used to leak the first
+    # stream's pair of them.  The nested finally guarantees r2.close() runs
+    # even when r1.close() raises (it does, on a corrupt .gz).
+    r1 = r2 = None
     emitted = 0
     try:
+        r1 = _RawStream(files[0], 1)
+        r2 = _RawStream(files[1], 1)
         while True:
             r1.fill(target)
             r2.fill(target)
@@ -106,8 +116,7 @@ def stream_merge_pairs(files, params: MergeParams, *, check_sync: bool = True,
                 if want_headers:
                     hdr = (r2.buf if slot == SLOT_MATE2
                            else r1.buf)[hdr_off:hdr_off + hdr_len]
-                    labels = extract_labels_from_header(
-                        hdr, tag_map, n_labels, label_defs)
+                    labels = extract(hdr)
                     if zn_index is not None:
                         labels = (labels[:zn_index] + (prov,)
                                   + labels[zn_index + 1:])
@@ -132,5 +141,9 @@ def stream_merge_pairs(files, params: MergeParams, *, check_sync: bool = True,
                 "pass --allow-empty if that is genuinely intended."
             )
     finally:
-        r1.close()
-        r2.close()
+        try:
+            if r1 is not None:
+                r1.close()
+        finally:
+            if r2 is not None:
+                r2.close()

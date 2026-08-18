@@ -15,7 +15,7 @@ from zna import reverse_complement
 from zna.cli import (
     parse_fasta, parse_fastq, choose_parser,
     stream_inputs, encode_command, decode_command, inspect_command,
-    get_base_name, get_read_suffix_number, parse_fastq_with_names,
+    _read_key,
     parse_block_size, shuffle_command,
 )
 from zna._shuffle import shuffle_zna
@@ -110,14 +110,6 @@ class TestParsers:
         sequences = list(parse_fastq(fh))
         assert len(sequences) == 0
     
-    def test_parse_fastq_with_names(self):
-        """Test FASTQ parser that returns names and sequences."""
-        fh = BytesIO(FASTQ_DATA)
-        entries = list(parse_fastq_with_names(fh))
-        assert len(entries) == 3
-        assert entries[0] == ("read1", "ACGTACGT")
-        assert entries[1] == ("read2", "TGCATGCA")
-        assert entries[2] == ("read3", "AAAACCCCGGGG")
 
     def test_get_parser_fasta(self):
         """Test parser selection for FASTA files."""
@@ -152,35 +144,42 @@ class TestParsers:
 # --- Read Name Helper Tests ---
 
 class TestReadNameHelpers:
-    def test_get_base_name_with_suffix(self):
-        """Test extracting base name from reads with /1 or /2 suffix."""
-        assert get_base_name("read1/1") == "read1"
-        assert get_base_name("read1/2") == "read1"
-        assert get_base_name("INSTRUMENT:123:FLOWCELL:1:1:1234:5678/1") == "INSTRUMENT:123:FLOWCELL:1:1:1234:5678"
-    
-    def test_get_base_name_without_suffix(self):
-        """Test extracting base name from reads without suffix."""
-        assert get_base_name("read1") == "read1"
-        assert get_base_name("single_read") == "single_read"
-    
-    def test_get_base_name_with_comment(self):
-        """Test extracting base name ignores comments."""
-        assert get_base_name("read1/1 comment text") == "read1"
-        assert get_base_name("read1/2 merged") == "read1"
-        assert get_base_name("read1 merged comment") == "read1"
-    
-    def test_get_read_suffix_number(self):
-        """Test extracting read number from suffix."""
-        assert get_read_suffix_number("read1/1") == 1
-        assert get_read_suffix_number("read1/2") == 2
-        assert get_read_suffix_number("read1") == 0
-        assert get_read_suffix_number("single") == 0
-    
-    def test_get_read_suffix_number_with_comment(self):
-        """Test suffix number extraction ignores comments."""
-        assert get_read_suffix_number("read1/1 comment") == 1
-        assert get_read_suffix_number("read1/2 merged") == 2
-        assert get_read_suffix_number("read1 comment") == 0
+    """The pairing key: `_read_key` is the live implementation of the contract
+    the 0.3.3 string helpers used to state (those now live only as the baseline
+    inside scripts/bench_tierc.py)."""
+
+    def test_base_name_with_suffix(self):
+        assert _read_key(b"read1/1")[0] == b"read1"
+        assert _read_key(b"read1/2")[0] == b"read1"
+        assert _read_key(b"INSTRUMENT:123:FLOWCELL:1:1:1234:5678/1")[0] == \
+            b"INSTRUMENT:123:FLOWCELL:1:1:1234:5678"
+
+    def test_base_name_without_suffix(self):
+        assert _read_key(b"read1")[0] == b"read1"
+        assert _read_key(b"single_read")[0] == b"single_read"
+
+    def test_base_name_with_comment(self):
+        assert _read_key(b"read1/1 comment text")[0] == b"read1"
+        assert _read_key(b"read1 other comment")[0] == b"read1"
+
+    def test_suffix_number(self):
+        assert _read_key(b"read1/1")[1] == 1
+        assert _read_key(b"read1/2")[1] == 2
+        assert _read_key(b"read1")[1] == 0
+        assert _read_key(b"single")[1] == 0
+
+    def test_suffix_number_with_comment(self):
+        assert _read_key(b"read1/1 comment")[1] == 1
+        assert _read_key(b"read1 comment")[1] == 0
+
+    def test_merged_marker_identifies_a_merged_read(self):
+        """The reason the string helpers were retired: a merged read is never
+        a mate, and only the marker can say so (names collide).  An explicit
+        mate suffix still wins -- the merger strips suffixes from merged
+        names, so a name carrying /1 is asserting mate-hood."""
+        from zna.cli import MERGED_SINGLE
+        assert _read_key(b"read1 merged_150_50")[1] == MERGED_SINGLE
+        assert _read_key(b"read1/1 merged_150_50")[1] == 1
 
 
 class TestParseBlockSize:

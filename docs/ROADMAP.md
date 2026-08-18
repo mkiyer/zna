@@ -36,7 +36,7 @@ Reproduce with [`scripts/merge_bench/README.md`](../scripts/merge_bench/README.m
 
 ### ~~0.5.0 — `zna encode --merge-pairs`~~ — SHIPPED in 0.5.0
 
-Built per [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md), honoring its three audit
+Built per [MERGE_PAIRS_PLAN.md](archive/MERGE_PAIRS_PLAN.md), honoring its three audit
 blockers. Verified on the 1M-pair benchmark: one-step and two-step agree on all
 999,496 fragments (zero disagreements), 1.53× faster wall, 2.2× cheaper CPU. See
 CHANGELOG.
@@ -137,7 +137,7 @@ enabling zero-copy pandas/polars and SQL over label columns.
 
 This section used to record a live inconsistency: the compiled backend substituted the
 policy base for **any** unencodable character while the reference substituted only
-`N`/`n` and raised on the rest. 0.4.0's alphabet strictness (`docs/NPOLICY_PLAN.md`
+`N`/`n` and raised on the rest. 0.4.0's alphabet strictness (`docs/archive/NPOLICY_PLAN.md`
 §8.2) resolved it in the strict direction — **both backends now raise, naming the
 character and its offset**, and only `N`/`n` is ever substitutable, under every policy.
 Verified directly against both backends (`encode_block` with an `R` under
@@ -166,7 +166,7 @@ Two cases are currently *defined but not validated*, and both concern paired inp
   `zna merge` cannot validate this — it is a FASTQ tool with no concept of label
   definitions, and comparing all tags would false-positive on legitimately per-mate ones.
   The check belongs in `--merge-pairs`, where the encoder holds both headers *and* knows
-  which tags were declared as labels. See [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md) §3.5.
+  which tags were declared as labels. See [MERGE_PAIRS_PLAN.md](archive/MERGE_PAIRS_PLAN.md) §3.5.
 
 ---
 

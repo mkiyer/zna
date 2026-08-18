@@ -20,7 +20,7 @@ learn and they outlive this release.
 
 Everything the previous handoff listed as remaining is built and measured.
 
-- **Per-record provenance** (`docs/NPOLICY_PLAN.md` D5). Header tokens
+- **Per-record provenance** (`docs/archive/NPOLICY_PLAN.md` D5). Header tokens
   `trim3_<n>` / `subn_<n>` / `rescued_<n>` on **every** outcome, not only merged ones,
   built in `merge_core.hpp::build_name` and mirrored in `_pymerge._prov_name`. A record
   nothing happened to is emitted byte-unchanged and stays zero-copy — 1,332,353 of
@@ -59,7 +59,7 @@ the comment says so.
 
 ## 2. What is next
 
-`docs/MERGE_PAIRS_PLAN.md` — `zna encode --merge-pairs` for 0.5.0, deferred because the
+`docs/archive/MERGE_PAIRS_PLAN.md` — `zna encode --merge-pairs` for 0.5.0, deferred because the
 one-step and two-step paths produce the *identical* corpus on the 1M library. Its
 provenance story is already settled: it computes the same `PairResult` and writes the
 same `PROV_*` bits directly, with no FASTQ in between.
@@ -71,7 +71,7 @@ of true. Corrected, but the corrections are worth reading as a set before trusti
 rest of the document.
 
 Decisions closed by measurement, **not to be reopened without new evidence** — the table
-in `docs/NPOLICY_PLAN.md` §2 and `docs/METHODS.md` carry the reasoning: no `--max-n`; a
+in `docs/archive/NPOLICY_PLAN.md` §2 and `docs/METHODS.md` carry the reasoning: no `--max-n`; a
 pair with a surviving N is not merged; the post-trim retry reuses the original shift; no
 consensus on a kept pair; stumps are allowed; breaking backwards compatibility is
 authorised.

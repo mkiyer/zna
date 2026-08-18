@@ -8,7 +8,60 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
-## [Unreleased]
+## [0.5.1] - 2026-08-18
+
+### Fixed — labeled two-file encode silently truncated on unequal R1/R2 counts
+
+The labeled two-file path paired with a plain `zip`, which stops at the shorter
+input: an R2 file with fewer records than R1 truncated the library at exit 0,
+every remaining R1 read gone with nothing in the output to say so. The
+*unlabeled* path replaced this exact construct in 0.3.x and documented why; the
+labeled path had drifted back to it. Both now pull both streams explicitly and
+fail naming the shorter file. Found by a post-release multi-agent audit,
+reproduced live before fixing.
+
+### Performance — the read-side tooling loops moved to C speed
+
+All measured on 1M-record files, identical outputs verified:
+
+- `zna inspect --counts` flag tally: **8.7×** (per-distinct-byte counting — the
+  flags column has at most a dozen reachable values, so per-record iteration
+  was pure interpreter overhead).
+- `zna inspect --verify`: **~2.4×** end to end. The lengths-tile check, the
+  fragment-adjacency check, and both histograms now run per distinct value:
+  adjacency is a 256-byte translate plus the regex `(?:S|OB*C)*` — the exact
+  state machine, fuzz-verified equivalent over 60k random flag streams.
+- `zna encode --merge-pairs --label-defs`: **6.1×** per-record label
+  extraction (the stream now goes through the dispatching factory and gets the
+  compiled extractor; it was hardcoded to the pure-Python parser).
+- The merge-pairs write loop drops a redundant per-fragment grouping pass
+  (~11% of command wall; the writer's own fragment contract still checks every
+  record) and `zna decode` batches its output writes (~11%).
+
+### Fixed
+
+- `zna inspect --counts` silently under-reported on truncated files (it broke
+  out of its walk on a short read); it now raises naming the truncation.
+- `_RawStream` leaked a pigz child and a prefetch thread when the second input
+  path failed to open, or when the first stream's close raised on a corrupt
+  `.gz` — both merge drive loops and the merge-pairs stream now construct
+  inside the try and close in a nested finally.
+- `zna shuffle`'s return type annotation said `None`; it returns
+  `(units_written, records_scanned)`.
+- `COMPRESSION_ZSTD`/`COMPRESSION_NONE`/`ZnaRecord` are now importable from
+  `zna` — the README's own Python API example failed on its import line.
+- `process_pair`'s documented return shape was two fields short in both
+  backends' docs (the 0.4.0 npolicy fields).
+
+### Removed
+
+- The dead `with_ends=` plumbing on `stream_inputs`/`_stream_zna_reencode`
+  (no caller since 0.4.1's copy-path rewrite) and the 0.3.3 header-parsing
+  helpers `get_base_name`/`get_read_suffix_number`/`parse_fastq_with_names`
+  (production code uses `_read_key`; the old implementations live on inside
+  `scripts/bench_tierc.py` as that benchmark's baseline).
+
+## [0.5.0] - 2026-08-18
 
 ### Added — the self-describing container (format extension, additive)
 
@@ -1135,7 +1188,10 @@ figures are cross-process, since the two arms are different builds.
 - Speed: 165 MB/s encode, 241 MB/s decode (pure Python)
 - File size competitive with BAM format
 
-## [0.2.0] - 2026-02-03
+## [0.1.9] - 2026-02-03
+
+*(This section was mislabeled as a second `[0.2.0]` for months; renumbered to
+its place in the sequence. Content unchanged.)*
 
 ### Added
 - C++ acceleration with nanobind (9.5x speedup over pure Python)

@@ -16,9 +16,9 @@ Backends implement::
         -> (shift, score_q, overlap_len, mismatches)
 
     process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-                 min_read_length, disagree_q)
+                 min_read_length, disagree_q[, npolicy, rng_seed, pair_index])
         -> (records, outcome, n_dropped, score_q, overlap_len, mismatches,
-            bases_consensus_changed, trim_guard_fired)
+            bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)
 
 All scoring arguments are integers in the fixed-point scale of :mod:`zna.merge.params`;
 no float crosses this boundary, which is what makes the two implementations comparable
