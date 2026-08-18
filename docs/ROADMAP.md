@@ -34,22 +34,19 @@ unverified, and all three want a Linux/x86 box:
 
 Reproduce with [`scripts/merge_bench/README.md`](../scripts/merge_bench/README.md).
 
-### 0.5.0 — `zna encode --merge-pairs`
+### ~~0.5.0 — `zna encode --merge-pairs`~~ — SHIPPED in 0.5.0
 
-Merging in-process, deleting the FASTQ intermediate between `zna merge` and
-`zna encode`. Fully specified in [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md), including
-the three blockers found while auditing the design against the code.
-
-Worth knowing before prioritising it: **the corpus it produces is flag-identical to the
-two-step path** on well-formed input — verified over 1,416,630 records, same histogram
-either way. So this is a speed and robustness change, not a correctness one, and nothing
-downstream needs rebuilding on account of it.
+Built per [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md), honoring its three audit
+blockers. Verified on the 1M-pair benchmark: one-step and two-step agree on all
+999,496 fragments (zero disagreements), 1.53× faster wall, 2.2× cheaper CPU. See
+CHANGELOG.
 
 ### Faster inflate
 
-Gzip decompression is the floor once compute is native. `libdeflate` or ISA-L inside the
-extension would move it — but `--merge-pairs` may moot the question first by deleting the
-intermediate that is being decompressed.
+Gzip decompression is the floor once compute is native. `libdeflate` or ISA-L inside
+the extension would move it — though `--merge-pairs` (shipped, 0.5.0) already deleted
+the intermediate's inflate-and-reparse; what remains is the mergers' own input
+decompression.
 
 ---
 
@@ -82,19 +79,15 @@ orphan a mate and needs no fragment logic of its own — it copies payloads and 
 The record-granular path would have to group mates itself, which is the second reason to
 start with blocks.
 
-### Stored block index (sidecar)
+### Stored block index (sidecar) — SUPERSEDED by the 0.5.0 trailer
 
-`block_index()` walks the block-header chain at ~2.3 µs per block — ~1.4 ms for a
-611-block file — so a stored index buys nothing locally.
-
-It would matter for **remote** corpora. A sidecar `sample.zna.idx` of
-`(offset, n_records)` per block would let a consumer read record counts for corpus
-balancing without downloading the data, and issue ranged reads for only the blocks it
-sampled — turning a 5% sample into 5% of the transfer.
-
-A sidecar beats a footer: no format-version bump, old readers ignore it, and it can be
-generated lazily. A footer would be misread, because today's readers parse block headers
-until EOF.
+The block index now lives **inside the file**: the 0.5.0 trailer stores it, the footer
+makes it discoverable O(1) from EOF, and a suffix-range GET of a remote file's tail
+indexes it with no full download — the remote-corpus case this item existed for.
+`docs/TRAILER_PLAN.md` §14 records how the footer landed *without* a format-version
+bump (count-0 pseudo-blocks; 0.4.1 readers decode them as valid empty blocks), which
+dissolves the "a footer would be misread" objection that justified a sidecar. No
+sidecar will be built.
 
 ### String labels
 
@@ -140,21 +133,17 @@ enabling zero-copy pandas/polars and SQL over label columns.
 
 ---
 
-## Known divergence between the codec backends
+## Known divergence between the codec backends — RESOLVED in 0.4.0
 
-The project's central discipline is that the two codec backends agree exactly. One case
-does not, and it is pinned by a test that documents it rather than blessing it
-(`tests/test_fuzz_roundtrip.py::test_npolicy_rejects_non_n_ambiguity_codes_in_python_backend`):
-
-With any `--npolicy` set, the compiled backend substitutes the policy base for **any**
-unencodable character, while the pure-Python backend substitutes only `N`/`n` and raises
-on the rest. So an IUPAC ambiguity code — `R`, `Y`, `S`, … — encodes on the compiled
-backend and raises on the reference one.
-
-Neither behaviour is obviously right, which is why it is still open. `--npolicy` is
-named for N, which argues for rejecting the rest; but silently rejecting a whole library
-because one read carries an `R` is a harsh failure. Resolving it is a behaviour change
-either way, so it wants a release boundary and a decision, not a quiet fix.
+This section used to record a live inconsistency: the compiled backend substituted the
+policy base for **any** unencodable character while the reference substituted only
+`N`/`n` and raised on the rest. 0.4.0's alphabet strictness (`docs/NPOLICY_PLAN.md`
+§8.2) resolved it in the strict direction — **both backends now raise, naming the
+character and its offset**, and only `N`/`n` is ever substitutable, under every policy.
+Verified directly against both backends (`encode_block` with an `R` under
+`--npolicy random`: both raise) while auditing for the 0.5.0 trailer work, which found
+this section still claiming the divergence was open. No divergence between the codec
+backends is currently known.
 
 ---
 

@@ -57,21 +57,35 @@ file header    <4sBBBBBHHH>  magic | version | seq_len_bytes | header flags |
                              read-group length | description length
                then the read group, the description, and one 89-byte label
                definition per label
+PROLOGUE       a count-0 block header + provenance JSON (writer_version,
+               shuffled, merged_in_process) -- start-known facts, written at
+               open, readable before any record, pipes included
 block header   <IIIII>       comp_size | uncomp_size | record_count |
                              flags_size | lengths_size
-block payload  one zstd frame:  flags ‖ labels ‖ lengths ‖ sequences
+block payload  one zstd frame (content-checksummed):
+                             flags ‖ labels ‖ lengths ‖ sequences
+SENTINEL       a count-0 block header + trailer JSON -- derived facts only:
+               counts, both length histograms, flag counts, the stored block
+               index, the prologue's crc32
+FOOTER         32 bytes at EOF: magic | version | crc32(trailer payload) |
+               sentinel_offset -- O(1) discovery
 ```
 
 Per-record flags (`ZnaRecordFlags`): `IS_READ1 1`, `IS_READ2 2`, `IS_PAIRED 4`,
-`IS_RC 8`, `IS_FULL_FRAGMENT 16`.
+`IS_RC 8`, `IS_FULL_FRAGMENT 16`.  `count == 0` never occurs on a data block;
+it marks the two metadata pseudo-blocks, and the reader consumes the prologue
+at open so every walk sees count==0 as exactly one thing: end of data.
 
 The payload is columnar because that is what makes it compress: each stream is
 homogeneous, so zstd sees runs instead of an interleave. Flags come first so a consumer
 can decompress a *prefix* of the frame and read the flag column without touching
 sequence.
 
-**No record or block count is stored in the file header.** Every block header carries
-its own; totals come from walking the chain (`block_index()`).
+The split between prologue and trailer is principled — *position follows when the
+information is knowable* — and the trailer is the writer's signature that the encode
+FINISHED: an aborted encode writes none, and `zna inspect --verify` refuses the file.
+Files from zna < 0.5 have neither and still read; they no longer certify.
+`docs/TRAILER_PLAN.md` (§14 especially) is the specification.
 
 ## Invariants that must not be broken
 
@@ -80,8 +94,8 @@ its own; totals come from walking the chain (`block_index()`).
    write path and raises otherwise. It is what makes `blocks(stride=…)` sharding sound.
 2. **The two backends produce byte-identical output.** `_pycodec.py` is the
    specification; `_accel.cpp` must match it. `tests/test_fuzz_roundtrip.py` runs the
-   whole matrix against both. One divergence is currently open and pinned by a test —
-   see ROADMAP.
+   whole matrix against both. No divergence is currently known (the npolicy
+   ambiguity-code divergence was resolved in 0.4.0: both backends raise).
 3. **Output must not depend on `--block-size`.** Both random streams — the unstranded RC
    coin and `--npolicy random`'s substitution — are derived from the record's *global*
    index via `_mix64`, never from a running per-block state.
@@ -91,6 +105,13 @@ its own; totals come from walking the chain (`block_index()`).
 5. **Strand normalization is not idempotent.** Applying it twice un-normalizes the data
    while the header still claims otherwise. Every ZNA→ZNA path copies orientation rather
    than re-deriving it (`preserve_normalization=True`).
+6. **Trailer stats come from the codec's returned columns**, tallied in `_flush_block`
+   — never from the writer's input arguments, which differ from the file whenever
+   strand normalization sets `IS_RC` or an N-policy changes a stored length. The fuzz
+   suite recounts every generated file against its trailer.
+7. **Only a finished encode certifies.** `close()` signs; `abort()` and the
+   exception path do not. Any new writer-holding code path must abort on error —
+   a partial file with a valid trailer is silent data loss at the consumer.
 
 ## Conventions
 

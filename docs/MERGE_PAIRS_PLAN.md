@@ -1,6 +1,10 @@
 # `zna encode --merge-pairs` — implementation plan
 
-Status: **specified, not built.** Revision 2, written 2026-08-13 after auditing the
+Status: **executed, 0.5.0.** (Step 3's carries_ends no-op refactor proved vacuous by
+execution time — 0.4.1's copy-path rewrite had already deleted the conflation it
+untangled — and the duplicate-name corruption of §1 was independently closed for
+merged reads by 0.4.0's MERGED_SINGLE guard; `--merge-pairs` closes it structurally.)
+Revision 2, written 2026-08-13 after auditing the
 2026-08-13 draft against the code. Revision 1 was written from the design intent;
 this one is written from what `src/zna/cli.py`, `src/zna/core.py` and
 `src/zna/merge/` actually do, with the load-bearing claims checked by running them.

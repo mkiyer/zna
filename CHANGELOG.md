@@ -70,6 +70,30 @@ previously *silent* case — the file read back clean, just shorter), truncation
 mid-block, a flipped trailer byte (CRC), a flipped block byte (zstd content
 checksum), tampered stats (recount), and an aborted encode (no trailer).
 
+### Added — `zna encode --merge-pairs`: merge in process
+
+The FASTQ intermediate between `zna merge` and `zna encode` is gone: pairs
+merge inside the encoder and each record's geometry is handed over rather than
+re-derived from read names. Same thresholds, same kernel, same
+`--merge-json` stats block; composes with `--strand-normalize`, `--shuffle`,
+and `--label-defs` (labels come from each record's own header; a `ZN`-tagged
+label is filled with the provenance byte directly, no tag round-trip). The
+writer stamps `merged_in_process` into the provenance prologue.
+
+Verified on the 1M-pair benchmark: one-step and two-step agree on all 999,496
+fragments — zero disagreements — with 99.13% of merged records reconstructing
+the true fragment exactly (the ~0.5% wrong-shift residual is a property of the
+genome and identical on both paths). 1.53× faster wall, 2.2× less CPU, and
+two silent-corruption classes are closed: mate files that do not correspond
+now fail per pair instead of zipping silently, and duplicate read names cannot
+re-pair independently merged molecules because no name is ever inspected.
+
+A desynced or empty input aborts BEFORE the writer signs, so the partial file
+left behind reads but does not certify. `--allow-empty` opts into a 0-record
+file; two-file mode requires FASTQ paths (no stdin, no `--interleaved`, no
+`--treat-unpaired-as-merged`, no `--seq-len-bytes 1` — each rejection says
+why).
+
 ### Fixed
 
 - `block_index()` on a file with trailing garbage appended a phantom

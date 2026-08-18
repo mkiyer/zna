@@ -3,7 +3,7 @@
 Every number in those documents comes from these scripts. They are kept so the design
 can be re-argued against measurements rather than recollection, and so the same numbers
 can be taken on a Linux/x86 box — this session's were all aarch64, which matters for
-`popcount`. See docs/ROADMAP.md, "0.4.1 — x86 tuning".
+`popcount`. See docs/ROADMAP.md, "0.4.2 — x86 tuning".
 
 Nothing here is part of the zna package or the test suite.
 

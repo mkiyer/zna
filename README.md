@@ -16,6 +16,8 @@
 - **Minimal Dependencies**: `zstandard` and `pyyaml` only (C++ extensions ship prebuilt)
 - **Flexible**: Single-end, paired-end, and interleaved reads
 - **Block-Parallel**: fragments never split across blocks, so any subset of blocks decodes independently — shard a file by block without splitting a pair
+- **Self-Describing**: every file carries its provenance (writer version, shuffled?) up front and its exact contents (counts, length histograms, block index, checksums) in a trailer — `zna inspect --verify` certifies a file with no sidecar
+- **In-Process Merging**: `zna encode --merge-pairs R1.fq R2.fq` merges and encodes in one step, no FASTQ intermediate
 - **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score, with a compiled kernel and byte-identical output on any platform
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
@@ -83,9 +85,15 @@ zna decode sample.zna -o sample.fasta
 # Inspect file statistics
 zna inspect sample.zna
 
-# Overlap-merge paired-end reads before encoding
+# Merge overlapping pairs and encode, one step, no intermediate
+zna encode --merge-pairs R1.fq.gz R2.fq.gz -o sample.zna
+
+# ...or the two-step path (still supported)
 zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
 zna encode --interleaved --treat-unpaired-as-merged merged.fq.gz -o sample.zna
+
+# Certify a file: integrity, structure, stats vs its trailer; exit 0 iff good
+zna inspect --verify sample.zna
 
 # Pipe-friendly workflows
 cat reads.fastq | zna encode -o reads.zna
@@ -133,7 +141,8 @@ reference and the Python API are all below.
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | compression ratios, throughput, and tuning |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
-| [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — specified, not built *(0.5.0)* |
+| [docs/TRAILER_PLAN.md](docs/TRAILER_PLAN.md) | the self-describing container: prologue, trailer, footer, `inspect --verify` — executed in 0.5.0; §14 records the amendments |
+| [docs/MERGE_PAIRS_PLAN.md](docs/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — executed in 0.5.0 |
 | [docs/NPOLICY_PLAN.md](docs/NPOLICY_PLAN.md) | the `--npolicy` design and what remains of it |
 | [docs/HANDOFF_0.4.0.md](docs/HANDOFF_0.4.0.md) | a record of the 0.4.0 release; its build traps and ground-truth notes are still current *(maintainers)* |
 
@@ -152,6 +161,7 @@ ZNA files use a binary format optimized for nucleic acid sequences:
 - **2-bit Encoding**: A=00, C=01, G=10, T=11
 - **Block Structure**: Columnar blocks, compressed as one Zstd frame each
 - **Fragment-complete blocks**: a fragment's reads are consecutive and never split
+- **Self-describing (0.5.0)**: a provenance prologue after the header, a stats trailer + footer at EOF; zstd frames carry content checksums
 - **Metadata**: Read groups, descriptions, and custom information
 
 ### File Structure
@@ -186,8 +196,30 @@ ZNA files use a binary format optimized for nucleic acid sequences:
 │    └───────────────────────────────┘    │
 ├─────────────────────────────────────────┤
 │  Block 1 ...                            │
+├─────────────────────────────────────────┤
+│  Sentinel (20-byte header, count = 0)   │
+│  Trailer — canonical JSON, derived      │
+│   facts only: record/base/pair counts,  │
+│   length histograms, per-flag counts,   │
+│   the stored block index, prologue CRC  │
+├─────────────────────────────────────────┤
+│  Footer (32 bytes at EOF)               │
+│   magic | ver | crc32(trailer) |        │
+│   sentinel offset — O(1) discovery      │
 └─────────────────────────────────────────┘
 ```
+
+A **provenance prologue** — another count-0 pseudo-block — sits between the
+file header and Block 0, carrying the facts known at encode *start*:
+`writer_version`, `shuffled`, `merged_in_process`. A streaming consumer, pipes
+included, learns what wrote the file before decoding a record
+(`ZnaReader.provenance`); the trailer (`ZnaReader.trailer`) carries only what
+requires the *complete* encode. The trailer is the writer's signature that the
+encode finished — an aborted encode writes none, so the file still reads but
+`zna inspect --verify` refuses to certify it. Files written by zna < 0.5 have
+neither and still read. The format version byte is unchanged: no data block
+ever carries `count == 0`, so the pseudo-blocks are invisible to older
+readers.
 
 The payload is **columnar, not row-oriented**: all flags come first, then all
 label values, then all lengths, then all packed sequence. That is what lets
@@ -587,8 +619,22 @@ Options:
   --shuffle-buffer-size N
                          Max memory per bucket for encode --shuffle (default: 1G).
                          Accepts K/M/G suffixes.
-  --fasta                Force FASTA format (overrides extension detection)
-  --fastq                Force FASTQ format (overrides extension detection)
+Overlap merging (--merge-pairs):
+  --merge-pairs          Merge overlapping pairs in process while encoding
+                         (takes exactly two FASTQ files, R1 R2, adjacent on the
+                         command line; no FASTQ intermediate). Mate names are
+                         checked per pair — input that silently mispaired under
+                         the plain two-file reader now fails loudly.
+  --threshold-merge N    Overlap score (bits) to merge (default: 28)
+  --threshold-trim N     Overlap score (bits) to trim the redundant overlap
+                         (default: 8)
+  --min-read-length N    Drop emitted reads shorter than this (default: 40)
+  --no-sync-check        Skip the per-pair mate-name check
+  --merge-json PATH      Write the merge run's statistics as JSON (same block
+                         as `zna merge --json`)
+  --merge-backend {auto,accel,python}
+                         Merge kernel (default: auto)
+  --allow-empty          Permit an input with no read pairs
 
 Metadata:
   --read-group TEXT      Read group ID (default: "Unknown")
@@ -602,10 +648,10 @@ Metadata:
   --read2-sense          Read 2 represents sense strand (default when --strand-specific)
   --read2-antisense      Read 2 represents antisense strand
   --npolicy {trim3,random}
-                         Policy for handling 'N' nucleotides:
-                         - drop: skip sequences containing N
-                         - random: replace N with random base (A/C/G/T)
-                         - A/C/G/T: replace N with specific base
+                         Policy for no-call (N) bases (default: trim3):
+                         - trim3: cut the read at its first N, keeping [0, N)
+                         - random: substitute a base from a seeded stream
+                           (--seed), reproducibly
 
 Format Options:
   -o, --output FILE      Output file (default: stdout)
@@ -642,13 +688,29 @@ Display ZNA file statistics.
 **Usage:**
 
 ```
-zna inspect FILE [--counts]
+zna inspect FILE [--verify] [--json] [--counts] [--blocks]
 
   input FILE             Input ZNA file to inspect
+  --verify               Fully certify the file: decode every block (zstd
+                         content checksums verify in the same motion), recount
+                         every stat, compare against the trailer, check
+                         fragment adjacency. Exit 0 iff the file passes.
+  --json                 Machine-readable output; splices the provenance and
+                         trailer payloads verbatim, and the verify verdict
+                         under --verify.
   --counts               Also report per-flag record counts (paired R1, paired R2,
                          single/merged, reverse-complemented). Reads block payloads,
-                         so slower than the default header-only scan.
+                         so slower than the default scan.
+  --blocks               (--json only) include the per-block index.
 ```
+
+A bare `inspect` already runs the cheap structural pass on any 0.5 file —
+footer CRC, stored block index against a walk of the actual headers — and
+exits non-zero on disagreement. `--verify` is the paid tier; it is what a
+corpus stager should run after every fetch. A file written by zna < 0.5 (or
+an encode that crashed mid-write) has no trailer: it reads normally, but
+`--verify` refuses it — the trailer is the writer's signature that the encode
+finished.
 
 ### `zna shuffle`
 

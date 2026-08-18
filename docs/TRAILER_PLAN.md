@@ -1,7 +1,8 @@
 # The stats trailer, the stored block index, and `zna verify` — implementation plan
 
-Status: **specified, not built.** Written 2026-08-18 against `main` at `f9697d2` (v0.4.1 + 1
-commit, 492 test functions green). Line references were verified at that commit and will drift;
+Status: **executed, 0.5.0.** Written 2026-08-18 against `main` at `f9697d2` (v0.4.1 + 1
+commit, 492 test functions green); implemented the same day — §14 records where the
+implementation overrode the text above, and the owner's rulings on §13. Line references were verified at that commit and will drift;
 resolve them by symbol, not by line.
 
 Companion documents: [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md) (rides the same release, specified
