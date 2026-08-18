@@ -17,6 +17,13 @@ from __future__ import annotations
 from .fastqio import InputError
 from .names import base_name, strip_pair_suffix
 
+#: Which mate of the pair an emitted record came from -- the whole geometry
+#: transfer of ``zna encode --merge-pairs``.  Mirrors ``Slot`` in
+#: ``fastq_chunk.hpp``.
+SLOT_MERGED = 0
+SLOT_MATE1 = 1
+SLOT_MATE2 = 2
+
 # Sentinel for "this shift cannot beat the incumbent"; far below any reachable score.
 _REJECT = -(1 << 62)
 
@@ -379,7 +386,22 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
     """Classify one pair and build its output records.
 
     Returns ``(records, outcome, n_dropped, score_q, overlap_len, mismatches,
-    bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)``.
+    bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)``,
+    with each record a ``(header, seq, qual)`` tuple.  The thin public shim over
+    :func:`_process_pair_ex`, which additionally carries each record's PROV_*
+    byte -- the record adapter reads the bits there directly, with no
+    ``ZN:i:`` tag round-trip, mirroring ``PairResult::prov`` in the C++ core.
+    """
+    records, *rest = _process_pair_ex(
+        h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
+        min_read_length, disagree_q, npolicy, rng_seed, pair_index)
+    return ([r[:3] for r in records], *rest)
+
+
+def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
+                     min_read_length, disagree_q, npolicy=NPOLICY_TRIM3, rng_seed=0,
+                     pair_index=0):
+    """:func:`process_pair` with records as ``(header, seq, qual, prov)``.
 
     The last two are pair totals. Their per-mate splits stay local: they exist only to
     build each record's provenance tokens, and summing them here keeps the run-level
@@ -525,7 +547,7 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
                           0 if rnd else npolicy_bases,
                           npolicy_bases if rnd else 0,
                           n_rescued) + b" merged_%d_%d" % (n1, n2)
-        cand = [(name, seq, qual)]
+        cand = [(name, seq, qual, bits)]
         paired, outcome = False, MERGED
     elif will_trim:
         b1 = (PROV_TRIMMED | (PROV_RESCUED if rescued_1 else 0)
@@ -534,10 +556,10 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
               | (npolicy_bit if npolicy_2 else 0))
         cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
                             npolicy_1 if rnd else 0, rescued_1),
-                 s1[:keep1], q1[:keep1]),
+                 s1[:keep1], q1[:keep1], b1),
                 (_prov_name(h2, b2, 0 if rnd else npolicy_2,
                             npolicy_2 if rnd else 0, rescued_2),
-                 s2[:keep2], q2[:keep2])]
+                 s2[:keep2], q2[:keep2], b2)]
         paired, outcome = True, TRIMMED
     else:
         if prov_band and not prov_trim:
@@ -547,9 +569,9 @@ def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
         b1 = npolicy_bit if npolicy_1 else 0
         b2 = npolicy_bit if npolicy_2 else 0
         cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
-                            npolicy_1 if rnd else 0, 0), s1, q1),
+                            npolicy_1 if rnd else 0, 0), s1, q1, b1),
                 (_prov_name(h2, b2, 0 if rnd else npolicy_2,
-                            npolicy_2 if rnd else 0, 0), s2, q2)]
+                            npolicy_2 if rnd else 0, 0), s2, q2, b2)]
         paired, outcome = True, KEPT
 
     if paired:
@@ -692,6 +714,111 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
                 frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
                 max_read_len, npolicy_bases, n_rescued_tot)
     return (b"".join(parts), pos1 - start1, pos2 - start2, counters,
+            len_hist, olen_hist, insert_hist)
+
+
+def merge_chunk_records(buf1, start1, end1, buf2, start2, end2, match_q, step_q,
+                        t_merge_q, t_trim_q, min_read_length, disagree_q,
+                        check_sync, base_index, want_headers,
+                        npolicy=NPOLICY_TRIM3, rng_seed=0):
+    """Merge every whole pair available, emitting RECORDS instead of FASTQ text.
+
+    The reference half of the ``zna encode --merge-pairs`` adapter; the
+    specification the C++ ``merge_chunk_records`` must match element for
+    element.  Returns ``(seqs, ends, consumed1, consumed2, counters, len_hist,
+    olen_hist, insert_hist)`` where *seqs* is one bytes blob and each end is
+    ``(seq_off, seq_len, hdr_off, hdr_len, slot, prov)``.
+
+    Conventions mirror the text adapter exactly, and the two differ on purpose:
+    *consumed* counts are RELATIVE to ``start`` (the caller does ``pos += c``),
+    while ``hdr_off`` is ABSOLUTE into the caller's buffer, like
+    :func:`split_records`'s return -- buf1 for MERGED and MATE1 records, buf2
+    for MATE2, selected by the slot.  ``hdr_len`` is 0 when *want_headers* is
+    false.  ``prov`` is the record's PROV_* byte taken directly from the pair
+    result -- no ``ZN:i:`` tag round-trip.
+    """
+    seq_parts, ends = [], []
+    seq_off = 0
+    n_pairs = merged = trimmed = kept = emitted = dropped = 0
+    bases_trimmed = frags_short = bases_consensus = trim_guard = 0
+    sum_olen = sum_diff = max_read_len = 0
+    npolicy_bases = n_rescued_tot = 0
+    len_hist, olen_hist, insert_hist = [], [], []
+    pos1, pos2 = start1, start2
+
+    while True:
+        a = _next_record(buf1, pos1, end1, "R1")
+        if a is None:
+            break
+        b = _next_record(buf2, pos2, end2, "R2")
+        if b is None:
+            break
+        h1, s1, q1, try1 = a
+        h2, s2, q2, try2 = b
+        longest = len(s1) if len(s1) > len(s2) else len(s2)
+        if longest > max_read_len:
+            max_read_len = longest
+
+        if check_sync and base_name(h1) != base_name(h2):
+            raise InputError(
+                f"R1/R2 out of sync at pair {base_index + n_pairs + 1}: "
+                f"'{base_name(h1).decode('latin-1')}' != "
+                f"'{base_name(h2).decode('latin-1')}'")
+
+        (records, outcome, n_dropped, score, olen, diff,
+         n_consensus, guard, npol_bases, rescued) = _process_pair_ex(
+            h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
+            min_read_length, disagree_q, npolicy, rng_seed, base_index + n_pairs)
+
+        n_pairs += 1
+        dropped += n_dropped
+        bases_consensus += n_consensus
+        trim_guard += guard
+        npolicy_bases += npol_bases
+        n_rescued_tot += rescued
+        if outcome == MERGED:
+            merged += 1
+        elif outcome == TRIMMED:
+            trimmed += 1
+            if records:
+                bases_trimmed += ((len(s1) - len(records[0][1]))
+                                  + (len(s2) - len(records[1][1])))
+        else:
+            kept += 1
+        if not records and outcome != MERGED:
+            frags_short += 1
+        if olen:
+            _bump(olen_hist, olen)
+            sum_olen += olen
+            sum_diff += diff
+
+        for i, (_header, seq, _qual, prov) in enumerate(records):
+            slot = (SLOT_MERGED if outcome == MERGED
+                    else (SLOT_MATE1 if i == 0 else SLOT_MATE2))
+            hdr_off = hdr_len = 0
+            if want_headers:
+                # The record's OWN source header (MERGED reads R1's): the
+                # located record starts at pos with '@', so the header is the
+                # next byte.  Length excludes any trailing CR, matching
+                # _next_record's rstrip.
+                if slot == SLOT_MATE2:
+                    hdr_off, hdr_len = pos2 + 1, len(h2)
+                else:
+                    hdr_off, hdr_len = pos1 + 1, len(h1)
+            ends.append((seq_off, len(seq), hdr_off, hdr_len, slot, prov))
+            seq_parts.append(seq)
+            seq_off += len(seq)
+            emitted += 1
+            L = len(seq)
+            _bump(len_hist, L)
+            if outcome == MERGED:
+                _bump(insert_hist, L)
+        pos1, pos2 = try1, try2
+
+    counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
+                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
+                max_read_len, npolicy_bases, n_rescued_tot)
+    return (b"".join(seq_parts), ends, pos1 - start1, pos2 - start2, counters,
             len_hist, olen_hist, insert_hist)
 
 

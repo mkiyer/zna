@@ -578,6 +578,92 @@ class TestCrossBackend:
         assert a[3][0] == 400 and a[3][1] > 100, a[3]      # the fixture proves nothing
         assert a[3][8] > 0, "no consensus changes: the fixture is not exercising it"
 
+    def test_record_adapter_agrees_with_merge_chunk(self):
+        """The record adapter and the FASTQ adapter share one inner loop; this
+        holds them to it: same sequences record for record, same slot the
+        FASTQ names imply, same consumed counts, all 15 counters, all three
+        histograms.  (MERGE_PAIRS_PLAN.md §4 step 1.)"""
+        from zna.merge.backend import available_merge_backends, get_merge_backend
+        if "accel" not in available_merge_backends():
+            pytest.skip("C++ merge backend not built")
+        cc = get_merge_backend("accel")
+        rng = random.Random(23)
+        r1s, r2s = [], []
+        for i in range(300):
+            frag = draw(rng, rng.randrange(40, 320))
+            l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
+            s1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
+            s2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
+            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
+            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
+            r1s.append(b"@f%d/1 XA:i:%d\n%b\n+\n%b\n" % (i, i, s1, q1))
+            r2s.append(b"@f%d/2 XB:i:%d\n%b\n+\n%b\n" % (i, i, s2, q2))
+        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+
+        blob, c1, c2, counters, lh, oh, ih = cc.merge_chunk(
+            buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+        seqs, ends, rc1, rc2, rcounters, rlh, roh, rih = cc.merge_chunk_records(
+            buf1, 0, len(buf1), buf2, 0, len(buf2), *args, True)
+
+        assert (c1, c2) == (rc1, rc2)
+        assert counters == rcounters
+        assert (list(lh), list(oh), list(ih)) == (list(rlh), list(roh), list(rih))
+        # sequences equal record for record...
+        fastq = [ln for ln in blob.split(b"\n")[1::4] if ln]
+        recs = [seqs[o:o + l] for (o, l, _ho, _hl, _slot, _p) in ends]
+        assert fastq == recs
+        # ...and the slot each record reports is the one its FASTQ name implies
+        names = [ln[1:] for ln in blob.split(b"\n")[0::4] if ln]
+        for name, (o, l, ho, hl, slot, prov) in zip(names, ends):
+            implied = (1 if b"/1" in name.split(b" ")[0]
+                       else 2 if b"/2" in name.split(b" ")[0] else 0)
+            assert slot == implied, (name, slot)
+            # headers point into the record's own source buffer, tags intact
+            src = buf2 if slot == 2 else buf1
+            hdr = src[ho:ho + hl]
+            assert hdr.startswith(b"f") and (b"XB:" in hdr if slot == 2
+                                             else b"XA:" in hdr)
+
+    def test_record_chunks_agree_across_backends(self):
+        """Cross-backend differential for the record adapter: seqs blob, ends
+        (offsets, slots, prov bytes), consumed counts, counters, histograms --
+        element for element.  (MERGE_PAIRS_PLAN.md §4 step 2.)"""
+        from zna.merge.backend import available_merge_backends, get_merge_backend
+        if "accel" not in available_merge_backends():
+            pytest.skip("C++ merge backend not built")
+        py = get_merge_backend("python").merge_chunk_records
+        cc = get_merge_backend("accel").merge_chunk_records
+        rng = random.Random(29)
+        r1s, r2s = [], []
+        for i in range(250):
+            frag = draw(rng, rng.randrange(40, 320))
+            l1, l2 = rng.randrange(20, 151), rng.randrange(20, 151)
+            s1 = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01))
+            s2 = bytearray(mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01))
+            # sprinkle no-calls so npolicy provenance bits actually appear
+            for sb in (s1, s2):
+                if len(sb) and rng.random() < 0.3:
+                    sb[rng.randrange(len(sb))] = ord(b"N")
+            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
+            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
+            r1s.append(b"@f%d/1 t\n%b\n+\n%b\n" % (i, bytes(s1), q1))
+            r2s.append(b"@f%d/2 t\n%b\n+\n%b\n" % (i, bytes(s2), q2))
+        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        for npolicy in (1, 0, 2):
+            args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40,
+                    DISAGREE_Q, True, 0, True, npolicy, 11)
+            a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+            b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+            assert a[0] == b[0], f"npolicy={npolicy}: seq blobs differ"
+            assert [tuple(e) for e in a[1]] == [tuple(e) for e in b[1]], \
+                f"npolicy={npolicy}: ends differ"
+            assert a[2:5] == b[2:5], f"npolicy={npolicy}: consumed/counters differ"
+            assert (list(a[5]), list(a[6]), list(a[7])) == \
+                (list(b[5]), list(b[6]), list(b[7]))
+            # the fixture must actually exercise provenance
+            assert any(e[5] for e in a[1]), f"npolicy={npolicy}: no prov bits set"
+
     @pytest.mark.parametrize("npolicy", [1, 0, 2])   # trim3, keep, random
     def test_chunks_with_no_calls_agree_blob_for_blob(self, npolicy):
         """The differential, on input that actually contains `N`.

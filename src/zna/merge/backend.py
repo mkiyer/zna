@@ -39,7 +39,8 @@ _BACKEND_MODULES = {
 _PREFERENCE = ("accel", "python")
 
 _REQUIRED_FUNCTIONS = frozenset(
-    {"scan", "process_pair", "merge_chunk", "split_records"})
+    {"scan", "process_pair", "merge_chunk", "merge_chunk_records",
+     "split_records"})
 
 _loaded: dict[str, ModuleType] = {}
 _default: Optional[ModuleType] = None

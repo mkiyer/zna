@@ -202,15 +202,48 @@ inline void emit(std::string& blob, const OutRec& r) {
     blob += '\n';
 }
 
-/// Merge every whole pair available in both buffers, appending FASTQ text to *blob*.
+/// Which mate of the pair an emitted record came from -- the whole geometry
+/// transfer of `zna encode --merge-pairs` (MERGE_PAIRS_PLAN.md §0.1).  Slot,
+/// not ZNA flag bits, crosses this boundary: the flag layout stays defined in
+/// exactly one place, on the Python side.
+enum Slot : uint8_t { SLOT_MERGED = 0, SLOT_MATE1 = 1, SLOT_MATE2 = 2 };
+
+/// One record emitted by `merge_chunk_records`.
 ///
-/// *pos1* / *pos2* are advanced to the number of bytes consumed from each stream.
-/// *base_index* is the index of the first pair in the input, carried only so a desync
-/// can be reported by absolute pair number rather than "somewhere in this chunk".
-inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
-                        const uint8_t* buf2, size_t n2, size_t& pos2,
-                        const Params& p, bool check_sync, int64_t base_index,
-                        ChunkScratch& sc, std::string& blob, ChunkStats& st) {
+/// `seq_off`/`seq_len` index into the caller's `seqs` blob.  `hdr_off`/`hdr_len`
+/// index into the ORIGINAL input buffer -- buf1 for MERGED and MATE1, buf2 for
+/// MATE2, derivable from `slot` -- and `hdr_len` is 0 when headers were not
+/// requested.  Pointing at the input rather than at `OutRec::h` is not merely
+/// cheaper, it is the only CORRECT option for a merged record: its `OutRec::h`
+/// points at `Scratch::name`, a single per-pair buffer the next pair
+/// overwrites.  It also hands `zna encode --label` byte-identical tag values to
+/// the two-step path, whose extractor reads the same input header.
+///
+/// `prov` is the record's PROV_* byte straight off `PairResult::prov` -- the
+/// direct transfer that lets `--merge-pairs` write the provenance column with
+/// no `ZN:i:` tag round-trip (MERGE_PAIRS_PLAN.md §10.4).
+struct RecordEnd {
+    uint32_t seq_off, seq_len;
+    uint32_t hdr_off, hdr_len;
+    uint8_t slot;
+    uint8_t prov;
+};
+
+/// The one inner loop both adapters share: locate, sync-check, merge, tally.
+///
+/// The loop carries the consumption protocol, the desync check and every
+/// statistic; the only thing the two output shapes disagree on is what to do
+/// with an emitted record, so that is the only thing the emitter functor is
+/// handed.  Two copies of this loop would drift -- the reason this is a
+/// template, not a convention.
+///
+/// `emit(r, i, a, b)` is called once per emitted record: the `PairResult`, the
+/// record's index within it, and the located input records for both mates.
+template <class EmitFn>
+inline void merge_chunk_impl(const uint8_t* buf1, size_t n1, size_t& pos1,
+                             const uint8_t* buf2, size_t n2, size_t& pos2,
+                             const Params& p, bool check_sync, int64_t base_index,
+                             ChunkScratch& sc, ChunkStats& st, EmitFn&& emit_rec) {
     RecordSpans a, b;
     Read r1, r2;
     for (;;) {
@@ -270,7 +303,7 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
             st.sum_diff += r.mismatches;
         }
         for (int i = 0; i < r.n_recs; ++i) {
-            emit(blob, r.recs[i]);
+            emit_rec(r, i, a, b);
             ++st.emitted;
             const int L = r.recs[i].s.n;
             st.len_hist[L] += 1;
@@ -282,6 +315,60 @@ inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
         pos1 = a.next_pos;
         pos2 = b.next_pos;
     }
+}
+
+/// Merge every whole pair available in both buffers, appending FASTQ text to *blob*.
+///
+/// *pos1* / *pos2* are advanced to the number of bytes consumed from each stream.
+/// *base_index* is the index of the first pair in the input, carried only so a desync
+/// can be reported by absolute pair number rather than "somewhere in this chunk".
+inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
+                        const uint8_t* buf2, size_t n2, size_t& pos2,
+                        const Params& p, bool check_sync, int64_t base_index,
+                        ChunkScratch& sc, std::string& blob, ChunkStats& st) {
+    merge_chunk_impl(
+        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, sc, st,
+        [&blob](const PairResult& r, int i, const RecordSpans&,
+                const RecordSpans&) { emit(blob, r.recs[i]); });
+}
+
+/// Merge every whole pair available, appending RECORDS instead of FASTQ text.
+///
+/// The second adapter over the same core, for `zna encode --merge-pairs`: no
+/// quality strings (ZNA does not store them), no name construction consumed
+/// (the core still builds merged names internally; v1 accepts that snprintf --
+/// see MERGE_PAIRS_PLAN.md §2.3), and headers as offsets into the caller's
+/// input buffers, only when *want_headers*.
+inline void merge_chunk_records(const uint8_t* buf1, size_t n1, size_t& pos1,
+                                const uint8_t* buf2, size_t n2, size_t& pos2,
+                                const Params& p, bool check_sync,
+                                int64_t base_index, bool want_headers,
+                                ChunkScratch& sc, std::string& seqs,
+                                std::vector<RecordEnd>& ends, ChunkStats& st) {
+    merge_chunk_impl(
+        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, sc, st,
+        [&](const PairResult& r, int i, const RecordSpans& a,
+            const RecordSpans& b) {
+            const OutRec& rec = r.recs[i];
+            const uint8_t slot =
+                (r.outcome == OUTCOME_MERGED) ? SLOT_MERGED
+                : (i == 0 ? SLOT_MATE1 : SLOT_MATE2);
+            uint32_t hdr_off = 0, hdr_len = 0;
+            if (want_headers) {
+                // The record's OWN source header (MERGED reads R1's): MATE2
+                // from buf2, everything else from buf1.
+                const Span& h = (slot == SLOT_MATE2) ? b.h : a.h;
+                const uint8_t* base = (slot == SLOT_MATE2) ? buf2 : buf1;
+                hdr_off = static_cast<uint32_t>(h.p - base);
+                hdr_len = static_cast<uint32_t>(h.n);
+            }
+            ends.push_back({static_cast<uint32_t>(seqs.size()),
+                            static_cast<uint32_t>(rec.s.n),
+                            hdr_off, hdr_len, slot,
+                            static_cast<uint8_t>(r.prov[i])});
+            seqs.append(reinterpret_cast<const char*>(rec.s.p),
+                        static_cast<size_t>(rec.s.n));
+        });
 }
 
 }  // namespace zna_merge

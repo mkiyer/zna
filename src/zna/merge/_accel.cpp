@@ -146,6 +146,78 @@ static nb::tuple merge_chunk(nb::bytes buf1, int64_t start1, int64_t end1,
         hist(st.len_hist), hist(st.olen_hist), hist(st.insert_hist));
 }
 
+/// Merge every whole pair in the two buffers; return RECORDS instead of text.
+///
+/// The `zna encode --merge-pairs` adapter.  Mirrors merge_chunk's conventions
+/// exactly: consumed counts are RELATIVE to start (the caller does pos += c),
+/// while every header offset in `ends` is ABSOLUTE into its bytes object,
+/// like split_records' return -- into buf1 for MERGED/MATE1 records, buf2 for
+/// MATE2, selected by the slot.
+static nb::tuple merge_chunk_records(nb::bytes buf1, int64_t start1, int64_t end1,
+                                     nb::bytes buf2, int64_t start2, int64_t end2,
+                                     int64_t match_q, int64_t step_q,
+                                     int64_t t_merge_q, int64_t t_trim_q,
+                                     int min_read_length, nb::bytes disagree_q,
+                                     bool check_sync, int64_t base_index,
+                                     bool want_headers, int npolicy,
+                                     uint64_t rng_seed) {
+    if (start1 < 0 || end1 < start1 || static_cast<size_t>(end1) > buf1.size() ||
+        start2 < 0 || end2 < start2 || static_cast<size_t>(end2) > buf2.size()) {
+        throw std::invalid_argument("merge_chunk_records(): bad [start, end) range");
+    }
+    if (disagree_q.size() != 256u * 256u) {
+        throw std::invalid_argument(
+            "merge_chunk_records(): disagree_q must be 256*256 bytes");
+    }
+    if (match_q <= 0 || step_q <= 0) {
+        throw std::invalid_argument(
+            "merge_chunk_records(): match_q and step_q must be positive");
+    }
+    const auto* b1 = reinterpret_cast<const uint8_t*>(buf1.c_str()) + start1;
+    const auto* b2 = reinterpret_cast<const uint8_t*>(buf2.c_str()) + start2;
+    const size_t n1 = static_cast<size_t>(end1 - start1);
+    const size_t n2 = static_cast<size_t>(end2 - start2);
+    const zna_merge::Params p{match_q, step_q, t_merge_q, t_trim_q, min_read_length,
+                              reinterpret_cast<const uint8_t*>(disagree_q.c_str()),
+                              npolicy, rng_seed};
+
+    std::string seqs;
+    std::vector<zna_merge::RecordEnd> ends;
+    zna_merge::ChunkStats st;
+    size_t pos1 = 0, pos2 = 0;
+    {
+        nb::gil_scoped_release release;
+        seqs.reserve(n1 / 2);
+        zna_merge::merge_chunk_records(b1, n1, pos1, b2, n2, pos2, p, check_sync,
+                                       base_index, want_headers, g_chunk_scratch,
+                                       seqs, ends, st);
+    }
+
+    nb::list ends_out;
+    for (const auto& e : ends) {
+        // Header offsets become absolute into the caller's bytes object.
+        const int64_t habs =
+            e.hdr_len == 0 ? 0
+            : (e.slot == zna_merge::SLOT_MATE2 ? start2 : start1) + e.hdr_off;
+        ends_out.append(nb::make_tuple(e.seq_off, e.seq_len, habs, e.hdr_len,
+                                       e.slot, e.prov));
+    }
+    auto hist = [](const std::vector<uint32_t>& h) {
+        size_t n = h.size();
+        while (n > 0 && h[n - 1] == 0) --n;
+        nb::list out;
+        for (size_t i = 0; i < n; ++i) out.append(h[i]);
+        return out;
+    };
+    return nb::make_tuple(
+        nb::bytes(seqs.data(), seqs.size()), ends_out, pos1, pos2,
+        nb::make_tuple(st.n_pairs, st.merged, st.trimmed, st.kept, st.emitted,
+                       st.dropped, st.bases_trimmed, st.frags_short,
+                       st.bases_consensus, st.trim_guard, st.sum_olen, st.sum_diff,
+                       st.max_read_len, st.npolicy_bases, st.n_rescued),
+        hist(st.len_hist), hist(st.olen_hist), hist(st.insert_hist));
+}
+
 /// (offset, n_records) just past `max_records` complete records.
 static nb::tuple split_records(nb::bytes buf, int64_t start, int64_t max_records) {
     if (start < 0 || static_cast<size_t>(start) > buf.size()) {
@@ -205,6 +277,21 @@ NB_MODULE(_accel, m) {
           "Merge every whole pair in the two buffers.\n"
           "Returns (blob, consumed1, consumed2, counters, len_hist, olen_hist,\n"
           "         insert_hist). Releases the GIL.");
+
+    m.def("merge_chunk_records", &merge_chunk_records,
+          nb::arg("buf1"), nb::arg("start1"), nb::arg("end1"),
+          nb::arg("buf2"), nb::arg("start2"), nb::arg("end2"),
+          nb::arg("match_q"), nb::arg("step_q"),
+          nb::arg("t_merge_q"), nb::arg("t_trim_q"),
+          nb::arg("min_read_length"), nb::arg("disagree_q"),
+          nb::arg("check_sync"), nb::arg("base_index"),
+          nb::arg("want_headers"), nb::arg("npolicy") = 1, nb::arg("rng_seed") = 0,
+          "Merge every whole pair in the two buffers, emitting records.\n"
+          "Returns (seqs, ends, consumed1, consumed2, counters, len_hist,\n"
+          "         olen_hist, insert_hist).  Each end is (seq_off, seq_len,\n"
+          "         hdr_off, hdr_len, slot, prov); hdr offsets are ABSOLUTE\n"
+          "         into buf1 (MERGED/MATE1) or buf2 (MATE2), consumed counts\n"
+          "         RELATIVE to start.  Releases the GIL.");
 
     m.def("split_records", &split_records,
           nb::arg("buf"), nb::arg("start"), nb::arg("max_records"),
