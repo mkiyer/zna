@@ -1358,12 +1358,24 @@ def encode_command(args):
             file=sys.stderr,
         )
 
+    # ZNA -> ZNA re-encode copies records in order, so the input's shuffled
+    # attestation survives verbatim into the output's provenance prologue.
+    # Every other input produces records in source order: not shuffled.  (The
+    # post-encode --shuffle pass rewrites the file through shuffle_zna, which
+    # stamps its own True.)
+    shuffled_in = False
+    if is_reencoding:
+        with open(files[0], "rb") as _f:
+            _prov = ZnaReader(_f).provenance
+        shuffled_in = bool(_prov is not None and _prov.shuffled)
+
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
         writer = stack.enter_context(ZnaWriter(
             f_out, header, block_size=block_size, npolicy=codec_npolicy,
             preserve_normalization=preserve_normalization,
             rng_seed=getattr(args, 'seed', 0) or 0,
+            shuffled=shuffled_in,
         ))
 
         def _trim3(seq):
@@ -1765,6 +1777,8 @@ def _scan_flag_counts(fh, reader, h) -> dict:
         if not b_header or len(b_header) < _BLOCK_HEADER_SIZE:
             break
         c_size, _u, _n, flags_size, _l = struct.unpack(_BLOCK_HEADER_FMT, b_header)
+        if _n == 0:
+            break  # the trailer sentinel: end of data
         if dctx is not None:
             flags_bytes = dctx.stream_reader(fh.read(c_size)).read(flags_size)
         else:
@@ -1837,72 +1851,32 @@ def inspect_command(args):
                 miss_str = f"  [missing={ldef.missing}]" if ldef.missing is not None else ""
                 print(f"  [{ldef.label_id}] {ldef.name:<4}{type_info}{desc_str}{miss_str}")
 
-        # Scan Blocks
-        block_count = 0
-        total_records = 0
-        compressed_payload = 0
-        uncompressed_payload = 0
+        # Block stats come from block_index(): the stored trailer index on a
+        # 0.5 file, one 20-byte read per block otherwise.  The hand-rolled walk
+        # this replaces seeked to a hand-computed header offset that measured
+        # the read group in CHARACTERS, not UTF-8 bytes -- wrong on any
+        # non-ASCII read group -- and broke silently on a short read, so damage
+        # under-reported instead of erroring (TRAILER_PLAN T6).
+        try:
+            index = reader.block_index()
+        except (ValueError, EOFError) as e:
+            sys.exit(f"Error walking blocks: {e}")
+        block_count = len(index)
+        total_records = sum(b.n_records for b in index)
+        compressed_payload = sum(b.comp_size for b in index)
+        uncompressed_payload = sum(b.uncomp_size for b in index)
 
-        # Optionally tally per-flag record counts. This requires reading and
-        # (partially) decompressing block payloads — the flags column is stored
-        # first, so only its bytes need to be decoded per block.
         count_flags = getattr(args, 'counts', False)
-        n_paired_r1 = n_paired_r2 = n_single = n_rc = n_full = 0
-        # (mate x is_rc) cross-tabulation — the only tally that actually
-        # verifies a file's geometry before anything trains on it.
-        rc_by_mate = {"R1": 0, "R2": 0, "single": 0}
-        dctx = None
-        if count_flags and h.compression_method == COMPRESSION_ZSTD:
-            import zstandard
-            dctx = zstandard.ZstdDecompressor()
-
-        # Seek past header
-        label_bytes = len(h.labels) * 89  # 89 bytes per label def
-        f.seek(_FILE_HEADER_SIZE + len(h.read_group) + len(h.description) + label_bytes)
-
-        while True:
-            b_header = f.read(_BLOCK_HEADER_SIZE)
-            if not b_header: break
-            if len(b_header) < _BLOCK_HEADER_SIZE: break
-
-            c_size, u_size, n_recs, flags_size, lengths_size = struct.unpack(
-                _BLOCK_HEADER_FMT, b_header
-            )
-
-            block_count += 1
-            total_records += n_recs
-            compressed_payload += c_size
-            uncompressed_payload += u_size
-
-            if count_flags:
-                # Flags are the first column in the payload; decode just those.
-                if dctx is not None:
-                    comp = f.read(c_size)
-                    reader = dctx.stream_reader(comp)
-                    flags_bytes = reader.read(flags_size)
-                else:
-                    flags_bytes = f.read(flags_size)
-                    f.seek(c_size - flags_size, 1)
-                for fl in flags_bytes:
-                    rc = fl & 8          # IS_RC
-                    if rc:
-                        n_rc += 1
-                    if fl & 16:          # IS_FULL_FRAGMENT
-                        n_full += 1
-                    if fl & 1:           # IS_READ1
-                        n_paired_r1 += 1
-                        if rc:
-                            rc_by_mate["R1"] += 1
-                    elif fl & 2:         # IS_READ2
-                        n_paired_r2 += 1
-                        if rc:
-                            rc_by_mate["R2"] += 1
-                    else:
-                        n_single += 1
-                        if rc:
-                            rc_by_mate["single"] += 1
-            else:
-                f.seek(c_size, 1)
+        if count_flags:
+            tally = _scan_flag_counts(f, reader, h)
+            n_paired_r1 = tally["paired_r1"]
+            n_paired_r2 = tally["paired_r2"]
+            n_single = tally["single_or_merged"]
+            n_rc = tally["reverse_complemented"]
+            n_full = tally["full_fragment"]
+            rc_by_mate = {"R1": tally["rc_by_mate"]["R1"],
+                          "R2": tally["rc_by_mate"]["R2"],
+                          "single": tally["rc_by_mate"]["single_or_merged"]}
 
         print("\n--- Content Statistics ---")
         print(f"Total Blocks:       {block_count}")

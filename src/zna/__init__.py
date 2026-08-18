@@ -1,8 +1,9 @@
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 
 from .core import (
     ZnaHeader, ZnaWriter, ZnaReader, BlockInfo,
+    ZnaProvenance, ZnaTrailer,
     read_zna, write_zna,
     ZnaHeaderFlags, ZnaRecordFlags, FLAG_FIELDS, ENDS_BY_FLAG,
     reverse_complement,
@@ -18,6 +19,7 @@ def is_accelerated() -> bool:
 
 __all__ = [
     "ZnaHeader", "ZnaWriter", "ZnaReader", "BlockInfo",
+    "ZnaProvenance", "ZnaTrailer",
     "read_zna", "write_zna",
     "ZnaHeaderFlags", "ZnaRecordFlags", "FLAG_FIELDS", "ENDS_BY_FLAG",
     "reverse_complement",

@@ -24,8 +24,11 @@ halves of this on every write path; see :data:`OPENS_FRAGMENT`.
 """
 from __future__ import annotations
 
+import json
 import struct
 import warnings
+import zlib
+from itertools import compress
 
 import zstandard
 from dataclasses import dataclass
@@ -74,6 +77,29 @@ _LABEL_DEF_SIZE = 16 + 64 + 1 + 8  # name + desc + dtype_code + missing = 89 byt
 # Block header: CompSize(I) UncompSize(I) RecordCount(I) FlagsSize(I) LengthsSize(I)
 _BLOCK_HEADER_FMT = "<IIIII"
 _BLOCK_HEADER_SIZE = struct.calcsize(_BLOCK_HEADER_FMT)
+
+# A block header whose record count is 0 is never a data block -- ``_flush_block``
+# returns without writing on an empty batch, so no real block has ever carried
+# count == 0 and the value is reserved (from 0.5.0) for the two METADATA
+# pseudo-blocks: the provenance PROLOGUE right after the file header, and the
+# trailer SENTINEL after the last data block.  Position disambiguates them, and
+# only at open: ``ZnaReader.__init__`` consumes the prologue, so to every walk
+# loop count == 0 has exactly one meaning -- end of data.
+#
+# Trailer footer, fixed 32 bytes at EOF:
+#   magic | footer_version | reserved | crc32 of the trailer payload AS WRITTEN
+#   (compressed form, checkable without inflating) | sentinel_offset | 8 pad bytes
+# ``sentinel_offset`` is the byte offset of the sentinel block header, i.e. the
+# end of the data blocks -- the value a block-packing consumer needs as its
+# final fence now that "the last block ends exactly at EOF" is no longer true.
+_FOOTER_FMT = "<8sHHIQ8x"
+_FOOTER_SIZE = struct.calcsize(_FOOTER_FMT)  # 32
+_FOOTER_MAGIC = b"ZNATRLR\x1A"
+_FOOTER_VERSION = 1
+
+#: Schema versions of the two JSON payloads, independent of the format byte.
+PROLOGUE_SCHEMA = 1
+TRAILER_SCHEMA = 1
 
 # Sequence-length field widths
 MIN_SEQ_LEN_BYTES = 1
@@ -262,6 +288,93 @@ class ZnaHeader:
                 raise ValueError(f"Label description too long (max 64 UTF-8 bytes): {ldef.description!r}")
 
 
+#: ``flag byte -> 1`` when the record is unpaired (single or merged read), for
+#: selecting unpaired lengths out of a block's columns at C speed via
+#: ``bytes.translate`` + ``itertools.compress``.
+_UNPAIRED_SELECTOR = bytes(0 if (f & 0x04) else 1 for f in range(256))
+
+
+def _count_into(hist: dict, values) -> None:
+    """Histogram update at C speed (the same mechanism Counter uses)."""
+    from collections import _count_elements  # type: ignore[attr-defined]
+    _count_elements(hist, values)
+
+
+def _canonical_json(obj) -> bytes:
+    """The one serialization both metadata payloads use.
+
+    Sorted keys, no whitespace, ASCII-only: identical input must produce
+    byte-identical files, so nothing here may depend on dict order, locale,
+    or anything derived from the environment.
+    """
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+
+
+@dataclass(slots=True)
+class ZnaProvenance:
+    """The prologue: facts known at encode START, readable before any record.
+
+    Written by :class:`ZnaWriter` immediately after the file header, so a
+    consumer -- including one on a pipe, which can never seek to the trailer --
+    can answer "what wrote this, and may it enter training?" before decoding a
+    single block.  Facts that require the whole encode live in
+    :class:`ZnaTrailer` instead; the split is principled, not incidental:
+    position in the file follows when the information is knowable.
+    """
+
+    writer_version: str
+    shuffled: bool
+    merged_in_process: bool
+    #: crc32 of the prologue payload as written; :class:`ZnaTrailer` re-states
+    #: it, so the end of the file attests the start.
+    crc32: int
+    #: The parsed payload verbatim, including fields a future schema may add.
+    raw: dict
+
+
+@dataclass(slots=True)
+class ZnaTrailer:
+    """The trailer: facts derivable only from the COMPLETE encode.
+
+    Tallied in ``_flush_block`` from the codec's returned columns -- never from
+    the writer's input arguments, which differ from the file whenever strand
+    normalization sets ``IS_RC`` or an N-policy changes stored lengths.
+    """
+
+    n_records: int
+    n_bases: int
+    n_pairs: int
+    n_unpaired: int
+    #: flag byte -> record count, zero entries omitted.
+    flag_counts: dict
+    #: stored record length -> count, over all records.
+    length_histogram: dict
+    #: same, over unpaired records only (merged reads and singles).
+    length_histogram_unpaired: dict
+    #: Byte offset of block 0's header (after header and prologue).
+    data_start: int
+    #: Per-block stored index; offset[i] = data_start + sum(20 + comp_sizes[:i]).
+    block_comp_sizes: list
+    block_uncomp_sizes: list
+    block_records: list
+    #: crc32 of the prologue payload, closing the integrity gap for
+    #: uncompressed files whose prologue carries no zstd content checksum.
+    prologue_crc32: int
+    #: The parsed payload verbatim, including fields a future schema may add.
+    raw: dict
+
+    def block_offsets(self) -> list[int]:
+        """Absolute byte offset of every block header, by running sum."""
+        out = []
+        off = self.data_start
+        for c in self.block_comp_sizes:
+            out.append(off)
+            off += _BLOCK_HEADER_SIZE + c
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Writer
 # ---------------------------------------------------------------------------
@@ -316,6 +429,18 @@ class ZnaWriter:
         "_records_written",
         "_label_defs",
         "_batch_labels",
+        "_shuffled",
+        "_merged_in_process",
+        "_len_char",
+        "_flag_counts",
+        "_len_hist",
+        "_len_hist_unpaired",
+        "_n_bases",
+        "_block_meta",
+        "_data_start_offset",
+        "_data_end",
+        "_prologue_crc32",
+        "_closed",
     )
 
     def __init__(
@@ -326,6 +451,8 @@ class ZnaWriter:
         npolicy: str | None = None,
         preserve_normalization: bool = False,
         rng_seed: int = 0,
+        shuffled: bool = False,
+        merged_in_process: bool = False,
     ) -> None:
         self._fh = fh
         self._header = header
@@ -368,11 +495,33 @@ class ZnaWriter:
         self._batch_labels: list[list] = [[] for _ in self._label_defs]
 
         if header.compression_method == COMPRESSION_ZSTD:
-            self._compressor = zstandard.ZstdCompressor(level=header.compression_level)
+            # write_checksum embeds an xxhash64 content checksum in every frame,
+            # verified automatically on decompress -- the format's first
+            # protection against bit rot, at negligible cost, and invisible to
+            # any reader (checksummed frames are ordinary frames).
+            self._compressor = zstandard.ZstdCompressor(
+                level=header.compression_level, write_checksum=True,
+            )
         else:
             self._compressor = None
 
-        self._write_file_header()
+        # Trailer accumulators.  Every stat is tallied in ``_flush_block`` from
+        # the columns the CODEC returned, never from the caller's arguments --
+        # strand normalization ORs IS_RC into the flags column and an N-policy
+        # can change stored lengths, so the input is simply not what the file
+        # holds.  The fuzz suite recounts every generated file against these.
+        self._shuffled = shuffled
+        self._merged_in_process = merged_in_process
+        self._len_char = {1: "B", 2: "H", 4: "I"}[header.seq_len_bytes]
+        self._flag_counts = [0] * 256
+        self._len_hist: dict[int, int] = {}
+        self._len_hist_unpaired: dict[int, int] = {}
+        self._n_bases = 0
+        self._block_meta: list[tuple[int, int, int]] = []
+        self._closed = False
+
+        header_len = self._write_file_header()
+        self._write_prologue(header_len)
 
     # -- context manager -----------------------------------------------------
 
@@ -385,16 +534,30 @@ class ZnaWriter:
         # with its symptom.
         if exc_type is not None:
             self._expect_mate = False
+            # Flush what was buffered so every block on disk stays whole, but
+            # write NO trailer: the trailer is the writer's signature that the
+            # encode finished, and a crashed encode must not produce a file
+            # that certifies.  ``records()`` still reads the blocks -- EOF
+            # termination is retained for exactly this shape of file -- while
+            # ``zna inspect --verify`` refuses it.
+            self._flush_block()
+            self._closed = True
+            return
         self.close()
 
     def close(self) -> None:
-        """Flush the final block.
+        """Flush the final block, then sign the file: sentinel, trailer, footer.
 
         Raises if the stream ended on a paired R1 — its mate never arrived, so the
         file would close with half a fragment in its last block.  The buffered tail is
         *not* written in that case: every block already on disk is whole, and the
         caller has an exception telling it the file is short.
+
+        Idempotent: a second call is a no-op, so ``close()`` inside a ``with``
+        block does not write the trailer twice.
         """
+        if self._closed:
+            return
         if self._expect_mate:
             self._expect_mate = False  # do not re-raise if close() is called again
             raise ValueError(
@@ -403,6 +566,64 @@ class ZnaWriter:
                 "write the mate, or write the read unpaired (is_paired=False)."
             )
         self._flush_block()
+        self._closed = True
+        self._write_trailer()
+
+    def _write_trailer(self) -> None:
+        """Append sentinel + trailer payload + footer.  Append-only: works on pipes.
+
+        The sentinel's ``comp_size`` covers the payload AND the 32-byte footer,
+        deliberately: a 0.4.1 reader that walks past the last data block then
+        consumes everything to EOF as one valid empty block and terminates
+        cleanly, instead of parsing the footer as a garbage block header.
+        (python-zstandard's one-shot ``decompress`` tolerates trailing bytes
+        after a complete frame, so the footer riding inside ``comp_size`` does
+        not break the old reader's inflate; ``uncomp_size`` stays honest, which
+        is what bounds its ``max_output_size``.)  New readers never use the
+        sentinel's sizes -- discovery is footer-first, or count==0 on pipes.
+        """
+        fc = self._flag_counts
+        n_records = sum(fc)
+        n_paired = sum(fc[f] for f in range(256) if f & 0x04)
+        n_pairs, odd = divmod(n_paired, 2)
+        n_unpaired = n_records - n_paired
+        # The writer enforces R1-R2 adjacency, so an odd paired count cannot
+        # happen; assert the derivation rather than trust it.
+        assert odd == 0 and n_unpaired + 2 * n_pairs == n_records
+
+        trailer: dict = {
+            "trailer_schema": TRAILER_SCHEMA,
+            "n_records": n_records,
+            "n_bases": self._n_bases,
+            "n_pairs": n_pairs,
+            "n_unpaired": n_unpaired,
+            "flag_counts": {str(f): c for f, c in enumerate(fc) if c},
+            "length_histogram": {str(k): v for k, v in self._len_hist.items()},
+            "length_histogram_unpaired": {
+                str(k): v for k, v in self._len_hist_unpaired.items()},
+            "blocks": {
+                "data_start": self._data_start_offset,
+                "comp_sizes": [m[0] for m in self._block_meta],
+                "uncomp_sizes": [m[1] for m in self._block_meta],
+                "records": [m[2] for m in self._block_meta],
+            },
+            "prologue_crc32": self._prologue_crc32,
+        }
+
+        raw = _canonical_json(trailer)
+        payload = (self._compressor.compress(raw)
+                   if self._compressor is not None else raw)
+        self._fh.write(struct.pack(
+            _BLOCK_HEADER_FMT,
+            len(payload) + _FOOTER_SIZE, len(raw), 0, 0, 0,
+        ))
+        self._fh.write(payload)
+        self._fh.write(struct.pack(
+            _FOOTER_FMT,
+            _FOOTER_MAGIC, _FOOTER_VERSION, 0,
+            zlib.crc32(payload) & 0xFFFFFFFF,
+            self._data_end,
+        ))
 
     # -- public --------------------------------------------------------------
 
@@ -663,7 +884,13 @@ class ZnaWriter:
             f"reads must be written consecutively, R1 immediately followed by R2."
         )
 
-    def _write_file_header(self) -> None:
+    def _write_file_header(self) -> int:
+        """Write the file header; return its byte length.
+
+        The length is arithmetic, never ``tell()`` -- the writer must work on
+        pipes, where every offset in the prologue/trailer bookkeeping is
+        derived by running sums from this value.
+        """
         rg_bytes = self._header.read_group.encode("utf-8")
         desc_bytes = self._header.description.encode("utf-8")
 
@@ -700,6 +927,44 @@ class ZnaWriter:
             self._fh.write(ldef.description.encode('utf-8').ljust(64, b'\x00')[:64])
             self._fh.write(struct.pack('B', ord(ldef.dtype.code)))
             self._fh.write(pack_missing(ldef))
+
+        return (_FILE_HEADER_SIZE + len(rg_bytes) + len(desc_bytes)
+                + _LABEL_DEF_SIZE * len(self._header.labels))
+
+    def _write_prologue(self, header_len: int) -> None:
+        """Write the provenance prologue: facts known at encode START.
+
+        A count-0 pseudo-block right after the header, so a streaming consumer
+        learns what wrote the file -- and whether its order is shuffled --
+        before decoding a single record.  Facts that need the whole encode go
+        in the trailer instead; parameter echoes (thresholds, npolicy) go
+        nowhere, because they are QC material, not file facts.
+
+        A 0.4.1 reader decodes this as a valid empty block and moves on.
+        """
+        from . import __version__ as writer_version
+
+        prov: dict = {
+            "prologue_schema": PROLOGUE_SCHEMA,
+            "writer_version": writer_version,
+            "shuffled": bool(self._shuffled),
+        }
+        if self._merged_in_process:
+            prov["merged_in_process"] = True
+
+        raw = _canonical_json(prov)
+        payload = (self._compressor.compress(raw)
+                   if self._compressor is not None else raw)
+        self._prologue_crc32 = zlib.crc32(payload) & 0xFFFFFFFF
+        self._fh.write(struct.pack(
+            _BLOCK_HEADER_FMT, len(payload), len(raw), 0, 0, 0,
+        ))
+        self._fh.write(payload)
+
+        # Where block 0's header will sit; advanced by every flush, so at close
+        # it is the sentinel offset the footer promises.
+        self._data_start_offset = header_len + _BLOCK_HEADER_SIZE + len(payload)
+        self._data_end = self._data_start_offset
 
     def _flush_block(self) -> None:
         """Encode the current batch and write one block."""
@@ -769,6 +1034,37 @@ class ZnaWriter:
             else uncompressed
         )
 
+        # 2b. Tally trailer statistics from the columns the codec RETURNED.
+        # ``flags_bytes`` carries IS_RC bits the caller never supplied, and
+        # ``lengths_bytes`` is post-npolicy -- the file's truth, not the input's.
+        # Everything below is C-speed: set/count over a column with few distinct
+        # bytes, one struct.unpack, dict-of-int updates via Counter mechanics.
+        assert count > 0, "count == 0 is reserved for metadata pseudo-blocks"
+        fc = self._flag_counts
+        for b in set(flags_bytes):
+            fc[b] += flags_bytes.count(b)
+
+        lengths = struct.unpack(f"<{count}{self._len_char}", lengths_bytes)
+        self._n_bases += sum(lengths)
+        lo, hi = min(lengths), max(lengths)
+        if lo == hi:
+            # Uniform read length -- the overwhelmingly common shape of real
+            # libraries -- collapses the histogram update to one dict add.
+            self._len_hist[lo] = self._len_hist.get(lo, 0) + count
+        else:
+            _count_into(self._len_hist, lengths)
+        selector = flags_bytes.translate(_UNPAIRED_SELECTOR)
+        n_unpaired = selector.count(1)
+        if n_unpaired:
+            if lo == hi:
+                self._len_hist_unpaired[lo] = (
+                    self._len_hist_unpaired.get(lo, 0) + n_unpaired)
+            elif n_unpaired == count:
+                _count_into(self._len_hist_unpaired, lengths)
+            else:
+                _count_into(self._len_hist_unpaired,
+                            compress(lengths, selector))
+
         # 3. Write block header + payload
         self._fh.write(
             struct.pack(
@@ -781,6 +1077,8 @@ class ZnaWriter:
             )
         )
         self._fh.write(compressed)
+        self._block_meta.append((len(compressed), len(uncompressed), count))
+        self._data_end += _BLOCK_HEADER_SIZE + len(compressed)
 
         # 4. Reset
         # Advance the global record index BEFORE clearing, so the next block's
@@ -821,16 +1119,169 @@ class ZnaReader:
     def __init__(self, fh: BinaryIO) -> None:
         self._fh = fh
         self._header = self._read_file_header()
-        #: Position of the first block, so :meth:`block_index` can rewind to it
-        #: no matter how far a caller has already read.
+
+        # Consume the provenance prologue, if there is one, so that every walk
+        # loop after this point is prologue-blind and ``count == 0`` has
+        # exactly one meaning to them: the trailer sentinel, i.e. end of data.
+        # On a 0.4.1-era file the probed 20 bytes are the first data block's
+        # header; a seekable stream rewinds, a pipe stashes them for the first
+        # walk read.
+        self._provenance: ZnaProvenance | None = None
+        self._pending_block_header = b""
+        self._trailer: ZnaTrailer | None = None
+        self._trailer_loaded = False
+        probe = fh.read(_BLOCK_HEADER_SIZE)
+        if len(probe) == _BLOCK_HEADER_SIZE:
+            comp_size, uncomp_size, count, _f, _l = struct.unpack(
+                _BLOCK_HEADER_FMT, probe)
+            if count == 0:
+                self._provenance = self._parse_prologue(comp_size, uncomp_size)
+            else:
+                self._pending_block_header = probe
+        elif probe:
+            # 1-19 bytes where a block header should be: stash them so the
+            # walks raise their usual incomplete-header error instead of this
+            # constructor swallowing the damage.
+            self._pending_block_header = probe
+
+        #: Position of the first data block, so :meth:`block_index` can rewind
+        #: to it no matter how far a caller has already read.
         try:
+            if self._pending_block_header:
+                fh.seek(-len(self._pending_block_header), 1)
+                self._pending_block_header = b""
             self._data_start = fh.tell()
         except (AttributeError, OSError):
             self._data_start = None
 
+    def _parse_prologue(self, comp_size: int, uncomp_size: int) -> ZnaProvenance:
+        payload = self._read_exact(comp_size)
+        if self._header.compression_method == COMPRESSION_ZSTD:
+            raw = zstandard.ZstdDecompressor().decompress(
+                payload, max_output_size=uncomp_size)
+        else:
+            raw = payload
+        try:
+            d = json.loads(raw)
+            return ZnaProvenance(
+                writer_version=d["writer_version"],
+                shuffled=bool(d["shuffled"]),
+                merged_in_process=bool(d.get("merged_in_process", False)),
+                crc32=zlib.crc32(payload) & 0xFFFFFFFF,
+                raw=d,
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            raise ValueError(
+                f"Corrupt provenance prologue: {e}. The file's data blocks may "
+                f"be intact, but its provenance cannot be trusted."
+            ) from e
+
+    @property
+    def provenance(self) -> ZnaProvenance | None:
+        """Facts known at encode start, or ``None`` for files written by zna < 0.5.
+
+        Available on pipes too — the prologue sits before the first block, which
+        is the point of putting it there.
+        """
+        return self._provenance
+
     @property
     def header(self) -> ZnaHeader:
         return self._header
+
+    @property
+    def trailer(self) -> ZnaTrailer | None:
+        """Facts derived from the complete encode, or ``None`` when absent.
+
+        ``None`` means the stream is a pipe (no seek to the footer), or the
+        file carries no trailer — written by zna < 0.5, an aborted encode, or
+        truncated; ``zna inspect --verify`` treats all of those as uncertified.
+        A trailer that is *present but corrupt* (bad footer version, CRC
+        mismatch, unparseable payload) raises ``ValueError`` instead: damage
+        must not be indistinguishable from age.
+
+        Leaves the read position unchanged.  Cached after the first call.
+        """
+        if self._trailer_loaded:
+            return self._trailer
+        if self._data_start is None:
+            self._trailer_loaded = True
+            return None
+
+        fh = self._fh
+        resume = fh.tell()
+        try:
+            fh.seek(0, 2)
+            file_size = fh.tell()
+            if file_size < self._data_start + _FOOTER_SIZE:
+                self._trailer_loaded = True
+                return None
+            fh.seek(file_size - _FOOTER_SIZE)
+            magic, footer_version, _reserved, crc, sentinel_offset = (
+                struct.unpack(_FOOTER_FMT, fh.read(_FOOTER_SIZE))
+            )
+            if magic != _FOOTER_MAGIC:
+                self._trailer_loaded = True
+                return None
+            if footer_version != _FOOTER_VERSION:
+                raise ValueError(
+                    f"Unknown trailer footer version {footer_version}; this "
+                    f"build reads version {_FOOTER_VERSION}. Written by a "
+                    f"newer zna?"
+                )
+            payload_start = sentinel_offset + _BLOCK_HEADER_SIZE
+            payload_end = file_size - _FOOTER_SIZE
+            if not (self._data_start <= sentinel_offset < payload_end):
+                raise ValueError(
+                    f"Trailer footer points at sentinel offset "
+                    f"{sentinel_offset}, outside the file's data region — "
+                    f"corrupt trailer."
+                )
+            fh.seek(sentinel_offset)
+            _c, uncomp_size, count, _f, _l = struct.unpack(
+                _BLOCK_HEADER_FMT, fh.read(_BLOCK_HEADER_SIZE))
+            if count != 0:
+                raise ValueError(
+                    f"No sentinel at offset {sentinel_offset} where the "
+                    f"footer promised one — corrupt trailer."
+                )
+            payload = self._read_exact(payload_end - payload_start)
+            if zlib.crc32(payload) & 0xFFFFFFFF != crc:
+                raise ValueError(
+                    "Trailer payload CRC mismatch — the file is corrupt."
+                )
+            if self._header.compression_method == COMPRESSION_ZSTD:
+                raw = zstandard.ZstdDecompressor().decompress(
+                    payload, max_output_size=uncomp_size)
+            else:
+                raw = payload
+            try:
+                d = json.loads(raw)
+                blocks = d["blocks"]
+                self._trailer = ZnaTrailer(
+                    n_records=d["n_records"],
+                    n_bases=d["n_bases"],
+                    n_pairs=d["n_pairs"],
+                    n_unpaired=d["n_unpaired"],
+                    flag_counts={int(k): v for k, v in d["flag_counts"].items()},
+                    length_histogram={
+                        int(k): v for k, v in d["length_histogram"].items()},
+                    length_histogram_unpaired={
+                        int(k): v
+                        for k, v in d["length_histogram_unpaired"].items()},
+                    data_start=blocks["data_start"],
+                    block_comp_sizes=blocks["comp_sizes"],
+                    block_uncomp_sizes=blocks["uncomp_sizes"],
+                    block_records=blocks["records"],
+                    prologue_crc32=d["prologue_crc32"],
+                    raw=d,
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                raise ValueError(f"Corrupt trailer payload: {e}") from e
+            self._trailer_loaded = True
+            return self._trailer
+        finally:
+            fh.seek(resume)
 
     def __iter__(self) -> Iterator[Tuple[str, bool, bool, bool]]:
         return self.records()
@@ -959,9 +1410,29 @@ class ZnaReader:
                 "block_index() requires a seekable stream; this reader was "
                 "opened on a pipe or socket."
             )
+
+        # A trailer stores the index the scan below would recompute, so a
+        # trailer-bearing file answers in one seek instead of one per block.
+        # The scan is retained forever: it is what ``zna inspect --verify``
+        # cross-checks the stored index against.
+        trailer = self.trailer
+        if trailer is not None:
+            return [
+                BlockInfo(index=i, offset=off, n_records=n,
+                          comp_size=c, uncomp_size=u)
+                for i, (off, c, u, n) in enumerate(zip(
+                    trailer.block_offsets(),
+                    trailer.block_comp_sizes,
+                    trailer.block_uncomp_sizes,
+                    trailer.block_records,
+                ))
+            ]
+
         fh = self._fh
         resume = fh.tell()
         try:
+            fh.seek(0, 2)
+            file_size = fh.tell()
             fh.seek(self._data_start)
             index: list[BlockInfo] = []
             while True:
@@ -977,6 +1448,17 @@ class ZnaReader:
                 comp_size, uncomp_size, count, _flags_size, _lengths_size = (
                     struct.unpack(_BLOCK_HEADER_FMT, block_header_data)
                 )
+                if count == 0:
+                    break  # the trailer sentinel: end of data
+                if offset + _BLOCK_HEADER_SIZE + comp_size > file_size:
+                    # This used to be a silent seek past EOF followed by a clean
+                    # empty read: a truncated or garbage-tailed file returned a
+                    # phantom BlockInfo and success.
+                    raise ValueError(
+                        f"block header at offset {offset} claims a "
+                        f"{comp_size}-byte payload, but the file ends at "
+                        f"{file_size} — truncated, or trailing garbage."
+                    )
                 index.append(BlockInfo(
                     index=len(index), offset=offset, n_records=count,
                     comp_size=comp_size, uncomp_size=uncomp_size,
@@ -1107,22 +1589,14 @@ class ZnaReader:
 
         index = 0
         yielded = 0
+        # On a pipe over a 0.4.1-era file, __init__'s prologue probe consumed
+        # the first block header; it is replayed here.
+        pending = self._pending_block_header
+        self._pending_block_header = b""
         while True:
-            block_header_data = fh_read(_BLOCK_HEADER_SIZE)
+            block_header_data = pending or fh_read(_BLOCK_HEADER_SIZE)
+            pending = b""
             if not block_header_data:
-                if yielded == 0 and index > 0 and (stride > 1 or selected is not None):
-                    # Silence here is indistinguishable from an empty file, and
-                    # in a training loader it is an idle worker nobody notices.
-                    what = (f"indices={sorted(selected)[:8]}..."
-                            if selected is not None
-                            else f"stride={stride}, offset={offset}")
-                    warnings.warn(
-                        f"blocks({what}) matched none of this file's {index} "
-                        f"block(s), so this shard has no data. Shards are whole "
-                        f"blocks: write the file with a smaller block_size, or "
-                        f"select fewer.",
-                        RuntimeWarning, stacklevel=3,
-                    )
                 break
             if len(block_header_data) < _BLOCK_HEADER_SIZE:
                 raise EOFError(
@@ -1132,6 +1606,11 @@ class ZnaReader:
             comp_size, uncomp_size, count, flags_size, lengths_size = struct.unpack(
                 _BLOCK_HEADER_FMT, block_header_data
             )
+            if count == 0:
+                # The trailer sentinel: end of data.  Deliberately not counted
+                # as a block, so the empty-shard warning above reports the
+                # number of DATA blocks a stride could have matched.
+                break
 
             index += 1
             this_block = index - 1
@@ -1177,6 +1656,22 @@ class ZnaReader:
                 offset_ += col_bytes
             yield sequences, flags_stream, tuple(columns)
 
+        if yielded == 0 and index > 0 and (stride > 1 or selected is not None):
+            # Silence here is indistinguishable from an empty file, and in a
+            # training loader it is an idle worker nobody notices.  Checked at
+            # loop exit so both terminations -- EOF on a 0.4.1-era file, the
+            # trailer sentinel on a 0.5 one -- report it.
+            what = (f"indices={sorted(selected)[:8]}..."
+                    if selected is not None
+                    else f"stride={stride}, offset={offset}")
+            warnings.warn(
+                f"blocks({what}) matched none of this file's {index} "
+                f"block(s), so this shard has no data. Shards are whole "
+                f"blocks: write the file with a smaller block_size, or "
+                f"select fewer.",
+                RuntimeWarning, stacklevel=3,
+            )
+
     def _iter_records(
         self, restore_strand: bool, with_rc: bool, with_ends: bool = False
     ) -> Iterator[tuple]:
@@ -1217,8 +1712,14 @@ class ZnaReader:
         if compression_method == COMPRESSION_ZSTD:
             dctx = zstandard.ZstdDecompressor()
 
+        # On a pipe over a 0.4.1-era file, __init__'s prologue probe consumed
+        # the first block header; it is replayed here.
+        pending = self._pending_block_header
+        self._pending_block_header = b""
+
         while True:
-            block_header_data = fh_read(_BLOCK_HEADER_SIZE)
+            block_header_data = pending or fh_read(_BLOCK_HEADER_SIZE)
+            pending = b""
             if not block_header_data:
                 break
             if len(block_header_data) < _BLOCK_HEADER_SIZE:
@@ -1230,6 +1731,10 @@ class ZnaReader:
             comp_size, uncomp_size, count, flags_size, lengths_size = struct.unpack(
                 _BLOCK_HEADER_FMT, block_header_data
             )
+            if count == 0:
+                # The trailer sentinel: end of data.  (EOF termination above is
+                # retained for 0.4.1-era files and aborted encodes.)
+                break
 
             block_payload = read_exact(comp_size)
 

@@ -76,6 +76,8 @@ def _scan_counts(fh, header) -> Tuple[int, int]:
         comp_size, _uncomp_size, count, flags_size, _lengths_size = struct.unpack(
             _BLOCK_HEADER_FMT, block_header
         )
+        if count == 0:
+            break  # the trailer sentinel: end of data
         n_records += count
 
         if dctx is not None:
@@ -142,7 +144,8 @@ def shuffle_zna(
     with open(input_path, "rb") as f:
         reader = ZnaReader(f)
         in_header = reader.header
-        # ZnaReader has consumed exactly the file header, so f is at block 0.
+        # ZnaReader has consumed the file header and the provenance
+        # prologue (if any), so f is at the first data block.
         n_units, n_records = _scan_counts(f, in_header)
 
     if n_units == 0:
@@ -254,8 +257,12 @@ def shuffle_zna(
 
         written = 0
         with open(output_path, "wb") as out_fh:
+            # ``shuffled=True`` goes into the output's provenance prologue:
+            # this function IS the attestation khorana's C1 used to take on
+            # operator word.  Bucket writers stay unstamped -- they are
+            # deleted with the temp directory.
             out_writer = ZnaWriter(out_fh, out_header, block_size=block_size,
-                                   preserve_normalization=True)
+                                   preserve_normalization=True, shuffled=True)
             try:
                 for bi in bucket_order:
                     bp = bucket_paths[bi]

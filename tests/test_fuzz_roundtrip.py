@@ -276,7 +276,63 @@ def write_file(header, recs, npolicy, labels_per_rec=None) -> bytes:
                 labels=None if labels_per_rec is None else labels_per_rec[i],
                 is_full_fragment=is_full,
             )
-    return buf.getvalue()
+    data = buf.getvalue()
+    # Every fuzz-generated file is also a trailer-correctness instrument: the
+    # whole matrix (npolicy x strand x compression x layout x backend) recounts
+    # itself here for free.  This is what enforces trap T1 -- stats must come
+    # from the codec's returned columns, and any tally taken from the writer's
+    # INPUT would disagree with this recount the moment strand normalization
+    # sets IS_RC or an npolicy changes a stored length.
+    assert_trailer_matches_recount(data)
+    return data
+
+
+def assert_trailer_matches_recount(data: bytes) -> None:
+    """Recount a file from a full decode and compare against its trailer."""
+    from collections import Counter
+
+    reader = ZnaReader(io.BytesIO(data))
+    t = reader.trailer
+    assert t is not None, "fuzz file has no trailer"
+    assert reader.provenance is not None
+    assert reader.provenance.crc32 == t.prologue_crc32, \
+        "trailer's prologue_crc32 does not match the prologue as read"
+
+    flag_counts: Counter = Counter()
+    len_hist: Counter = Counter()
+    len_hist_unpaired: Counter = Counter()
+    n_records = n_bases = 0
+    for seqs, flags in ZnaReader(io.BytesIO(data)).blocks(labels=False) \
+            if reader.header.labels else ZnaReader(io.BytesIO(data)).blocks():
+        n_records += len(seqs)
+        for seq, fl in zip(seqs, flags):
+            flag_counts[fl] += 1
+            n = len(seq)
+            n_bases += n
+            len_hist[n] += 1
+            if not (fl & 0x04):
+                len_hist_unpaired[n] += 1
+
+    assert t.n_records == n_records, (t.n_records, n_records)
+    assert t.n_bases == n_bases, (t.n_bases, n_bases)
+    assert t.flag_counts == dict(flag_counts), (t.flag_counts, flag_counts)
+    assert t.length_histogram == dict(len_hist)
+    assert t.length_histogram_unpaired == dict(len_hist_unpaired)
+    n_paired = sum(c for f, c in flag_counts.items() if f & 0x04)
+    assert t.n_pairs == n_paired // 2
+    assert t.n_unpaired == n_records - n_paired
+    assert t.n_unpaired + 2 * t.n_pairs == t.n_records
+    # The stored block index describes the actual bytes: each promised offset
+    # holds a block header whose sizes and count match the trailer.
+    assert sum(t.block_records) == n_records
+    off_expect = t.data_start
+    for k, (c, u, n) in enumerate(zip(t.block_comp_sizes, t.block_uncomp_sizes,
+                                      t.block_records)):
+        hdr = data[off_expect:off_expect + _BLOCK_HEADER_SIZE]
+        got = struct.unpack(_BLOCK_HEADER_FMT, hdr)
+        assert got == (c, u, n) + got[3:], f"block {k}: header {got} != index"
+        assert n > 0, "a data block with count == 0 reached disk"
+        off_expect += _BLOCK_HEADER_SIZE + c
 
 
 class FuzzCase(unittest.TestCase):
