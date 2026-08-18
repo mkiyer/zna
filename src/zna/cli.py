@@ -1182,6 +1182,34 @@ def encode_command(args):
                     f"write an empty output and report success."
                 )
 
+    merge_pairs = getattr(args, 'merge_pairs', False)
+    if merge_pairs:
+        # Each rejection says WHY, not just that (MERGE_PAIRS_PLAN.md §5).
+        if len(files) != 2:
+            sys.exit("Error: --merge-pairs is a two-file mode: give R1 and R2 "
+                     "as exactly two positional files. (argparse requires the "
+                     "two paths to be adjacent: put option flags before or "
+                     "after both, not between them.)")
+        if "-" in files:
+            sys.exit("Error: --merge-pairs cannot read stdin; the merge "
+                     "reader takes paths and drives its own decompression.")
+        if getattr(args, 'interleaved', False):
+            sys.exit("Error: --merge-pairs takes two separate mate files, "
+                     "not an interleaved stream.")
+        if getattr(args, 'fasta', False):
+            sys.exit("Error: --merge-pairs needs FASTQ: the merge decision "
+                     "is quality-aware, and FASTA has no qualities.")
+        if getattr(args, 'treat_unpaired_as_merged', False):
+            sys.exit("Error: --merge-pairs makes --treat-unpaired-as-merged "
+                     "meaningless: the merger hands over each record's exact "
+                     "geometry, which is what that blanket assertion "
+                     "approximates.")
+        if args.seq_len_bytes == 1:
+            sys.exit("Error: --merge-pairs needs --seq-len-bytes >= 2: a "
+                     "merged record can be up to twice a read long, and with "
+                     "1-byte lengths (max 255) a 2x150 merge would fail "
+                     "mid-stream, leaving a partial file.")
+
     if is_reencoding:
         # Read existing header to use as defaults
         with open(files[0], "rb") as f:
@@ -1376,6 +1404,7 @@ def encode_command(args):
             preserve_normalization=preserve_normalization,
             rng_seed=getattr(args, 'seed', 0) or 0,
             shuffled=shuffled_in,
+            merged_in_process=merge_pairs,
         ))
 
         def _trim3(seq):
@@ -1401,10 +1430,37 @@ def encode_command(args):
             return seq.count('N') + seq.count('n')
         treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
 
-        if label_defs:
+        merge_acc = None
+        if merge_pairs:
+            # Dispatched BEFORE label_defs, deliberately: stream_inputs_labeled
+            # also knows the two-file mode and would silently emit an UNMERGED
+            # stream, writing an unmerged corpus at exit 0
+            # (MERGE_PAIRS_PLAN.md §0.3 -- the audit's third blocker).
+            from .merge.encode_stream import stream_merge_pairs
+            from .merge.cli import _new_acc
+            from .merge.params import MergeParams
+            merge_acc = _new_acc()
+            merge_params = MergeParams(
+                t_merge=getattr(args, 't_merge', 28.0),
+                t_trim=getattr(args, 't_trim', 8.0),
+                min_read_length=getattr(args, 'min_read_length', 40),
+                npolicy=npolicy or "trim3",
+                rng_seed=getattr(args, 'seed', 0) or 42,
+            )
+            stream = stream_merge_pairs(
+                files, merge_params,
+                check_sync=not getattr(args, 'no_sync_check', False),
+                merge_backend=getattr(args, 'merge_backend', 'auto'),
+                label_defs=label_defs, tag_map=tag_map,
+                allow_empty=getattr(args, 'allow_empty', False),
+                acc=merge_acc, quiet=quiet)
+            carries_ends = True
+        elif label_defs:
             stream = stream_inputs_labeled(args, label_defs, tag_map)
+            carries_ends = False
         else:
             stream = stream_inputs(args)
+            carries_ends = False
 
         # Single-end input can never yield a paired record: only two-file,
         # interleaved, and ZNA re-encode modes set IS_PAIRED.  Fragment grouping
@@ -1484,6 +1540,32 @@ def encode_command(args):
                 if show_progress and count % 1_000_000 == 0:
                     print(f"      Processed {count//1_000_000}M records...",
                           end='\r', file=sys.stderr)
+        elif carries_ends:
+            # The stream hands over each record's geometry: 6-tuples
+            # (seq, is_paired, is_read1, is_read2, has_start, has_end), labels
+            # seventh when declared.  No N-policy work here -- under
+            # --merge-pairs the policy already ran inside the kernel, so this
+            # path sees no no-calls at all -- and no _full_fragment_flags:
+            # re-deriving what was handed over is the failure mode this seam
+            # exists to delete.  IS_RC is never supplied; orientation belongs
+            # to the writer's strand-normalization settings, which compose
+            # with this stream unchanged (plan §0.2).
+            #
+            # _fragment_units still groups mates -- the kernel emits MATE1
+            # immediately followed by MATE2, and grouping is what the writer's
+            # fragment contract expects to see arrive together (plan §6.8).
+            for unit in _fragment_units(stream):
+                npolicy_total_bases += sum(len(rec[0]) for rec in unit)
+                for rec in unit:
+                    writer.write_record(
+                        rec[0], rec[1], rec[2], rec[3],
+                        labels=rec[6] if label_defs else None,
+                        is_full_fragment=rec[4] and rec[5])
+                count += len(unit)
+                if (count % 1_000_000 < len(unit) and count >= 1_000_000
+                        and show_progress):
+                    print(f"      Processed {count//1_000_000}M records...",
+                          end='\r', file=sys.stderr)
         else:
             for unit in _fragment_units(stream):
                 if trim3:
@@ -1518,6 +1600,42 @@ def encode_command(args):
                         and show_progress):
                     print(f"      Processed {count//1_000_000}M records...",
                           end='\r', file=sys.stderr)
+
+    if merge_pairs and merge_acc is not None:
+        # The records the merger emitted ARE the records in the file -- there
+        # is no dropper between the kernel and the writer.  Not an input
+        # error: if these ever disagree the adapter or the write loop lost
+        # records, which must be a crash, not a statistic
+        # (MERGE_PAIRS_PLAN.md §10.2; subsumed at read time by
+        # `zna inspect --verify` check 4).
+        emitted = merge_acc[0][4]
+        if emitted != count:
+            raise AssertionError(
+                f"merge emitted {emitted} records but {count} were written")
+        if not quiet and not is_stdout:
+            c = merge_acc[0]
+            print(f"[ZNA] merge: {c[0]} pairs -> {c[1]} merged, "
+                  f"{c[2]} trimmed, {c[3]} kept; {c[5]} dropped short",
+                  file=sys.stderr)
+        merge_json_path = getattr(args, 'merge_json', None)
+        if merge_json_path:
+            import json as _json
+            from .merge.cli import _assemble_stats
+            from .merge.backend import get_merge_backend_name
+            stats = _assemble_stats(merge_acc, merge_params)
+            # _assemble_stats reads the process-global backend selection, which
+            # --merge-backend deliberately never mutates; report the kernel
+            # that actually ran.
+            stats["backend"] = get_merge_backend_name(
+                None if getattr(args, 'merge_backend', 'auto') == 'auto'
+                else args.merge_backend)
+            # Same block `zna merge --json` writes; "tool" stays "zna-merge"
+            # deliberately -- hulkrna's gather consumes these blocks and may
+            # key on it, and khorana no longer reads merge.json at all
+            # (TRAILER_PLAN §8).
+            with open(merge_json_path, "w") as jf:
+                _json.dump(stats, jf, indent=2)
+                jf.write("\n")
 
     # ── Optional shuffle pass ─────────────────────────────────────────
     if getattr(args, 'shuffle', False) and not is_stdout:
@@ -1559,7 +1677,21 @@ def encode_command(args):
         # Skipped when re-encoding a .zna, and that is not an oversight -- ZNA stores
         # two bits per base, so a decoded record cannot contain a no-call and no policy
         # ran. Reporting "removed 0 bases" there would imply one had been applied.
-        if npolicy and not is_reencoding:
+        if merge_pairs and merge_acc is not None:
+            # Under --merge-pairs the policy ran inside the kernel, after
+            # overlap rescue; encode's own counters are legitimately zero and
+            # reporting them would claim the policy did nothing.  Report the
+            # kernel's numbers -- the same quantities `zna merge` prints.
+            npolicy_bases = merge_acc[0][13]
+            npolicy_records = 0        # the kernel counts bases, not records
+        if npolicy and not is_reencoding and merge_pairs and merge_acc is not None:
+            verb = "removed" if npolicy == "trim3" else "substituted"
+            rescued = merge_acc[0][14]
+            print(f"[ZNA] no-calls: --npolicy {npolicy} {verb} {npolicy_bases} "
+                  f"base{'' if npolicy_bases == 1 else 's'} in the merge kernel; "
+                  f"{rescued} rescued from the mate at no cost.",
+                  file=sys.stderr)
+        elif npolicy and not is_reencoding:
             verb = "removed" if npolicy == "trim3" else "substituted"
             print(f"[ZNA] no-calls: --npolicy {npolicy} {verb} {npolicy_bases} "
                   f"base{'' if npolicy_bases == 1 else 's'} "
@@ -2266,6 +2398,33 @@ def main():
                           help="Read 2 represents antisense strand")
     enc.set_defaults(read2_antisense=False)  # Default: sense (dUTP)
     
+    mp_group = enc.add_argument_group(
+        "Overlap merging (--merge-pairs)",
+        "Merge overlapping pairs in process while encoding, deleting the "
+        "FASTQ intermediate between `zna merge` and `zna encode`. Takes "
+        "exactly two positional FASTQ files (R1 R2, adjacent on the command "
+        "line). Pairing is handed over by the merger rather than re-derived "
+        "from read names -- and mate names are CHECKED per pair, so two "
+        "files that do not correspond now fail loudly where the two-file "
+        "reader silently mispaired them (see --no-sync-check).")
+    mp_group.add_argument("--merge-pairs", action="store_true",
+                          help="merge overlapping pairs in process while encoding")
+    from .merge.args import add_merge_algorithm_arguments
+    add_merge_algorithm_arguments(mp_group)
+    mp_group.add_argument("--merge-json", metavar="PATH",
+                          help="write the merge run's statistics as JSON -- the "
+                               "same block `zna merge --json` writes")
+    mp_group.add_argument("--merge-backend", choices=("auto", "accel", "python"),
+                          default="auto",
+                          help="merge kernel. `auto` uses the compiled backend "
+                               "and fails if it is missing; `python` is the "
+                               "~50x-slower reference oracle, never chosen "
+                               "for you.")
+    mp_group.add_argument("--allow-empty", action="store_true",
+                          help="permit an input with no read pairs. Off by "
+                               "default: a 0-record .zna otherwise vanishes "
+                               "from a corpus with every stage green.")
+
     fmt_group = enc.add_argument_group("Format Options")
     fmt_group.add_argument("-o", "--output", help="Output file. Defaults to stdout (-).")
     fmt_group.add_argument("--seq-len-bytes", type=int, choices=[1, 2, 4], default=2, help="Bytes for seq len")

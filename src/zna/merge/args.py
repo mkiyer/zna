@@ -88,6 +88,37 @@ class _Fmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFo
     """Show defaults on each option AND preserve the epilog's formatting."""
 
 
+def add_merge_algorithm_arguments(p):
+    """The scoring knobs shared by ``zna merge`` and ``zna encode --merge-pairs``.
+
+    One definition, two parsers: factoring these out is what keeps the two
+    from drifting (MERGE_PAIRS_PLAN.md §5).  Only the knobs that parameterize
+    the DECISION live here; I/O, threading and policy flags stay with their
+    owning command (`zna encode` already has its own ``--npolicy``, ``--seed``
+    and ``-q``, with identical semantics).
+    """
+    p.add_argument("--threshold-merge", type=float, default=28.0, dest="t_merge",
+                   help="overlap score (bits) >= this -> merge the pair into one "
+                        "full-fragment read. 28 bits = one spurious merge per 1e6 "
+                        "pairs at 2x150; each extra bit halves that.")
+    p.add_argument("--threshold-trim", type=float, default=8.0, dest="t_trim",
+                   help="overlap score (bits) >= this (but below --threshold-merge) "
+                        "-> keep both reads and split the redundant overlap between "
+                        "their 3' ends. Low on purpose: a wrong trim deletes read tail, "
+                        "where a wrong merge invents sequence. Measured against ground "
+                        "truth (docs/MERGE_BENCHMARK_RESULTS.md), 8 bits removes 4.4 "
+                        "bases of duplicated sequence per base it deletes, and is the "
+                        "value that minimises the two costs added together.")
+    p.add_argument("--min-read-length", type=int, default=40, dest="min_read_length",
+                   help="drop emitted reads shorter than this (after merge/trim; a "
+                        "trimmed read can fall below it). MUST match the pipeline-wide "
+                        "floor used by any earlier quality-trimming step.")
+    p.add_argument("--no-sync-check", action="store_true",
+                   help="skip the per-pair R1/R2 read-name consistency check. Only "
+                        "for input whose mate names genuinely differ by design.")
+    return p
+
+
 def add_merge_arguments(p):
     """Add every ``zna merge`` flag to an existing parser. Returns it."""
     p.add_argument("--in1", required=True, help="R1 FASTQ (optionally .gz)")
@@ -110,22 +141,7 @@ def add_merge_arguments(p):
                    help="pigz level for --out. Default 1 (fast): the output is an "
                         "intermediate consumed by `zna encode`, so speed beats ratio. "
                         "Raise for archival/standalone use.")
-    p.add_argument("--threshold-merge", type=float, default=28.0, dest="t_merge",
-                   help="overlap score (bits) >= this -> merge the pair into one "
-                        "full-fragment read. 28 bits = one spurious merge per 1e6 "
-                        "pairs at 2x150; each extra bit halves that.")
-    p.add_argument("--threshold-trim", type=float, default=8.0, dest="t_trim",
-                   help="overlap score (bits) >= this (but below --threshold-merge) "
-                        "-> keep both reads and split the redundant overlap between "
-                        "their 3' ends. Low on purpose: a wrong trim deletes read tail, "
-                        "where a wrong merge invents sequence. Measured against ground "
-                        "truth (docs/MERGE_BENCHMARK_RESULTS.md), 8 bits removes 4.4 "
-                        "bases of duplicated sequence per base it deletes, and is the "
-                        "value that minimises the two costs added together.")
-    p.add_argument("--min-read-length", type=int, default=40, dest="min_read_length",
-                   help="drop emitted reads shorter than this (after merge/trim; a "
-                        "trimmed read can fall below it). MUST match the pipeline-wide "
-                        "floor used by any earlier quality-trimming step.")
+    add_merge_algorithm_arguments(p)
     p.add_argument("--npolicy", choices=("trim3", "random"), default="trim3",
                    help="what to do with a no-call (N) that the overlap could not "
                         "rescue from the mate. trim3: cut the read at it, keeping "
@@ -140,8 +156,6 @@ def add_merge_arguments(p):
                    help="seed for --npolicy random. Substitution is derived from it and "
                         "the read's position, never from a running stream, so the output "
                         "does not depend on --chunk-size or --threads.")
-    p.add_argument("--no-sync-check", action="store_true",
-                   help="skip the per-pair R1/R2 read-name consistency check")
     p.add_argument("--allow-empty", action="store_true",
                    help="exit 0 on an input with no read pairs. Off by default: an "
                         "empty input otherwise succeeds silently all the way to a "

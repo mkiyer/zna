@@ -468,3 +468,289 @@ class TestEncodeReportsItsNpolicy:
         self._encode(tmp_path, [in1], "trim3", "src.zna")
         err = self._encode(tmp_path, [tmp_path / "src.zna"], "trim3", "re.zna")
         assert "no-calls:" not in err, err
+
+
+# --------------------------------------------------------------------------- #
+# `zna encode --merge-pairs`: the one-step path (MERGE_PAIRS_PLAN.md §6)
+# --------------------------------------------------------------------------- #
+
+def make_inputs(tmp_path, seed, n, with_n=False):
+    """A two-file library mixing merging and non-merging pairs, varied lengths.
+
+    The same shape as the module fixture's corpus, but parameterized per test:
+    ~half the fragments are short enough to overlap and merge, the rest are
+    read-length or longer and stay pairs.  ``with_n`` sprinkles no-calls so
+    npolicy provenance bits actually appear.
+    """
+    rng = random.Random(seed)
+    in1, in2 = tmp_path / f"mk{seed}_1.fq", tmp_path / f"mk{seed}_2.fq"
+    with open(in1, "wb") as f1, open(in2, "wb") as f2:
+        for i in range(n):
+            if rng.random() < 0.5:
+                frag = _draw(rng, rng.randrange(120, 2 * READLEN - 20))
+            else:
+                frag = _draw(rng, rng.randrange(2 * READLEN, 3 * READLEN))
+            l1 = READLEN - (rng.randrange(1, 60) if rng.random() < 0.4 else 0)
+            l2 = READLEN - (rng.randrange(1, 60) if rng.random() < 0.4 else 0)
+            r1 = bytearray((frag + ADAPTER1 + _draw(rng, READLEN))[:l1])
+            r2 = bytearray((rc(frag) + ADAPTER2 + _draw(rng, READLEN))[:l2])
+            if with_n:
+                for rb in (r1, r2):
+                    if rng.random() < 0.4 and len(rb) > 10:
+                        rb[rng.randrange(len(rb) // 2, len(rb))] = ord(b"N")
+            f1.write(b"@f%d/1\n%b\n+\n%b\n" % (i, bytes(r1), b"I" * len(r1)))
+            f2.write(b"@f%d/2\n%b\n+\n%b\n" % (i, bytes(r2), b"I" * len(r2)))
+    return in1, in2
+
+
+def _mp_encode(tmp_path, in1, in2, *extra, name="onestep.zna", expect_fail=False):
+    """`zna encode --merge-pairs` out of process, against THIS interpreter."""
+    out = tmp_path / name
+    cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs",
+           "--min-read-length", str(MIN_READ_LENGTH),
+           "-o", str(out), *extra, str(in1), str(in2)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if expect_fail:
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        return proc
+    assert proc.returncode == 0, proc.stderr
+    return out
+
+
+def _flags_of(path):
+    from collections import Counter
+    with open(path, "rb") as fh:
+        c: Counter = Counter()
+        for _s, flags in ZnaReader(fh).blocks():
+            c.update(flags)
+        return dict(c)
+
+
+class TestMergePairsMatchesTheTwoStep:
+    def test_merge_pairs_matches_the_two_step_pipeline(self, tmp_path):
+        """The headline: same input, both paths, exact equality of records AND
+        flags on well-formed input.  Run without strand normalization --
+        unstranded normalization draws a per-record coin keyed to the GLOBAL
+        record index, and the two paths order records identically, so it
+        would also agree, but the bare comparison is the sharper one."""
+        in1, in2 = make_inputs(tmp_path, seed=1301, n=400)
+        one = _mp_encode(tmp_path, in1, in2)
+
+        merged, _stats = run_merge(tmp_path, in1, in2)
+        two = tmp_path / "twostep.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+               "--treat-unpaired-as-merged", "-o", str(two), str(merged)]
+        assert subprocess.run(cmd, capture_output=True).returncode == 0
+
+        with open(one, "rb") as f1, open(two, "rb") as f2:
+            a = list(ZnaReader(f1).records(with_ends=True))
+            b = list(ZnaReader(f2).records(with_ends=True))
+        assert a == b, "one-step and two-step corpora differ"
+
+    def test_merge_pairs_stamps_merged_in_process(self, tmp_path):
+        in1, in2 = make_inputs(tmp_path, seed=1303, n=40)
+        out = _mp_encode(tmp_path, in1, in2)
+        with open(out, "rb") as fh:
+            r = ZnaReader(fh)
+            assert r.provenance.merged_in_process is True
+            assert r.trailer is not None
+
+    def test_merge_pairs_survives_duplicate_read_names(self, tmp_path):
+        """The improvement, pinned from both sides.  Two independently merged
+        molecules sharing a read name: the two-step path re-pairs them into
+        one fragment (two IS_PAIRED records, IS_FULL_FRAGMENT lost); the
+        one-step path is structurally immune."""
+        rng = random.Random(5)
+        in1, in2 = tmp_path / "d1.fq", tmp_path / "d2.fq"
+        with open(in1, "wb") as f1, open(in2, "wb") as f2:
+            for i, name in enumerate((b"dup", b"dup", b"uniqA", b"uniqB")):
+                frag = _draw(rng, 200 + 5 * i)
+                r1 = (frag + ADAPTER1 + _draw(rng, READLEN))[:READLEN]
+                r2 = (rc(frag) + ADAPTER2 + _draw(rng, READLEN))[:READLEN]
+                f1.write(b"@%b/1\n%b\n+\n%b\n" % (name, r1, b"I" * len(r1)))
+                f2.write(b"@%b/2\n%b\n+\n%b\n" % (name, r2, b"I" * len(r2)))
+
+        one = _mp_encode(tmp_path, in1, in2, "--no-sync-check")
+        flags_one = _flags_of(one)
+        assert flags_one == {16: 4}, flags_one     # four whole molecules
+
+        # The two-step path gets the same answer today -- but only because
+        # 0.4.0's MERGED_SINGLE guard recognizes the `merged_` token and
+        # refuses to pair merged reads by name.  That is a token convention
+        # holding the line; --merge-pairs never inspects a name at all, so
+        # this class of corruption is structurally impossible rather than
+        # guarded against.  If this assertion ever fails, the token guard
+        # regressed -- the one-step assertion above is the load-bearing one.
+        merged, _ = run_merge(tmp_path, in1, in2)
+        two = tmp_path / "dup_two.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+               "--treat-unpaired-as-merged", "-o", str(two), str(merged)]
+        assert subprocess.run(cmd, capture_output=True).returncode == 0
+        flags_two = _flags_of(two)
+        assert flags_two == {16: 4}, flags_two
+
+    def test_merge_pairs_thresholds_reach_the_kernel(self, tmp_path):
+        """A parameter parsed but never passed to MergeParams is invisible to
+        every other test here; the merged-record count must move."""
+        in1, in2 = make_inputs(tmp_path, seed=1305, n=200)
+        low = _mp_encode(tmp_path, in1, in2, "--threshold-merge", "28",
+                         name="low.zna")
+        high = _mp_encode(tmp_path, in1, in2, "--threshold-merge", "500",
+                          name="high.zna")
+        merged_low = _flags_of(low).get(16, 0)
+        merged_high = _flags_of(high).get(16, 0)
+        assert merged_low > merged_high, (merged_low, merged_high)
+        assert merged_high == 0
+
+    def test_merge_pairs_composes_with_strand_normalize(self, tmp_path):
+        """The test that would have caught §0.2: --strand-normalize must not
+        be silently disabled.  Merged records report both edges; mates
+        exactly one -- and under R2-antisense the writer flips R2, so its
+        boundary edge moves to the right."""
+        in1, in2 = make_inputs(tmp_path, seed=1307, n=150)
+        out = _mp_encode(tmp_path, in1, in2, "--strand-normalize",
+                         "--strand-specific", "--read1-sense",
+                         "--read2-antisense")
+        n_pairs = n_merged = 0
+        with open(out, "rb") as fh:
+            for (seq, is_paired, is_r1, is_r2, has_start,
+                 has_end) in ZnaReader(fh).records(with_ends=True):
+                if is_paired:
+                    n_pairs += 1
+                    if is_r1:
+                        assert (has_start, has_end) == (True, False)
+                    else:
+                        assert (has_start, has_end) == (False, True), \
+                            "R2 not reverse-complemented: §0.2 regressed"
+                else:
+                    n_merged += 1
+                    assert (has_start, has_end) == (True, True)
+        assert n_pairs and n_merged
+
+    def test_merge_pairs_labels_come_from_each_records_own_header(self, tmp_path):
+        """R1 and R2 carry DIFFERENT tag values; MATE2 must get R2's.  This is
+        the test that would have caught rev 1's 'labels from R1's header'."""
+        rng = random.Random(9)
+        in1, in2 = tmp_path / "l1.fq", tmp_path / "l2.fq"
+        with open(in1, "wb") as f1, open(in2, "wb") as f2:
+            for i in range(30):
+                a = _draw(rng, READLEN)          # disjoint: stays a pair
+                b = _draw(rng, READLEN)
+                f1.write(b"@x%d/1 ZI:i:%d\n%b\n+\n%b\n" % (i, 100 + i, a, b"I" * len(a)))
+                f2.write(b"@x%d/2 ZI:i:%d\n%b\n+\n%b\n" % (i, 200 + i, b, b"I" * len(b)))
+        ldefs = tmp_path / "ldefs.yaml"
+        ldefs.write_text("labels:\n"
+                         "  - name: ti\n    tag: ZI\n    type: i\n    missing: -1\n")
+        out = _mp_encode(tmp_path, in1, in2, "--label-defs", str(ldefs))
+        with open(out, "rb") as fh:
+            for seq, ip, r1_, r2_, hs, he, labels in ZnaReader(fh).records(
+                    with_ends=True):
+                assert ip, "fixture reads must not merge"
+                if r1_:
+                    assert 100 <= labels[0] < 200
+                else:
+                    assert 200 <= labels[0] < 300, \
+                        "MATE2 got R1's label value"
+
+    def test_merge_pairs_mate_grouping(self, tmp_path):
+        """What this actually pins (plan §6.8): the strategy's pairing flags
+        are good enough for _fragment_units to group mates, which the
+        writer's fragment contract then enforces on disk."""
+        in1, in2 = make_inputs(tmp_path, seed=1311, n=120)
+        out = _mp_encode(tmp_path, in1, in2)
+        from zna.core import OPENS_FRAGMENT, CLOSES_FRAGMENT
+        with open(out, "rb") as fh:
+            for _seqs, flags in ZnaReader(fh).blocks():
+                expect = False
+                for fl in flags:
+                    assert CLOSES_FRAGMENT[fl] == expect
+                    expect = OPENS_FRAGMENT[fl]
+                assert not expect
+
+    def test_merge_pairs_provenance_column_matches_two_step(self, tmp_path):
+        """§10.4's sharpest comparison: the ZN provenance column, written
+        directly off the pair result with no tag round-trip, must equal what
+        the two-step path reconstructs from the ZN:i: header tag."""
+        in1, in2 = make_inputs(tmp_path, seed=1313, n=250, with_n=True)
+        ldefs = tmp_path / "prov.yaml"
+        ldefs.write_text("labels:\n"
+                         "  - name: prov\n    tag: ZN\n    type: C\n    missing: 0\n")
+        one = _mp_encode(tmp_path, in1, in2, "--label-defs", str(ldefs))
+
+        merged, _ = run_merge(tmp_path, in1, in2)
+        two = tmp_path / "prov_two.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+               "--treat-unpaired-as-merged", "--label-defs", str(ldefs),
+               "-o", str(two), str(merged)]
+        assert subprocess.run(cmd, capture_output=True).returncode == 0
+
+        def prov_col(path):
+            with open(path, "rb") as fh:
+                return [rec[-1][0] for rec in ZnaReader(fh).records(
+                    with_ends=True)]
+        a, b = prov_col(one), prov_col(two)
+        assert a == b, "provenance columns diverge between the paths"
+        assert any(a), "fixture set no provenance bits; the test proves nothing"
+
+
+class TestMergePairsRejections:
+    """Every rejected combination, each with a reason in the message."""
+
+    # (--fasta is not an encode CLI flag -- format is inferred -- so that
+    # rejection guards only API callers driving encode_command directly and
+    # has no CLI row here.)
+    @pytest.mark.parametrize("extra,needle", [
+        (["--interleaved"], "interleaved"),
+        (["--treat-unpaired-as-merged"], "treat-unpaired-as-merged"),
+        (["--seq-len-bytes", "1"], "seq-len-bytes"),
+    ])
+    def test_rejected_combination(self, tmp_path, extra, needle):
+        in1, in2 = make_inputs(tmp_path, seed=1315, n=4)
+        proc = _mp_encode(tmp_path, in1, in2, *extra, expect_fail=True)
+        assert needle in (proc.stdout + proc.stderr)
+
+    def test_requires_two_files(self, tmp_path):
+        in1, _ = make_inputs(tmp_path, seed=1317, n=4)
+        out = tmp_path / "x.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs",
+               "-o", str(out), str(in1)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode != 0
+        assert "two-file" in (proc.stdout + proc.stderr)
+
+    def test_desync_fails_and_the_output_does_not_certify(self, tmp_path):
+        """Unequal read counts fail loudly -- and because the drained check
+        raises out of the stream BEFORE the writer closes, the partial file
+        left behind has no trailer: it reads, but refuses certification."""
+        in1, in2 = make_inputs(tmp_path, seed=1319, n=30)
+        # append one extra record to R1
+        with open(in1, "ab") as fh:
+            fh.write(b"@extra/1\n" + b"A" * 60 + b"\n+\n" + b"I" * 60 + b"\n")
+        out = tmp_path / "desync.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs",
+               "-o", str(out), str(in1), str(in2)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode != 0
+        assert "exhausted" in (proc.stdout + proc.stderr)
+        if out.exists() and out.stat().st_size > 0:
+            with open(out, "rb") as fh:
+                assert ZnaReader(fh).trailer is None, \
+                    "a desynced encode must not certify"
+
+    def test_empty_input_fails_without_allow_empty(self, tmp_path):
+        in1, in2 = tmp_path / "e1.fq", tmp_path / "e2.fq"
+        in1.write_bytes(b"")
+        in2.write_bytes(b"")
+        out = tmp_path / "e.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs",
+               "-o", str(out), str(in1), str(in2)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode != 0
+        assert "--allow-empty" in (proc.stdout + proc.stderr)
+        # and with the flag, a 0-record file that verifies
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs",
+               "--allow-empty", "-o", str(out), str(in1), str(in2)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        with open(out, "rb") as fh:
+            assert ZnaReader(fh).trailer.n_records == 0
