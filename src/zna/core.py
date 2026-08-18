@@ -533,28 +533,38 @@ class ZnaWriter:
         # fragment; raising the pairing error on top of it would replace the cause
         # with its symptom.
         if exc_type is not None:
-            # Flush what was buffered so every block on disk stays whole, but
-            # write NO trailer: the trailer is the writer's signature that the
-            # encode finished, and a crashed encode must not produce a file
-            # that certifies.  ``records()`` still reads the blocks -- EOF
-            # termination is retained for exactly this shape of file -- while
-            # ``zna inspect --verify`` refuses it.
-            #
-            # An open fragment cannot be flushed whole: if the buffer ends on
-            # a paired R1 whose mate never arrived, that one record is dropped
-            # rather than written -- a block ending mid-fragment would violate
-            # the very invariant "blocks stay whole" names.
-            if self._expect_mate and self._batch_seqs:
-                self._batch_seqs.pop()
-                self._batch_flags.pop()
-                for col in self._batch_labels:
-                    if col:
-                        col.pop()
-            self._expect_mate = False
-            self._flush_block()
-            self._closed = True
+            self.abort()
             return
         self.close()
+
+    def abort(self) -> None:
+        """Close the writer WITHOUT signing the file: no sentinel, no trailer.
+
+        For error paths that cannot use the context manager (``zna shuffle``
+        holds many writers at once).  What was buffered is flushed so every
+        block on disk stays whole, but no trailer is written: the trailer is
+        the writer's signature that the encode finished, and a crashed encode
+        must not produce a file that certifies.  ``records()`` still reads the
+        blocks -- EOF termination is retained for exactly this shape of file --
+        while ``zna inspect --verify`` refuses it.
+
+        An open fragment cannot be flushed whole: if the buffer ends on a
+        paired R1 whose mate never arrived, that one record is dropped rather
+        than written -- a block ending mid-fragment would violate the very
+        invariant "blocks stay whole" names.  Aborting also never raises the
+        pairing error, so the exception that caused the abort keeps the stage.
+        """
+        if self._closed:
+            return
+        if self._expect_mate and self._batch_seqs:
+            self._batch_seqs.pop()
+            self._batch_flags.pop()
+            for col in self._batch_labels:
+                if col:
+                    col.pop()
+        self._expect_mate = False
+        self._flush_block()
+        self._closed = True
 
     def close(self) -> None:
         """Flush the final block, then sign the file: sentinel, trailer, footer.

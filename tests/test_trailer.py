@@ -356,6 +356,61 @@ class TestWriterEdges(unittest.TestCase):
             self.assertEqual(t.n_records, 22, f"seq_len_bytes={slb}")
 
 
+class TestShuffleAbort(unittest.TestCase):
+    def test_an_interrupted_shuffle_does_not_certify(self):
+        """A KeyboardInterrupt mid-shuffle used to leave a partial file at the
+        USER'S OUTPUT PATH with a complete trailer and shuffled=True -- a
+        certified file silently missing most of its records.  The output
+        writer now aborts: readable, but no trailer, so verify refuses it."""
+        import random
+        import tempfile
+        import pathlib as pl
+        import zna._shuffle as sh
+
+        rng = random.Random(1)
+        with tempfile.TemporaryDirectory() as d:
+            src = pl.Path(d) / "in.zna"
+            dst = pl.Path(d) / "out.zna"
+            buf = io.BytesIO()
+            with ZnaWriter(buf, ZnaHeader(read_group="s", seq_len_bytes=2,
+                                          compression_method=COMPRESSION_ZSTD),
+                           block_size=256) as w:
+                for _ in range(400):
+                    w.write_record("".join(rng.choices("ACGT", k=60)),
+                                   False, False, False)
+            src.write_bytes(buf.getvalue())
+
+            calls = {"n": 0}
+            real_copy = ZnaReader.copy_records
+
+            def bomb_on_second_bucket(self):
+                calls["n"] += 1
+                gen = real_copy(self)
+                if calls["n"] == 3:        # input, first bucket, THEN trip
+                    def g():
+                        for i, rec in enumerate(gen):
+                            if i == 2:
+                                raise KeyboardInterrupt
+                            yield rec
+                    return g()
+                return gen
+
+            ZnaReader.copy_records = bomb_on_second_bucket
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    sh.shuffle_zna(str(src), str(dst), seed=1,
+                                   buffer_bytes=1 << 14, block_size=256,
+                                   tmp_dir=d, quiet=True)
+            finally:
+                ZnaReader.copy_records = real_copy
+
+            data = dst.read_bytes()
+        r = ZnaReader(io.BytesIO(data))
+        self.assertIsNone(r.trailer, "an aborted shuffle must not certify")
+        # ...but what was written stays readable, whole blocks only.
+        self.assertGreater(len(list(ZnaReader(io.BytesIO(data)).records())), 0)
+
+
 class TestOldReaderDegradesBenignly(unittest.TestCase):
     """Pin D1/A1: a 0.4.1 reader on a 0.5 file reads every record, decodes each
     pseudo-block as a valid empty block, and stops at a clean EOF.

@@ -211,6 +211,7 @@ def shuffle_zna(
             for fh in bucket_fhs
         ]
 
+        aborted = False
         try:
             with open(input_path, "rb") as f:
                 reader = ZnaReader(f)
@@ -242,9 +243,17 @@ def shuffle_zna(
                             end="\r",
                             file=sys.stderr,
                         )
+        except BaseException:
+            aborted = True
+            raise
         finally:
+            # On the error path, abort() rather than close(): a close() here
+            # would (a) raise the dangling-R1 error over the REAL exception if
+            # the interrupt landed between an R1 and its R2, and (b) sign a
+            # half-distributed bucket with a trailer.  Buckets die with the
+            # temp directory either way, but exceptions must keep the stage.
             for w in bucket_writers:
-                w.close()
+                (w.abort if aborted else w.close)()
             for fh in bucket_fhs:
                 fh.close()
 
@@ -261,6 +270,15 @@ def shuffle_zna(
             # this function IS the attestation khorana's C1 used to take on
             # operator word.  Bucket writers stay unstamped -- they are
             # deleted with the temp directory.
+            #
+            # The writer is driven as a context manager, NOT close()d in a
+            # finally: a KeyboardInterrupt mid-pass would otherwise leave a
+            # partial file at the USER'S OUTPUT PATH carrying a complete,
+            # self-consistent trailer and shuffled=True -- a certified file
+            # silently missing most of its records, which is precisely the
+            # failure class the trailer exists to eliminate.  __exit__ writes
+            # no trailer on an exception, so an aborted shuffle leaves a file
+            # that reads but refuses certification.
             out_writer = ZnaWriter(out_fh, out_header, block_size=block_size,
                                    preserve_normalization=True, shuffled=True)
             try:
@@ -305,7 +323,10 @@ def shuffle_zna(
                             end="\r",
                             file=sys.stderr,
                         )
-            finally:
+            except BaseException:
+                out_writer.abort()
+                raise
+            else:
                 out_writer.close()
 
     return written, n_records
