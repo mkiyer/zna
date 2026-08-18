@@ -144,6 +144,12 @@ def shuffle_zna(
     with open(input_path, "rb") as f:
         reader = ZnaReader(f)
         in_header = reader.header
+        # A shuffle is a permutation: every content fact about the records
+        # survives it, so the input's merged-in-process attestation carries
+        # into the output's prologue.  (`shuffled` is NOT carried -- this
+        # function IS that attestation and stamps its own True.)
+        in_prov = reader.provenance
+        merged_in_process = bool(in_prov is not None and in_prov.merged_in_process)
         # ZnaReader has consumed the file header and the provenance
         # prologue (if any), so f is at the first data block.
         n_units, n_records = _scan_counts(f, in_header)
@@ -280,7 +286,8 @@ def shuffle_zna(
             # no trailer on an exception, so an aborted shuffle leaves a file
             # that reads but refuses certification.
             out_writer = ZnaWriter(out_fh, out_header, block_size=block_size,
-                                   preserve_normalization=True, shuffled=True)
+                                   preserve_normalization=True, shuffled=True,
+                                   merged_in_process=merged_in_process)
             try:
                 for bi in bucket_order:
                     bp = bucket_paths[bi]

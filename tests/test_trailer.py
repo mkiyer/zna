@@ -229,6 +229,23 @@ class TestStamping(unittest.TestCase):
         self.assertEqual(t.length_histogram_unpaired,
                          t0.length_histogram_unpaired)
 
+    def test_shuffle_propagates_merged_in_process(self):
+        """A shuffle is a permutation: the merged-in-process attestation
+        survives it (the production recipe is --merge-pairs ... --shuffle,
+        and the shuffle pass must not strip the fact)."""
+        import tempfile, pathlib as pl
+        with tempfile.TemporaryDirectory() as d:
+            src = pl.Path(d) / "in.zna"
+            dst = pl.Path(d) / "out.zna"
+            src.write_bytes(build(n_pairs=100, n_single=10, block_size=256,
+                                  merged_in_process=True))
+            shuffle_zna(str(src), str(dst), seed=3, buffer_bytes=1 << 16,
+                        block_size=256, tmp_dir=d, quiet=True)
+            data = dst.read_bytes()
+        p = ZnaReader(io.BytesIO(data)).provenance
+        self.assertTrue(p.shuffled)
+        self.assertTrue(p.merged_in_process)
+
     def test_writer_kwarg_round_trips(self):
         data = build(shuffled=True, merged_in_process=True)
         p = ZnaReader(io.BytesIO(data)).provenance

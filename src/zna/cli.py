@@ -1392,10 +1392,14 @@ def encode_command(args):
     # post-encode --shuffle pass rewrites the file through shuffle_zna, which
     # stamps its own True.)
     shuffled_in = False
+    merged_in_process_in = False
     if is_reencoding:
         with open(files[0], "rb") as _f:
             _prov = ZnaReader(_f).provenance
         shuffled_in = bool(_prov is not None and _prov.shuffled)
+        # A copy preserves record content, so the merged-in-process
+        # attestation survives re-encode exactly as `shuffled` does.
+        merged_in_process_in = bool(_prov is not None and _prov.merged_in_process)
 
     with ExitStack() as stack:
         f_out = stack.enter_context(get_output_handle(args.output))
@@ -1404,7 +1408,7 @@ def encode_command(args):
             preserve_normalization=preserve_normalization,
             rng_seed=getattr(args, 'seed', 0) or 0,
             shuffled=shuffled_in,
-            merged_in_process=merge_pairs,
+            merged_in_process=merge_pairs or merged_in_process_in,
         ))
 
         def _trim3(seq):
