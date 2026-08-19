@@ -8,6 +8,48 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
+## [0.5.3] - 2026-08-19
+
+**The aarch64 re-measure 0.5.2 owed.** 0.5.2 changed the NEON code path blind — the
+grouped reduction in `neq16x<V>` was written on an x86 box that could not run it — and
+the ROADMAP filed that as a debt, not a claim. Paid on an Apple M3 Max, against 50k real
+pairs with `scripts/merge_bench/bench_simd.cpp` (now carrying the shipped kernel shape as
+rows N1–N4 / S1–S8 beside the 0.5.1 "before"). Every output is byte-identical to 0.5.2's
+and 0.5.1's; `BAIL_VECTORS` is a pruning schedule and cannot change an answer.
+
+### Performance — `BAIL_VECTORS` 2 → 4 on aarch64, 1.22× on the kernel
+
+- **The grouped reduction did not regress NEON — it won.** Old per-vector kernel at
+  bail 32 (the 0.5.1 path): 0.497 µs/pair. Grouped at bail 32: 0.473 (1.05×). The
+  ROADMAP's "should be a win or a wash" is now a measured win.
+- **The shipped 0.5.2 aarch64 value was the worst of the four.** With the 16-byte step
+  loop in place the optimum moved outward exactly as the x86 round predicted: bail 32 at
+  0.506 µs/pair, 48 at 0.439, **64 at 0.416**, 80 at 0.415 — then a cliff (96 at 0.528,
+  128 at 0.675) where a group no longer fits a 150 bp shift more than once. 64 and 80 are
+  within noise across three repeats; 64 stays clear of the cliff down to ~80 bp reads.
+  So **4 vectors / 64 bases**: 1.22× over shipped, 2.84× over scalar, 0 mismatches.
+- End to end on the 1M-pair benchmark (`merge --threads 1`, `/dev/null`, pigz path):
+  2.6–3.0 s either way — within this box's run-to-run noise, as expected now that the
+  kernel is ~25% of wall time. The M3 finishes the whole merge in under half the
+  Haswell's 5.84 s; the two boxes' absolute numbers are not comparable.
+
+### Verified, not changed
+
+- **MSVC compiles the `psadbw` path.** 0.5.2's author could not build Windows; CI on its
+  commit is green on both `windows-latest` legs, so the portability claim holds.
+- 200k-pair merged FASTQ byte-identical across `BAIL_VECTORS` 2 and 4; **722** compiled
+  / **664 + 64 skipped** extension-less.
+
+### Fixed — a 0.5.2 test assumed the compiled merge backend was always present
+
+`test_merge_output_identical_across_backends` shelled out to `zna merge` without
+`--backend`, and `zna merge` refuses to fall back to the reference kernel silently — so
+the extension-less test configuration (the one that proves the package works when the
+C++ did not build) failed on 2 of the 3 gzip modes. Written on a Linux box where the
+compiled backend is always there; caught the first time the third configuration ran it.
+The test now names the backend the environment actually has. The gzip policy it tests
+was never in question.
+
 ## [0.5.2] - 2026-08-19
 
 **The first Linux/x86 assessment.** ZNA was developed on aarch64 and every number in its

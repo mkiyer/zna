@@ -238,9 +238,17 @@ class TestMergeReadPath:
             else:
                 env[k] = v
         out = tmp_path / f"m_{mode}.fq"
+        # This test is about the READER, not the kernel, so it runs on whichever
+        # merge backend the environment has.  `zna merge` refuses to fall back to
+        # the reference kernel silently (a 50x slowdown looks like a slow node at
+        # cluster scale), so the extension-less configuration must ask for it by
+        # name -- which is exactly the configuration that first caught this test
+        # assuming the compiled backend was always present.
+        from zna.merge.backend import available_merge_backends
+        backend = "accel" if "accel" in available_merge_backends() else "python"
         r = subprocess.run(
             [sys.executable, "-m", "zna.merge", "--in1", str(r1), "--in2", str(r2),
-             "--out", str(out), "--threads", "1", "-q"],
+             "--out", str(out), "--threads", "1", "-q", "--backend", backend],
             env=env, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         body = out.read_bytes()

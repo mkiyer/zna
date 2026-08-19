@@ -10,25 +10,6 @@ algorithms work is [METHODS.md](METHODS.md).
 
 ## Scheduled
 
-### 0.5.3 — re-measure the merge kernel on aarch64
-
-**0.5.2 changed the NEON code path without being able to measure it, and that is a debt,
-not a claim.** The x86 work replaced `neq16` with `neq16x<V>`, which accumulates the
-per-lane equality flags in a vector register and folds **once per group** instead of once
-per vector. On NEON that turns `V` × `vaddvq_u8` into `V-1` × `vaddq_u8` plus one
-`vaddvq_u8`, and `vaddvq_u8` is the more expensive instruction on every ARM core — so it
-should be a win or a wash, but "should be" is exactly the reasoning this ROADMAP exists to
-distrust. Correctness is not in question: the outputs are byte-identical on 1M pairs, the
-suite passes under UBSAN, and `asan_scan` is clean.
-
-Two things to take on an Apple-silicon or Graviton box:
-
-1. **Confirm the grouped reduction did not regress NEON.** `scripts/merge_bench/bench_simd.cpp`
-   against the shipped kernel.
-2. **Re-tune `BAIL_VECTORS` for aarch64.** It is still **2** (32 bases), the optimum
-   measured for the *old* per-vector reduction. x86 moved from 2 to 3 once the reduction
-   got cheaper and the 16-byte step loop shortened the tail; aarch64 may well move too.
-
 ### 0.6.0 — `zna encode`'s per-record driver into C++, which also lets `pigz` go
 
 Two items in one because the second falls out of the first for free, and the second is
@@ -235,6 +216,39 @@ something you can re-run — and if you have a reason to reopen one, measure it 
 data rather than arguing from these.
 
 ---
+
+## Closed by measurement in 0.5.3
+
+### ~~0.5.3 — re-measure the merge kernel on aarch64~~ — DONE
+
+The debt 0.5.2 filed, paid on an Apple M3 Max against 50k real pairs
+(`scripts/merge_bench/bench_simd.cpp`, which now carries the shipped kernel shape beside
+the 0.5.1 "before"). Both questions answered:
+
+**1. Did the grouped reduction regress NEON?** No — it won. Per-vector kernel at bail 32
+(0.5.1): 0.497 µs/pair; grouped at bail 32: 0.473. `vaddvq_u8` really is the expensive
+instruction, and folding once per group pays even on a core where it is cheap.
+
+**2. Does `BAIL_VECTORS` move?** Yes, further than x86's: **2 → 4** (64 bases). The
+shipped 2 was the worst of {2,3,4,5}:
+
+| bail (bases) | µs/pair | vs scalar |
+|---|---|---|
+| 32 (0.5.2 shipped) | 0.506 | 2.33× |
+| 48 (x86's value) | 0.439 | 2.69× |
+| **64** | **0.416** | **2.84×** |
+| 80 | 0.415 | 2.75–2.84× |
+| 96 | 0.528 | 2.39× |
+| 128 | 0.675 | 1.87× |
+
+The cliff past 80 is the step loop's limit: a 96+ base group fits a 150 bp shift at most
+once, so the group loop stops contributing. 64 and 80 are within noise across repeats;
+64 keeps clear of the cliff down to ~80 bp reads. Byte-identical output at every value
+(a pruning schedule cannot change an answer); 1.22× over shipped on the kernel, within
+noise end to end because the kernel is now ~25% of a merge's wall time.
+
+The Windows leg 0.5.2 could not build locally is green in CI on its commit, so the
+`psadbw` portability claim is verified, not assumed.
 
 ## Closed by measurement in 0.5.2
 

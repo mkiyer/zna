@@ -63,6 +63,64 @@ static inline int neq32(const uint8_t* a, const uint8_t* b) {
 }
 #endif
 
+/// The 0.5.2 shipped shape: per-lane equality accumulated in a vector register and
+/// reduced ONCE per group (mirrors merge_core.hpp neq16x<V>).  On NEON that trades
+/// V x vaddvq_u8 for (V-1) x vaddq_u8 + 1 x vaddvq_u8; on x86 it is what lets psadbw
+/// replace pmovmskb+popcount.  Benchmarked here against the per-vector `neq16` above,
+/// which is the 0.5.1 "before".
+#ifdef HAVE_V16
+template <int V>
+static inline int neq16x(const uint8_t* a, const uint8_t* b) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const uint8x16_t one = vdupq_n_u8(1);
+    uint8x16_t acc = vdupq_n_u8(0);
+    for (int j = 0; j < V; ++j) {
+        const uint8x16_t eq = vceqq_u8(vld1q_u8(a + j * 16), vld1q_u8(b + j * 16));
+        acc = vaddq_u8(acc, vandq_u8(eq, one));
+    }
+    return 16 * V - (int)vaddvq_u8(acc);
+#else
+    __m128i acc = _mm_setzero_si128();
+    for (int j = 0; j < V; ++j) {
+        __m128i va = _mm_loadu_si128((const __m128i*)(a + j * 16));
+        __m128i vb = _mm_loadu_si128((const __m128i*)(b + j * 16));
+        acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(va, vb));
+    }
+    const __m128i sad = _mm_sad_epu8(acc, _mm_setzero_si128());
+    return 16 * V - (_mm_cvtsi128_si32(sad) + (int)_mm_extract_epi16(sad, 4));
+#endif
+}
+
+/// Shipped 0.5.2 shift_score: grouped reduction, bail between groups, then a 16-byte
+/// step loop (STEP16=1) or straight to the byte tail (STEP16=0), then bytes.
+template <int BAIL, int STEP16>
+static inline int64_t sc_grouped(const uint8_t* s1, const uint8_t* s2rc,
+                                 int s, int n, int64_t best, int* out_d) {
+    const int64_t ceiling = (int64_t)n * M_W;
+    if (ceiling <= best) return INT64_MIN;
+    const int64_t dmax = (ceiling - best - 1) / STEP;
+    const uint8_t* a = s1   + (s > 0 ?  s : 0);
+    const uint8_t* b = s2rc + (s < 0 ? -s : 0);
+    int64_t d = 0;
+    int k = 0;
+    constexpr int GROUP = 16 * BAIL;
+    for (; k + GROUP <= n; k += GROUP) {
+        d += neq16x<BAIL>(a + k, b + k);
+        if (d > dmax) return INT64_MIN;
+    }
+    if (STEP16) {
+        for (; k + 16 <= n; k += 16) {
+            d += neq16x<1>(a + k, b + k);
+            if (d > dmax) return INT64_MIN;
+        }
+    }
+    for (; k < n; ++k) d += (a[k] != b[k]);
+    if (d > dmax) return INT64_MIN;
+    *out_d = (int)d;
+    return ceiling - d * STEP;
+}
+#endif
+
 /// VW = bytes per vector op, BAIL = vectors between bail checks
 template <int VW, int BAIL>
 static inline int64_t sc_simd(const uint8_t* s1, const uint8_t* s2rc,
@@ -249,6 +307,10 @@ static Res scan(const Pair& P, uint64_t* b1, uint64_t* b2) {
     auto one = [&](int s, int n, int* dd) -> int64_t {
         if (K == 0) return sc_scalar(P.s1, P.s2rc, s, n, best, dd);
         if (K == 1) return sc_packed(b1, b2, s, n, best, dd);
+#ifdef HAVE_V16
+        if (K == 5) return sc_grouped<BAIL,0>(P.s1, P.s2rc, s, n, best, dd);
+        if (K == 6) return sc_grouped<BAIL,1>(P.s1, P.s2rc, s, n, best, dd);
+#endif
         return sc_simd<VW,BAIL>(P.s1, P.s2rc, s, n, best, dd);
     };
     const int plo = (len1>=len2)?0:len1-len2, phi = (len1>=len2)?len1-len2:0;
@@ -339,6 +401,19 @@ int main(int argc, char** argv) {
 #ifdef HAVE_V16
     run<4,16,2>("L. byte SIMD 16B, bail 32, FUSED flank pair", &d);
     run<4,16,4>("M. byte SIMD 16B, bail 64, FUSED flank pair", &d);
+    std::printf("\n# 0.5.2 grouped reduction (neq16x<V>), no 16-byte step loop\n");
+    run<5,16,1>("N1. grouped, bail every 16 bases", &d);
+    run<5,16,2>("N2. grouped, bail every 32 bases", &d);
+    run<5,16,3>("N3. grouped, bail every 48 bases", &d);
+    run<5,16,4>("N4. grouped, bail every 64 bases", &d);
+    std::printf("\n# 0.5.2 grouped reduction + 16-byte step loop  (== shipped shift_score)\n");
+    run<6,16,1>("S1. grouped+step16, bail 16", &d);
+    run<6,16,2>("S2. grouped+step16, bail 32   <- SHIPPED on aarch64", &d);
+    run<6,16,3>("S3. grouped+step16, bail 48   <- SHIPPED on x86", &d);
+    run<6,16,4>("S4. grouped+step16, bail 64", &d);
+    run<6,16,5>("S5. grouped+step16, bail 80", &d);
+    run<6,16,6>("S6. grouped+step16, bail 96", &d);
+    run<6,16,8>("S8. grouped+step16, bail 128", &d);
 #endif
     run<1,0,0>("F. 2-bit packed + popcount, fused flanks", &d);
     return 0;

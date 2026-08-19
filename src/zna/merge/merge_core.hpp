@@ -162,12 +162,19 @@ inline int neq16(const uint8_t* a, const uint8_t* b) noexcept {
 ///
 ///   * **3 (48 bases) on x86-64.** 1.539 us/pair against 1.754 at 2 and 1.542 at 4
 ///     (g++ 8.5 -O3, 50k real pairs); g++ 13.2 agrees on the ordering.
-///   * **2 (32 bases) on aarch64**, which is what was measured on Apple silicon when the
-///     kernel was written: 32 bases beat both 16 and 64 there. Left alone deliberately --
-///     no aarch64 machine was available for this round, and the grouped reduction above
-///     may well have moved the optimum. Re-measure before changing it.
+///   * **4 (64 bases) on aarch64.** Re-measured for 0.5.3 on Apple M3 Max (clang -O3,
+///     50k real pairs, `scripts/merge_bench/bench_simd.cpp` rows S1-S8), after the
+///     grouped reduction moved the optimum exactly as the x86 round predicted it might:
+///     the shipped value 2 was the WORST of {2,3,4,5} -- bail 32 at 0.506 us/pair, 48 at
+///     0.439, **64 at 0.416**, 80 at 0.415 -- then a cliff: 96 at 0.528, 128 at 0.675,
+///     because a 96+ base group fits a 150 bp shift at most once and the scan falls to
+///     the step loop. 80 and 64 are within noise of each other across repeats, and 64
+///     stays clear of that cliff down to ~80 bp reads, so 64 it is: **1.22x over the
+///     shipped 0.5.2 aarch64 path, 0 mismatches.** The old per-vector kernel at bail 32
+///     (the 0.5.1 path) measured 0.497, so the grouped reduction alone was a 5% win
+///     there too -- the ROADMAP's "should be a win or a wash" is now a measured win.
 #if defined(__ARM_NEON) || defined(__aarch64__)
-constexpr int BAIL_VECTORS = 2;
+constexpr int BAIL_VECTORS = 4;
 #else
 constexpr int BAIL_VECTORS = 3;
 #endif
