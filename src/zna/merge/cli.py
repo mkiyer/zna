@@ -13,10 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import platform
-import shutil
 import sys
 import time
 
+from .. import _gzip
 from . import backend as _backend
 from .args import add_merge_arguments, add_merge_parser, build_parser  # noqa: F401
 from .fastqio import FastqWriter, InputError, _open_binary_read
@@ -96,7 +96,10 @@ class _RawStream:
 
     def __init__(self, path, threads):
         import concurrent.futures as cf
-        self._stream, self._proc = _open_binary_read(str(path), threads)
+        # The prefetch thread below is what makes ISA-L the right choice here; see
+        # `_open_binary_read` and `zna._gzip.prefer_isal`.
+        self._stream, self._proc = _open_binary_read(str(path), threads,
+                                                     own_read_thread=True)
         self._path = str(path)
         self.buf = b""
         self.pos = 0
@@ -287,7 +290,7 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
         drain(0)
 
 
-def _assemble_stats(acc, params, elapsed=None):
+def _assemble_stats(acc, params, elapsed=None, inflate="unknown"):
     counters, hist, ohist, ihist = acc
     n_pairs = counters[_N_PAIRS]
     merged, trimmed, kept = counters[_MERGED], counters[_TRIMMED], counters[_KEPT]
@@ -309,6 +312,11 @@ def _assemble_stats(acc, params, elapsed=None):
         # Which kernel ran. The reference backend is ~50x slower and silently correct,
         # so a run that quietly fell back to it looks like a slow node, not a mistake.
         "backend": _backend.active_name(),
+        # Which decompressor fed the run. Inflate is the largest single cost of a merge,
+        # so a wall-clock number in this dict is not comparable across runs without it.
+        # Passed in rather than re-derived: this function is also called by `zna encode
+        # --merge-pairs`, which reaches the reader by a different route.
+        "inflate": inflate,
         "python": platform.python_version(),
         "input_pairs": n_pairs,
         "merged": merged,
@@ -420,13 +428,30 @@ def _validate(args, params) -> None:
         raise SystemExit("--io-threads must be >= 1")
 
 
+def inflate_backend_for(path1, path2) -> str:
+    """Which decompressor will inflate this run's two inputs.
+
+    Both `zna merge` and `zna encode --merge-pairs` read through :class:`_RawStream`,
+    which prefetches on its own thread, so both pass ``own_read_thread=True``; see
+    :mod:`zna._gzip`. Returns one name when the two inputs agree and ``"a/b"`` when they
+    do not -- one gzipped input and one plain is unusual enough to be worth seeing rather
+    than hiding behind a single label.
+    """
+    n1 = _gzip.inflate_backend_name(str(path1), own_read_thread=True)
+    n2 = _gzip.inflate_backend_name(str(path2), own_read_thread=True)
+    return n1 if n1 == n2 else f"{n1}/{n2}"
+
+
 def run(args) -> dict:
     """Execute the merge and return the statistics dict."""
     _backend.use(getattr(args, "backend", "auto"))
-    logger.info("backend: %s | gzip: %s | threads: %d",
-                _backend.active_name(),
-                "pigz" if shutil.which("pigz") else "stdlib gzip",
-                max(1, args.threads))
+    # Name the decompressor that will actually run, not the one that is installed. This
+    # line said "pigz" whenever the binary existed, which stopped being true when the
+    # reader gained an ISA-L path -- and inflate is the largest single cost of a merge,
+    # so a throughput number is not interpretable without it.
+    inflate = inflate_backend_for(args.in1, args.in2)
+    logger.info("backend: %s | inflate: %s | threads: %d",
+                _backend.active_name(), inflate, max(1, args.threads))
     params = MergeParams(
         t_merge=args.t_merge,
         t_trim=args.t_trim,
@@ -455,7 +480,7 @@ def run(args) -> dict:
         logger.info(
             "longest read %d bp: the overlap scan is O(L^2), so expect it to be slow "
             "in proportion (no limit is imposed)", acc[0][_MAX_READ_LEN])
-    stats = _assemble_stats(acc, params, elapsed)
+    stats = _assemble_stats(acc, params, elapsed, inflate=inflate)
 
     if args.json:
         with open(args.json, "w") as fh:

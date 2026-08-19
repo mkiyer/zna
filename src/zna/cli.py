@@ -22,6 +22,7 @@ from .core import (
     ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
     FLAG_FIELDS,
 )
+from . import _gzip
 from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
 from ._shuffle import shuffle_zna
 
@@ -88,17 +89,27 @@ class _DecompressPipe(io.BufferedReader):
 
 
 def _open_gzip(filepath: str):
-    """Open a gzip file for reading, preferring an external decompressor.
+    """Open a gzip file for reading, by the fastest route available.
 
-    Handing decompression to a separate process lets it run in parallel with
-    Python's parsing instead of competing with it for the GIL; measured ~2.75x
-    over the ``gzip`` module on 300k records.  ``pigz`` is tried first because it
-    threads the decompression too.
+    An external decompressor first.  This function's caller drives ``readline`` from the
+    **main thread**, so inflate here competes with a GIL-bound parse loop and what helps
+    is another core, not a cheaper implementation: measured on 1M records from a gzipped
+    interleaved FASTQ, ``pigz`` runs 5.50 s wall against ISA-L's 6.54 s, while costing
+    7.26 s of CPU against 6.31 s.  Contrast ``zna merge``, which prefetches on its own
+    thread and therefore prefers ISA-L — :func:`zna._gzip.prefer_isal` holds that
+    decision and both measurements.
 
-    Falls back to the ``gzip`` module when no external tool is present, and
-    ``ZNA_NO_EXTERNAL_GZIP=1`` forces that path for debugging.
+    ISA-L is still tried ahead of the stdlib, so a machine with no ``pigz`` gets 448
+    MB/s rather than 208.
+
+    ``ZNA_NO_ISAL=1`` and ``ZNA_NO_EXTERNAL_GZIP=1`` each skip one path, for debugging a
+    suspected difference between decompressors.
     """
-    if not os.environ.get("ZNA_NO_EXTERNAL_GZIP"):
+    if _gzip.prefer_isal(own_read_thread=False):
+        stream = _gzip.open_isal(filepath, _GZIP_READ_BUFFER)
+        if stream is not None:
+            return stream
+    if _gzip.external_gzip_allowed():
         for cmd in _GUNZIP_COMMANDS:
             try:
                 proc = subprocess.Popen(
@@ -108,10 +119,10 @@ def _open_gzip(filepath: str):
                 # No such binary, or it is not executable — try the next one.
                 continue
             return _DecompressPipe(proc, filepath)
-    # A FASTQ record is four readline calls, and GzipFile serves each from its
-    # own modest internal buffer; a wide BufferedReader in front amortises that
-    # across many records instead of paying it per line.
-    return io.BufferedReader(gzip.open(filepath, "rb"), buffer_size=_GZIP_READ_BUFFER)
+    stream = _gzip.open_isal(filepath, _GZIP_READ_BUFFER)
+    if stream is not None:
+        return stream
+    return _gzip.open_stdlib_gzip(filepath, _GZIP_READ_BUFFER)
 
 
 def parse_block_size(value) -> int:
@@ -1604,9 +1615,15 @@ def encode_command(args):
         merge_json_path = getattr(args, 'merge_json', None)
         if merge_json_path:
             import json as _json
-            from .merge.cli import _assemble_stats
+            from .merge.cli import _assemble_stats, inflate_backend_for
             from .merge.backend import get_merge_backend_name
-            stats = _assemble_stats(merge_acc, merge_params)
+            # --merge-pairs reads through the same `_RawStream` as `zna merge`, so it
+            # resolves the decompressor the same way; report it for the same reason.
+            # `files` is safe to index: the --merge-pairs guard above exits unless it
+            # holds exactly two paths.
+            stats = _assemble_stats(
+                merge_acc, merge_params,
+                inflate=inflate_backend_for(files[0], files[1]))
             # _assemble_stats reads the process-global backend selection, which
             # --merge-backend deliberately never mutates; report the kernel
             # that actually ran.
@@ -1624,7 +1641,7 @@ def encode_command(args):
     # ── Optional shuffle pass ─────────────────────────────────────────
     if getattr(args, 'shuffle', False) and not is_stdout:
         if not quiet:
-            print(f"\n[ZNA] Shuffling ...", file=sys.stderr)
+            print("\n[ZNA] Shuffling ...", file=sys.stderr)
         # Shuffle in-place via a temp file
         tmp_fd, tmp_shuffle = tempfile.mkstemp(
             suffix=".zna", dir=os.path.dirname(args.output) or "."
@@ -2243,7 +2260,7 @@ def inspect_command(args):
             print(f"Writer:           zna {prov.writer_version}")
             print(f"Shuffled:         {prov.shuffled}")
             if prov.merged_in_process:
-                print(f"Merged in-process:True")
+                print("Merged in-process:True")
         else:
             print("(none: written by zna < 0.5, or truncated)")
 
@@ -2332,7 +2349,7 @@ def inspect_command(args):
              print(f"Compression Ratio:  {ratio:.2f}x")
         else:
              print(f"Data Size:          {uncompressed_payload / (1024*1024):.2f} MB")
-             print(f"Compression Ratio:  1.00x")
+             print("Compression Ratio:  1.00x")
 
 
 def get_zna_version():

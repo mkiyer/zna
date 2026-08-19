@@ -1,5 +1,5 @@
 {% set name = "zna" %}
-{% set version = "0.5.1" %}
+{% set version = "0.5.2" %}
 {% set username = "mkiyer" %}
 
 package:
@@ -79,12 +79,16 @@ about:
     
     Features:
     - 1.7 GB/s decode and 726 MB/s encode on 150 bp reads; 6.6 GB/s decode on
-      long reads (single core)
+      long reads (single core, Apple silicon -- roughly 2.5x lower per core on
+      an older x86 part; see the README for both)
     - ~4x compression from 2-bit packing, more with Zstd on duplicated data
     - C++ acceleration with a pure Python fallback
     - Columnar block layout; batch and block-sharded reading for data loaders
     - Supports single-end, paired-end, interleaved, and overlap-merged reads
     - Supports strand-specific protocols and per-record fragment geometry
+    - Optional: install python-isal alongside for 2.3x faster gzip input, which
+      is the largest single cost of `zna merge` (the pip extra is zna[fast]);
+      without it pigz or the stdlib is used, with identical output
   doc_url: https://github.com/{{ username }}/{{ name }}/blob/main/README.md
   dev_url: https://github.com/{{ username }}/{{ name }}
 

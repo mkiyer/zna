@@ -55,6 +55,12 @@ Changelog = "https://github.com/mkiyer/zna/releases"
 zna = "zna.cli:main"
 
 [project.optional-dependencies]
+# Optional accelerator, never required. `isal` binds Intel's ISA-L, whose inflate is
+# 2.3x the pigz subprocess path this falls back to -- and inflate is the largest single
+# cost of `zna merge`. See src/zna/_gzip.py for the measurements and the fallback order.
+fast = [
+    "isal>=1.0"
+]
 dev = [
     "pytest",
     "black",

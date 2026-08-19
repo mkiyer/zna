@@ -32,12 +32,22 @@
 
 ```bash
 pip install zna
+# or, if your inputs are gzipped -- see below
+pip install 'zna[fast]'
 # or
 conda install -c bioconda zna
 ```
 
 Both ship prebuilt binaries with the C++ extensions already compiled — Linux, macOS
 (Intel and Apple Silicon) and Windows, on CPython 3.10–3.14. Nothing needs a compiler.
+
+**`zna[fast]` adds one optional dependency, `isal` (Intel ISA-L), for gzip input.**
+Inflate is the largest single cost of `zna merge` — a profile puts a quarter of all
+cycles inside `pigz`'s `libz` — and ISA-L reads a gzip member at **448 MB/s against
+`pigz`'s 193 and the stdlib's 208**, which on a 1M-pair library takes `zna merge
+--threads 1` from 5.84 s to 4.04 s while *also* using less CPU. Output is byte-identical
+either way, and a truncated or CRC-damaged member is still rejected. Without the extra,
+ZNA behaves exactly as it did before: `pigz` when it is on `PATH`, then stdlib `gzip`.
 
 **Verify both extensions loaded.** ZNA has two: the codec, and `zna merge`'s overlap
 scan. Either can be absent without an error — the pure-Python fallbacks are correct and
@@ -48,9 +58,11 @@ Check it rather than assume it:
 python -c "
 import zna
 from zna.merge.backend import available_merge_backends
+from zna._gzip import inflate_backend_name
 print('zna', zna.__version__)
 print('codec accelerated:', zna.is_accelerated())
 print('merge backends:   ', available_merge_backends())   # want 'accel' in here
+print('gzip input via:   ', inflate_backend_name('x.fq.gz'))   # 'isal' with zna[fast]
 "
 ```
 
@@ -116,6 +128,16 @@ per stored byte at Zstd level 9 on random (worst-case, incompressible) sequence.
 > is the self-describing container (trailer stats + frame checksums); decode
 > is within noise of the table. The *scaling with read length* below still
 > holds; the absolute numbers are 0.3.5-era.
+>
+> **Every figure on this page is Apple silicon.** The same method at 0.5.2 on a Xeon
+> E5-2680 v3 (Haswell, 2.5 GHz, 2014) gives encode 179 MB/s, decode 452 MB/s via
+> `records()` and 811 MB/s via `blocks()`, at the identical 3.95x compression — roughly
+> 2.5x lower across the board, which is the per-core difference between the two parts
+> rather than anything ZNA does differently. **The codec was profiled on x86 in 0.5.2 and
+> left alone:** its two kernels measure 5,465 Mbase/s (decode, already memory-bandwidth
+> bound) and 1,723 Mbase/s (encode), and hand-written SSE2 was *slower* than both. What
+> `zna encode` is actually limited by is its per-record Python driver — the compiled codec
+> is ~3% of the command — see `docs/ROADMAP.md`.
 
 | Read Type | Encode (MB/s) | Decode (MB/s) | Encode (rec/s) | Decode (rec/s) | Compression |
 |---|---|---|---|---|---|
@@ -873,7 +895,7 @@ Options:
 ```
 
 **Speed.** The merge kernel is compiled C++ and releases the GIL, so `--threads` are
-real worker threads. It is not usually the bottleneck — gzip is — so **2 threads
+real worker threads. It is not usually the bottleneck — inflate is — so **2 threads
 saturate and more does nothing**:
 
 | | µs/pair |
@@ -883,7 +905,19 @@ saturate and more does nothing**:
 | `--threads 4` | 1.43 |
 
 With gzip removed from both ends the tool runs at 0.42 µs/pair, so on compressed input
-it is I/O bound. `pigz` is used when it is on `PATH`, falling back to stdlib `gzip`.
+it is I/O bound. (Apple silicon, 8 cores.)
+
+> **Install `zna[fast]` if your input is gzipped.** Inflate is the largest single cost of
+> a merge — a profile at `--threads 1` puts a quarter of all cycles inside `pigz`'s
+> `libz`. The `fast` extra pulls in `isal` (Intel ISA-L), which the reader prefers when
+> present: **448 MB/s of inflate against `pigz`'s 193**, and on a 1M-pair library
+> `--threads 1` goes from 5.84 s to 4.04 s wall while also using less CPU. It is
+> optional — without it, `pigz` is used when on `PATH`, then stdlib `gzip`, exactly as
+> before. `zna merge` logs which one ran and records it in `--json`.
+>
+> **0.5.2 also made the scan itself 2.04x faster on x86-64.** Every earlier number here
+> was measured on aarch64; on Linux/x86 the kernel had been reducing each vector compare
+> through a PLT call to libgcc's `__popcountdi2`. See CHANGELOG and `docs/METHODS.md` §2.4.
 
 **Determinism.** The score is computed in fixed-point integers and the argmax has a
 specified tie-break, so a given FASTQ produces **byte-identical output on any platform,

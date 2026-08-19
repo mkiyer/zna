@@ -203,7 +203,6 @@ def shuffle_zna(
     else:
         bucket_header = out_header
 
-    has_labels = len(in_header.labels) > 0
     # Bound once: both passes below index this per record to recover the pairing
     # triple from the flag byte, and a global lookup per record is what it replaces.
     flag_fields = FLAG_FIELDS

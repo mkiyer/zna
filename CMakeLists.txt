@@ -75,10 +75,18 @@ install(TARGETS _accel LIBRARY DESTINATION zna)
 #
 # No -march, no ISA flags, no runtime dispatch.  The kernel uses 16-byte vectors,
 # which are baseline on every target we build for -- NEON on aarch64, SSE2 on
-# x86-64 -- and falls back to a scalar loop anywhere else.  Anything wider is not
-# baseline, and per docs/METHODS.md is not obviously faster either: the scan is
-# rejection-dominated, so the bail interval matters more than the vector width.
-# x86 tuning is scheduled for 0.4.1 (docs/ROADMAP.md).
+# x86-64 -- and falls back to a scalar loop anywhere else.
+#
+# The x86 assessment this comment used to defer to 0.4.1 happened in 0.5.2, and it
+# CONFIRMED the no-flag policy rather than overturning it -- but not for the reason
+# stated here.  Anything wider is not baseline and is now measured *not faster*: a
+# 32-byte AVX2 kernel reached 1.556 us/pair against baseline SSE2's 1.539.  What the
+# same measurement did find is that `-mpopcnt` would have been worth 1.88x, because
+# `__builtin_popcount` on a baseline build compiles to a PLT call to libgcc.  That is
+# fixed in the source instead (`psadbw`, see merge_core.hpp), which is the right place:
+# a flag here would have bought speed by raising the CPU floor of every wheel.
+#
+# So: still no flags, and now for a measured reason.  docs/ROADMAP.md has the sweep.
 nanobind_add_module(
     _merge_accel
     NB_STATIC

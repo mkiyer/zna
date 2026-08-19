@@ -56,6 +56,17 @@ jobs:
           python -m pip install "scikit-build-core>=0.10" "nanobind>=2.0" pytest
           python -m pip install . --no-build-isolation -v
 
+      - name: Install the optional ISA-L extra (Linux legs only)
+        # `isal` is an optional accelerator for gzip INPUT (see src/zna/_gzip.py), so it
+        # must be absent somewhere and present somewhere. Installing it on Linux only
+        # gets both: tests/test_gzip_backends.py forces each of the three decompressors
+        # by environment variable, so a leg that HAS isal exercises all three paths,
+        # while the macOS and Windows legs prove the no-extra install still works and
+        # that those tests skip rather than fail. Without this the ISA-L path shipped
+        # untested, which is how it started.
+        if: runner.os == 'Linux'
+        run: python -m pip install isal
+
       - name: Both extensions must have built
         # A silently missing extension is the failure mode this project keeps hitting:
         # the codec falls back to pure Python and the merge kernel to the reference

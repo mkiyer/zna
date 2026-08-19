@@ -279,14 +279,21 @@ Pruning is consistent with the tie rule for free. Rejecting on `ceiling <= best`
 ```c
 const uint8_t* a = s1   + (s > 0 ?  s : 0);      // a shift is just a pointer offset
 const uint8_t* b = s2rc + (s < 0 ? -s : 0);
-for (; k + 32 <= n; k += 32) {
-    d += neq16(a + k, b + k) + neq16(a + k + 16, b + k + 16);
-    if (d > dmax) return REJECT;                 // bail every 32 bases
+constexpr int GROUP = 16 * BAIL_VECTORS;         // 48 bases on x86, 32 on aarch64
+for (; k + GROUP <= n; k += GROUP) {
+    d += neq16x<BAIL_VECTORS>(a + k, b + k);     // ONE reduction per group
+    if (d > dmax) return REJECT;
+}
+for (; k + 16 <= n; k += 16) {                   // keeps the byte tail under 16
+    d += neq16(a + k, b + k);
+    if (d > dmax) return REJECT;
 }
 for (; k < n; ++k) d += (a[k] != b[k]);          // scalar tail
 ```
 
-`neq16` counts differing bytes in a 16-byte window: `vceqq_u8` + `vaddvq_u8` on NEON, `_mm_cmpeq_epi8` + `movemask` + popcount on SSE2. Sixteen bytes is baseline on every target — NEON on aarch64, SSE2 as part of the x86-64 base ISA — so there is no `-march` flag and no runtime dispatch, and where neither is available the vector block compiles out and the scalar tail does the whole overlap for the same result. Because a shift is a pointer offset there is no packing step, no cross-word realignment, no guard word and no lookup table, and the guard `k + 32 <= n` is the only thing keeping the loads inside the record.
+`neq16x<V>` counts differing bytes across `V` consecutive 16-byte windows, accumulating the per-lane equality flags in a vector register and folding them **once for the whole group**: `vceqq_u8` + `vaddq_u8` then one `vaddvq_u8` on NEON, `_mm_cmpeq_epi8` + `_mm_sub_epi8` then one `_mm_sad_epu8` on SSE2. Sixteen bytes is baseline on every target — NEON on aarch64, SSE2 as part of the x86-64 base ISA — so there is no `-march` flag and no runtime dispatch, and where neither is available the vector blocks compile out and the scalar tail does the whole overlap for the same result. Because a shift is a pointer offset there is no packing step, no cross-word realignment, no guard word and no lookup table, and every loop guard is `k + <step> <= n`, which is the only thing keeping the loads inside the record.
+
+**`psadbw`, not `pmovmskb` + popcount, is what makes the x86 path fast**, and the reason is worth stating because the obvious kernel is a trap. POPCNT is SSE4.2-era and this extension is compiled for baseline x86-64, so `__builtin_popcount` there is not an instruction: GCC emits `callq __popcountdi2@plt`. Through 0.5.1 that call sat in this loop, twice per 32 bases, and cost it 1.88× — the byte-SIMD kernel was only 1.33× the scalar one on x86 against 2.3× on aarch64. `psadbw` is baseline SSE2 and is the exact analogue of `vaddvq_u8`, so grouping the reduction removes the call rather than working around it. Bail granularity is a hardware property and is set per ISA (`BAIL_VECTORS`); the 16-byte step between the group loop and the byte tail is what makes a wide group affordable, since a 48-base group would otherwise leave up to 47 bases — a third of a 150 bp read — to the scalar loop.
 
 **Byte comparison is not an approximation of the reference semantics — it *is* the reference semantics.** `N` vs `N` earns a full match, `N` vs `A` is a mismatch, IUPAC codes compare as themselves (`reverse_complement` passes anything outside ACGTN through uncomplemented, deliberately), and any byte at all is defined. There is no purity test, no dispatch, no second code path to keep in sync, and no class of input on which the fast path and the oracle can disagree. A 2-bit packed kernel cannot have that property — `N` would collapse onto a real base and start manufacturing evidence — and would need a packer, bit realignment and a purity dispatch to fake it. (The container's 2-bit alphabet, §4.1, is a separate matter: the merger never packs, and `N` policy is applied at encode time.)
 
@@ -302,7 +309,20 @@ Measured over 50,000 real pairs, full pruned scans, every variant checked agains
 | byte SIMD, 16 B vectors, bail every 64 | 0.515 |
 | byte SIMD, bail 32, fused flanks | 0.555 |
 
-Bail granularity, not vector width, is the variable that matters: the scan is rejection-dominated (roughly 0.32·n comparisons per rejected shift), so 32 bases beats both 16 (too much branching) and 64 (too much work past the point of rejection). Fusing the two flank shifts helps a packed kernel and hurts this one — it doubles register pressure and defeats the early-exit ordering.
+Bail granularity, not vector width, is the variable that matters: the scan is rejection-dominated (roughly 0.32·n comparisons per rejected shift), so on this machine 32 bases beats both 16 (too much branching) and 64 (too much work past the point of rejection). Fusing the two flank shifts helps a packed kernel and hurts this one — it doubles register pressure and defeats the early-exit ordering.
+
+**The same table on x86-64** (Xeon E5-2680 v3, Haswell; g++ 8.5, `-O3 -std=c++17`, no ISA flags), taken in 0.5.2 and the reason the kernel above has three loops instead of two:
+
+| variant | µs/pair |
+|---|---:|
+| scalar C++, direct transliteration | 4.34 |
+| 0.5.1 kernel: `movemask` + popcount, bail 32 | 3.140 |
+| `psadbw`, bail 32 | 1.747 |
+| `psadbw`, bail 48 | 1.671 |
+| **`psadbw`, bail 48, + 16-byte step** | **1.539** |
+| AVX2 32 B vectors, `movemask` + popcount, bail 32 (`-march=native`) | 1.556 |
+
+Two things to read off it. The 0.5.1 kernel gained only **1.33×** over scalar here against **2.29×** on NEON, which is the popcount call. And the baseline-SSE2 kernel *beats* the AVX2 one, which is why no AVX2 path or runtime dispatch is built — with the reduction fixed there is nothing left for the wider vector to win. `docs/ROADMAP.md`, "Closed by measurement in 0.5.2", has the rest of the sweep.
 
 The reference backend runs the same search with mismatches accumulated branchlessly in blocks of 8 and the bail tested once per block; the result is bit-for-bit identical either way, since overshooting `dmax` inside a block still rejects. A stride bug there (`k += 7`, a wrong `lim`) changes 6.34% of scores and 0.26% of merge/trim/keep decisions on real data while passing every test that uses clean overlaps, so both loops have a dedicated test that sweeps a single mismatch across every position of a block, across the vector boundary and into the tail.
 

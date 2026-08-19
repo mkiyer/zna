@@ -75,7 +75,6 @@ def stream_merge_pairs(files, params: MergeParams, *, check_sync: bool = True,
         zn = tag_map.get(b"ZN")
         if zn is not None:
             zn_index = zn[0]
-    n_labels = len(label_defs)
     target = max(_READ_BLOCK, 2000 * 1024)
     geometry = _GEOMETRY_BY_SLOT
 

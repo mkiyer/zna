@@ -8,6 +8,128 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
+## [0.5.2] - 2026-08-19
+
+**The first Linux/x86 assessment.** ZNA was developed on aarch64 and every number in its
+docs was Apple silicon. Taken to a Xeon E5-2680 v3 (Haswell), the merge kernel's SIMD win
+turned out to be **1.33× over scalar instead of the 2.3× recorded on NEON** — and the
+cause was a function call in the innermost loop, not the vector width. Nothing about the
+format changed; every output in this release is byte-identical to 0.5.1's.
+
+### Performance — the merge overlap scan, 2.04× on x86, no ISA flags
+
+`neq16` reduced each 16-byte compare with `pmovmskb` + `__builtin_popcount`. POPCNT is
+SSE4.2-era and this extension is compiled for baseline x86-64, so GCC emitted
+**`callq __popcountdi2@plt` — a PLT call, with the caller's registers spilled around it,
+twice per 32 bases** in the hottest loop in the tool. GCC 8.5 and 13.2 both do it. The
+comment claiming GCC would "emit a table or a SWAR sequence" without `-mpopcnt` was
+wrong, and aarch64 never saw any of it because NEON reduces with `vaddvq_u8`.
+
+Three changes, all in `merge_core.hpp`:
+
+- **Reduce with `psadbw`.** Baseline SSE2 — no `-march`, no CPUID, no runtime dispatch —
+  and the exact analogue of `vaddvq_u8`. `neq16x<V>` now accumulates per-lane equality
+  flags in a vector register and folds **once per group** rather than once per vector,
+  which is the shape NEON always wanted too.
+- **Bail interval is per-ISA** (`BAIL_VECTORS`): 3 vectors / 48 bases on x86, measured
+  against 2 and 4. aarch64 stays at its measured 2 — see below.
+- **A 16-byte step between the group loop and the byte tail.** A 48-base group otherwise
+  leaves up to 47 bases to the scalar loop, a third of a 150 bp read; this keeps the tail
+  under 16 bases at any interval. Worth 1.08× on its own.
+
+Measured, 50k real pairs, full pruned scans, g++ -O3 with no ISA flags: **3.140 µs/pair →
+1.539**. End to end on 1M pairs with the same decompressor on both sides and output to
+`/dev/null`, `zna merge --threads 1`: **7.61 s → 5.84 s wall (1.30×)** and 7.77 s → 6.06 s
+CPU. `merge_chunk` itself 4.698 → 2.978 µs/pair (1.58×).
+
+**AVX2 was evaluated and deliberately not built.** With the reduction fixed, a 32-byte
+AVX2 kernel reaches 1.556 µs/pair — *slower than the 1.539 of baseline SSE2*. The win was
+never in the vector width. `docs/ROADMAP.md` has the full table, including the row where
+AVX2 loses because a 256-bit `psadbw` needs a cross-lane fold that POPCNT does not.
+
+### Added — optional ISA-L inflate, `pip install 'zna[fast]'`
+
+With the kernel twice as fast, inflate became the largest single cost of a merge: a
+profile of `zna merge --threads 1` put **a quarter of all cycles inside pigz's libz**,
+`crc32_z` alone at 8.6%. Installing `isal` (Intel ISA-L) is now enough for the readers to
+use it — 448 MB/s against pigz's 193 and the stdlib's 208 on a 106 MB member.
+
+**It is strictly optional.** Not imported until a `.gz` is actually opened, so `import
+zna` is unaffected, and a machine without it behaves exactly as 0.5.1 did.
+
+**Which decompressor is preferred depends on the caller**, which was measured rather than
+assumed, and the two read paths differ:
+
+| 1M pairs, wall / CPU | ISA-L | pigz subprocess |
+|---|---|---|
+| `zna merge --threads 1` | **4.04 / 4.28 s** | 5.84 / 6.06 s |
+| `zna encode` from `.gz` | 6.54 / 6.31 s | **5.50 / 7.26 s** |
+
+`zna merge` prefetches on its own thread and ISA-L releases the GIL, so in-process inflate
+overlaps just as a subprocess does and the faster implementation wins on **both** axes.
+`zna encode` drives `readline` from the main thread, so its inflate competes with a
+GIL-bound parse loop, and there another *core* beats a cheaper *implementation* — pigz
+stays first, with ISA-L ahead of the stdlib when no external tool exists (6.60 s against
+7.79 s). `zna/_gzip.py` holds the policy and both measurements.
+
+**Cumulative for this release**, 1M pairs, `zna merge --threads 1`. Two honest framings,
+because the answer depends on where the output goes and both were measured:
+
+| | 0.5.1 | 0.5.2, no extra | 0.5.2 + `[fast]` |
+|---|---|---|---|
+| wall, output to `/dev/null` | 7.61 s | 5.84 s (1.30×) | **4.04 s (1.88×)** |
+| CPU, output to `/dev/null` | 7.77 s | 6.06 s (1.28×) | **4.28 s (1.82×)** |
+| wall, 427 MB FASTQ to network scratch | 9.75 s | — | **6.88 s (1.42×)** |
+| CPU, same | 7.71 s | — | **4.32 s (1.78×)** |
+
+The `/dev/null` rows isolate the tool; the scratch rows are what a pipeline sees, where
+writing the intermediate FASTQ is itself a third of the wall time. `zna encode
+--merge-pairs`, which has no intermediate to write, goes **9.63 → 6.23 s wall (1.55×)**
+and 9.44 → 6.00 s CPU.
+
+`zna merge` now logs `inflate: isal|external|gzip|plain` and records it in `--json`,
+because a wall-clock number in that dict is not comparable across runs without it. The
+old log line said `gzip: pigz` whenever the binary merely existed.
+
+### Fixed
+
+- `scripts/merge_bench/dump_pairs.py` had not run since `find_overlap` began taking a
+  `MergeParams` (it still passed `8.0, 0.01`) — `TypeError` on import of the first pair.
+- `scripts/merge_bench/bench_breakdown.py` imported `HAVE_NUMBA` and called
+  `cli._init_worker`/`cli._process_chunk`, none of which have existed since the 0.4.0
+  chunk-protocol rewrite. Rebuilt against the current architecture, including a stage
+  that times `merge_chunk` itself — the call the shipped tool actually makes.
+  **Both scripts are the reproduction path `docs/ROADMAP.md` points at for this work**,
+  and neither would start.
+- `scripts/merge_bench/asan_scan.cpp` passed `nullptr` to `memcpy` on its zero-length
+  case, which UBSAN flags; guarded the way the same file's `run()` already did.
+- Dead locals `has_labels` (`_shuffle.py`) and `n_labels` (`merge/encode_stream.py`), an
+  orphaned `import shutil`, and three `f`-strings with no placeholders.
+
+### Verification
+
+- **Byte-identical output** across the whole release, on 1M pairs. The merged FASTQ is
+  `cmp`-clean against 0.5.1, and clean again across all three inflate backends and at any
+  `--threads`. For the `.zna` files the right invariant is the payloads, not the whole
+  file: the provenance prologue stores `writer_version`, so a version bump necessarily
+  changes byte 22 onward and shifts every trailer offset by one. Checked at that level
+  instead — **all 13 compressed block payloads bit-identical**, `(count, compressed_size,
+  uncompressed_size)` identical per block, and `zna decode` output `cmp`-clean.
+- **Both extensions built with `-fsanitize=undefined -fno-sanitize-recover=all`** — abort
+  on any UB — and the full suite plus a 1M-pair merge, encode, shuffle, decode and
+  `inspect --verify` run clean through them. Neither extension had ever been sanitized on
+  x86-64. `asan_scan` is clean too: 11,568 scans, 144,006 chunks.
+- `tests/test_gzip_backends.py` (22 new tests) pins the backend policy, that all three
+  paths produce identical bytes, and that all three still reject a truncated or
+  CRC-damaged member — the integrity check the subprocess path existed for.
+
+### Known debt
+
+The NEON path was changed without an aarch64 machine to measure it on. It should be a win
+or a wash (one `vaddvq_u8` per group instead of per vector) and correctness is verified,
+but `BAIL_VECTORS` is still the value tuned for the *old* reduction. Scheduled as 0.5.3 in
+`docs/ROADMAP.md`.
+
 ## [0.5.1] - 2026-08-18
 
 ### Fixed — labeled two-file encode silently truncated on unequal R1/R2 counts

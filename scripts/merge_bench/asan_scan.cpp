@@ -145,7 +145,10 @@ int main() {
         std::vector<uint8_t> v(n);
         for (auto& c : v) c = static_cast<uint8_t>(rng() & 0xFF);
         uint8_t* a1 = static_cast<uint8_t*>(std::malloc(n ? n : 1));
-        std::memcpy(a1, v.data(), n);
+        // `v.data()` is nullptr when n == 0, and memcpy's arguments are declared
+        // non-null, so UBSAN flags the zero-length copy. Guard it the way `run()`
+        // above already does.
+        if (n) std::memcpy(a1, v.data(), n);
         std::string blob;
         zna_merge::ChunkStats st;
         size_t p1 = 0, p2 = 0;

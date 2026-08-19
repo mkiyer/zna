@@ -6,8 +6,9 @@
 
 Every number in those documents comes from these scripts. They are kept so the design
 can be re-argued against measurements rather than recollection, and so the same numbers
-can be taken on a Linux/x86 box — this session's were all aarch64, which matters for
-`popcount`. See docs/ROADMAP.md, "0.4.2 — x86 tuning".
+can be taken on a Linux/x86 box. That happened in 0.5.2 and it mattered exactly where
+the note used to warn it would — `popcount` — see docs/ROADMAP.md, "Closed by measurement
+in 0.5.2".
 
 Nothing here is part of the zna package or the test suite.
 
@@ -100,7 +101,8 @@ python verify_tiebreak.py r1.fq.gz r2.fq.gz
 python dump_pairs.py r1.fq.gz r2.fq.gz 50000 pairs.bin
 c++ -O3 -std=c++17 -o bench_scan bench_scan.cpp && ./bench_scan pairs.bin   # scalar vs 2-bit packed
 c++ -O3 -std=c++17 -o bench_simd bench_simd.cpp && ./bench_simd pairs.bin   # ...vs byte-wise SIMD
-# on x86, add -mavx2 to bench_simd to enable the 32-byte variants (SSE2 needs no flag)
+# on x86 see "Taking these on x86" below before adding -mavx2: it enables POPCNT too,
+# which silently folds the reduction fix into what looks like a vector-width result
 
 # 5. the whole path in C++, which must be BYTE-IDENTICAL to `zna merge`  (retired-design §3)
 c++ -O3 -std=c++17 -o proto_merge proto_merge.cpp
@@ -147,8 +149,28 @@ retired-design §5.
 The fixed-point scale is chosen by exhaustive enumeration rather than taste — see design
 §4 for the table, which is small enough to live as a test.
 
-## Taking these on x86
+## Taking these on x86 — done in 0.5.2, and what it found
 
-Every number in the design is aarch64/NEON. The SSE2 path in `bench_simd.cpp` is written
-but has never been run, the AVX2 variants need `-mavx2`, and the optimal bail
-granularity is hardware-dependent (32 bases won here). This is retired-design phase G.
+The SSE2 path in `bench_simd.cpp` had never been run. It runs, and it showed the shipped
+kernel getting **1.33×** over scalar on a Xeon E5-2680 v3 against the **2.29×** these
+scripts recorded on NEON. The cause was `__builtin_popcount` compiling to
+`callq __popcountdi2@plt` — POPCNT is not baseline x86-64 — twice per 32 bases in the
+innermost loop. `merge_core.hpp` now reduces with `psadbw` instead.
+
+**`bench_simd.cpp` still contains that popcount kernel**, deliberately: it is the
+`before` in the comparison. Two things follow for anyone re-running it on x86.
+
+- **`-mavx2` also enables POPCNT**, so a bare `./bench_simd` against a `-mavx2` build
+  compares *two* changes at once and will credit the vector width for the reduction's
+  win. Build with `-mpopcnt` alone to separate them; the numbers are in ROADMAP.
+- The bail granularity is per-ISA now (`BAIL_VECTORS`): 48 bases on x86, 32 on aarch64.
+
+```bash
+c++ -O3 -std=c++17 -o bench_simd bench_simd.cpp && ./bench_simd pairs.bin  # as shipped
+c++ -O3 -std=c++17 -mpopcnt  -o bs_pc bench_simd.cpp && ./bs_pc pairs.bin  # isolate popcnt
+c++ -O3 -std=c++17 -mavx2    -o bs_v2 bench_simd.cpp && ./bs_v2 pairs.bin  # + 32 B vectors
+```
+
+Still open, and scheduled as 0.5.3: **none of the 0.5.2 numbers are aarch64.** The grouped
+reduction changed the NEON path too, and its `BAIL_VECTORS` is still the value tuned for
+the old per-vector reduction.

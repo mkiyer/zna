@@ -11,6 +11,8 @@ import gzip
 import shutil
 import subprocess
 
+from .. import _gzip
+
 _BUF = 1 << 20
 
 
@@ -22,8 +24,20 @@ class InputError(ValueError):
     """
 
 
-def _open_binary_read(path: str, threads: int):
+def _open_binary_read(path: str, threads: int, *, own_read_thread: bool):
     """Return (stream, proc). ``proc`` is the pigz process to reap, or None.
+
+    *own_read_thread* must say whether the caller reads on a dedicated thread, because
+    that is what decides between ISA-L and a subprocess and **the two callers of this
+    function differ**. :class:`zna.merge.cli._RawStream` prefetches on its own thread and
+    wants ISA-L; :func:`read_fastq` below drives ``readline`` from the calling thread and
+    wants the subprocess. Getting that backwards is not subtle — it cost `read_fastq`
+    2.836 -> 4.007 us/pair when this function briefly hardcoded ``True``. The policy and
+    both measurements are in :mod:`zna._gzip`.
+
+    ISA-L is worth wanting where it fits: 2.3x the pigz pipe on this repository's
+    1M-pair library, and a profile of ``zna merge --threads 1`` puts a quarter of all
+    cycles inside pigz's ``libz``, which makes inflate the largest single cost of a merge.
 
     pigz cannot parallelise inflate (it threads only the CRC and read-ahead), so a
     reader gains almost nothing from extra threads — and measured, ``-p4`` per stream is
@@ -32,13 +46,20 @@ def _open_binary_read(path: str, threads: int):
     deflate genuinely parallelises.
     """
     if path.endswith(".gz"):
-        pigz = shutil.which("pigz")
+        if _gzip.prefer_isal(own_read_thread=own_read_thread):
+            stream = _gzip.open_isal(path, _BUF)
+            if stream is not None:
+                return stream, None
+        pigz = shutil.which("pigz") if _gzip.external_gzip_allowed() else None
         if pigz:
             proc = subprocess.Popen(
                 [pigz, "-dc", "-p", str(max(1, threads)), path],
                 stdout=subprocess.PIPE, bufsize=_BUF,
             )
             return proc.stdout, proc
+        stream = _gzip.open_isal(path, _BUF)
+        if stream is not None:
+            return stream, None
         return gzip.open(path, "rb"), None
     return open(path, "rb", buffering=_BUF), None
 
@@ -51,7 +72,9 @@ def read_fastq(path, threads: int = 1):
     ``scripts/merge_bench/``, which want records rather than bytes.
     """
     path = str(path)
-    stream, proc = _open_binary_read(path, threads)
+    # This loop is the reader: `readline` runs on the calling thread, so an in-process
+    # inflate would compete with it rather than overlap. See `_open_binary_read`.
+    stream, proc = _open_binary_read(path, threads, own_read_thread=False)
     readline = stream.readline
     try:
         while True:

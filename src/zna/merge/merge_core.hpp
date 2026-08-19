@@ -33,8 +33,17 @@
  * and would have needed a packer, cross-word bit realignment and a purity dispatch to
  * keep those semantics. Slower and more machinery.
  *
- * Measured, 50k real pairs, full pruned scans: numba 2.633 us/pair, scalar C++ 1.075,
- * this 0.470 (5.6x). Bail granularity of 32 bases beat both 16 and 64; see §6.1.
+ * Measured on aarch64/NEON, 50k real pairs, full pruned scans: numba 2.633 us/pair,
+ * scalar C++ 1.075, this 0.470 (5.6x), at a 32-base bail.
+ *
+ * **x86-64 was re-measured in 0.5.2 and the kernel changed under it.** Every figure
+ * above is Apple silicon; the first Linux/x86 measurement found the SSE2 path running
+ * but reducing each vector compare through a PLT call to libgcc's `__popcountdi2`,
+ * which cost it 1.88x and had collapsed the SIMD win to 1.33x over scalar. It now
+ * reduces with `psadbw`, in groups of three vectors, with a 16-byte step before the
+ * byte tail: 3.14 us/pair -> 1.54 on a Xeon E5-2680 v3, and no ISA flag or runtime
+ * dispatch is involved. `neq16x` and `BAIL_VECTORS` below carry the numbers, including
+ * why AVX2 is not built.
  */
 #ifndef ZNA_MERGE_CORE_HPP
 #define ZNA_MERGE_CORE_HPP
@@ -48,8 +57,11 @@
 
 // 16-byte vectors are baseline on every target we build for: NEON on aarch64, SSE2 on
 // x86-64 (part of the base ISA -- no -march flag, no runtime check). Anything wider is
-// not baseline and, per §6.1, is not obviously faster either: the scan is
-// rejection-dominated, so the bail interval matters more than the vector width.
+// not baseline, and as of 0.5.2 is measured NOT faster rather than merely "not obviously
+// faster": with the reduction done right (`neq16x`), a 32-byte AVX2 kernel came in at
+// 1.556 us/pair against baseline SSE2's 1.539. The scan is rejection-dominated, so the
+// bail interval and the cost of the horizontal reduction matter; the vector width does
+// not. docs/ROADMAP.md has the sweep.
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #  include <arm_neon.h>
 #  define ZNA_MERGE_V16 1
@@ -62,10 +74,19 @@ namespace zna_merge {
 
 /// Population count of a 16-bit mask, the portable fold.
 ///
-/// Always compiled, on every platform, even where `popcount16` below does not call it --
-/// otherwise the only build that exercises it is the only build that cannot test it.
+/// **Nothing in the scan calls this any more**, and the reason is the point. It existed
+/// for `neq16`, which reduced each vector compare with `pmovmskb` + a popcount; the x86
+/// kernel now reduces with `psadbw` (see `neq16x`) and needs no popcount at all. It is
+/// kept, exported and tested because the lesson it encodes outlived its caller: a
+/// popcount that *requires* POPCNT -- `__builtin_popcount` without `-mpopcnt`, or MSVC's
+/// `__popcnt16` -- is not a free primitive on a baseline x86-64 build. GCC turns the
+/// first into `callq __popcountdi2@plt`, which is what cost the 0.5.1 kernel 1.88x; the
+/// second would emit the instruction itself and fault on any pre-Nehalem CPU. If a
+/// future kernel wants a 16-bit popcount, this is the one to use.
+///
 /// `tests/test_merge.py::TestPopcount` checks it against Python's own bit count over all
-/// 65,536 inputs, from whichever platform the suite happens to run on.
+/// 65,536 inputs, from whichever platform the suite happens to run on -- which is why it
+/// is compiled on every platform rather than only where it would be selected.
 inline int popcount16_portable(unsigned x) noexcept {
     x &= 0xFFFFu;
     x -= (x >> 1) & 0x5555u;                     // pairs
@@ -74,46 +95,82 @@ inline int popcount16_portable(unsigned x) noexcept {
     return static_cast<int>((x * 0x0101u) >> 8) & 0xFFu;   // sum the two bytes
 }
 
-/// Population count of a 16-bit mask, with **no ISA requirement**.
+/// Number of differing bytes across `V` consecutive 16-byte windows.
 ///
-/// `__builtin_popcount` is a GCC/Clang extension. MSVC does not have it, and the first
-/// Windows build of this extension failed on exactly that -- C3861, at the `neq16` line
-/// below -- because `zna merge` is new in 0.4.0 and no MSVC had ever compiled this file.
+/// One horizontal reduction for the whole group, not one per vector. The per-lane
+/// equality flags are accumulated in a vector register first -- `V` stays well under
+/// 255, so a byte lane cannot overflow -- and folded once at the end. That is the shape
+/// the NEON path always wanted (`vaddvq_u8` is the expensive instruction, not
+/// `vaddq_u8`) and the shape that lets x86 drop `popcount` entirely.
 ///
-/// MSVC's `__popcnt16` is **not** the fix. It compiles to the POPCNT instruction, which
-/// is SSE4.2-era and not baseline x86-64, so the wheel would build cleanly and then
-/// fault with an illegal instruction on an older CPU. A compile error on a machine we
-/// control beats a crash on a machine we do not.
-inline int popcount16(unsigned x) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-    // Cheap even without -mpopcnt: the compiler emits a table or a SWAR sequence, and
-    // only emits POPCNT itself when the ISA is enabled explicitly.
-    return __builtin_popcount(x & 0xFFFFu);
-#else
-    return popcount16_portable(x);
-#endif
-}
-
-/// Number of differing bytes in a 16-byte window. Unaligned loads are penalty-free on
-/// every target of interest.
-inline int neq16(const uint8_t* a, const uint8_t* b) noexcept {
+/// **x86 reduces with `psadbw`, not `pmovmskb` + `popcount`.** `psadbw` is baseline
+/// SSE2 -- no `-march`, no runtime dispatch, no CPUID -- and is the exact analogue of
+/// NEON's `vaddvq_u8`. The kernel it replaces called libgcc's `__popcountdi2` through
+/// the PLT twice per 32 bases, because POPCNT is SSE4.2-era and this file is compiled
+/// for baseline x86-64. Measured on 50,000 real pairs, full pruned scans, Xeon E5-2680
+/// v3 (Haswell), g++ -O3 with no ISA flags: **3.14 us/pair before, 1.54 after (2.04x)**.
+/// The same source with `-march=native` and 32-byte AVX2 vectors reaches 1.556 -- i.e.
+/// *no better than baseline SSE2 with the right reduction* -- which is why no AVX2 path
+/// and no dispatch machinery is built. See docs/ROADMAP.md, 0.4.2.
+template <int V>
+inline int neq16x(const uint8_t* a, const uint8_t* b) noexcept {
+    static_assert(V >= 1 && V <= 255, "byte-lane accumulator would overflow");
 #if defined(__ARM_NEON) || defined(__aarch64__)
-    const uint8x16_t eq = vceqq_u8(vld1q_u8(a), vld1q_u8(b));
-    // vceqq gives 0xFF per equal lane; mask to 1 and sum, so the total cannot overflow
-    // a byte lane (16 lanes, max 16).
-    return 16 - static_cast<int>(vaddvq_u8(vandq_u8(eq, vdupq_n_u8(1))));
+    const uint8x16_t one = vdupq_n_u8(1);
+    uint8x16_t acc = vdupq_n_u8(0);              // per-lane count of EQUAL bytes
+    for (int j = 0; j < V; ++j) {
+        const uint8x16_t eq = vceqq_u8(vld1q_u8(a + j * 16), vld1q_u8(b + j * 16));
+        acc = vaddq_u8(acc, vandq_u8(eq, one));  // vceqq gives 0xFF per equal lane
+    }
+    return 16 * V - static_cast<int>(vaddvq_u8(acc));
 #elif defined(ZNA_MERGE_V16)
-    __m128i va, vb;
-    std::memcpy(&va, a, 16);
-    std::memcpy(&vb, b, 16);
-    const int mask = _mm_movemask_epi8(_mm_cmpeq_epi8(va, vb));
-    return 16 - popcount16(static_cast<unsigned>(mask));
+    __m128i acc = _mm_setzero_si128();           // per-lane count of EQUAL bytes
+    for (int j = 0; j < V; ++j) {
+        __m128i va, vb;
+        std::memcpy(&va, a + j * 16, 16);
+        std::memcpy(&vb, b + j * 16, 16);
+        // cmpeq gives 0x00/0xFF; 0xFF is -1 as int8, so SUBTRACTING it adds 1 per equal
+        // lane -- two instructions per vector, and no constant to keep live.
+        acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(va, vb));
+    }
+    // psadbw against zero sums the 16 unsigned byte lanes into two 64-bit halves.
+    const __m128i sad = _mm_sad_epu8(acc, _mm_setzero_si128());
+    const int eq = _mm_cvtsi128_si32(sad) + static_cast<int>(_mm_extract_epi16(sad, 4));
+    return 16 * V - eq;
 #else
     int d = 0;
-    for (int k = 0; k < 16; ++k) d += (a[k] != b[k]);
+    for (int k = 0; k < 16 * V; ++k) d += (a[k] != b[k]);
     return d;
 #endif
 }
+
+/// Number of differing bytes in one 16-byte window.
+///
+/// Kept as its own name because it is the scan's *tail* step and because
+/// `tests/test_merge.py` pins `VECTOR_WIDTH` at 16.
+inline int neq16(const uint8_t* a, const uint8_t* b) noexcept {
+    return neq16x<1>(a, b);
+}
+
+/// 16-byte vectors between bail checks in `shift_score`.
+///
+/// A hardware property, not an algorithm property, so it is set per ISA and each value
+/// is the measured optimum on that ISA. Changing it cannot change the scan's answer --
+/// the mismatch count is monotone in `k`, so "over budget at some checkpoint" and "over
+/// budget at the end" are the same predicate however the checkpoints are spaced -- so
+/// this is purely a pruning schedule.
+///
+///   * **3 (48 bases) on x86-64.** 1.539 us/pair against 1.754 at 2 and 1.542 at 4
+///     (g++ 8.5 -O3, 50k real pairs); g++ 13.2 agrees on the ordering.
+///   * **2 (32 bases) on aarch64**, which is what was measured on Apple silicon when the
+///     kernel was written: 32 bases beat both 16 and 64 there. Left alone deliberately --
+///     no aarch64 machine was available for this round, and the grouped reduction above
+///     may well have moved the optimum. Re-measure before changing it.
+#if defined(__ARM_NEON) || defined(__aarch64__)
+constexpr int BAIL_VECTORS = 2;
+#else
+constexpr int BAIL_VECTORS = 3;
+#endif
 
 constexpr int64_t REJECT = -(static_cast<int64_t>(1) << 62);
 
@@ -135,11 +192,21 @@ inline int64_t shift_score(const uint8_t* s1, const uint8_t* s2rc,
     int64_t d = 0;
     int k = 0;
 #ifdef ZNA_MERGE_V16
-    // Two vectors between bail checks. Measured optimum: 32 bases beats 16 (too much
-    // branching) and 64 (too much work past the point of rejection). The guard is
-    // `k + 32 <= n`, so the loop never reads a byte the caller did not supply.
-    for (; k + 32 <= n; k += 32) {
-        d += neq16(a + k, b + k) + neq16(a + k + 16, b + k + 16);
+    // Vector groups, bailing between groups; then single vectors; then bytes. Every
+    // guard is `k + <step> <= n`, so no loop reads a byte the caller did not supply.
+    //
+    // The middle loop is what makes a wide bail interval affordable. Without it the
+    // group loop's leftover -- up to 16*BAIL_VECTORS-1 bases, 47 of a 150 bp read --
+    // falls to the byte loop, and a wider interval pays for its cheaper reduction with
+    // a longer scalar tail. With it the tail is under 16 bases whatever the interval,
+    // which is worth a further 1.08x on x86 (1.664 us/pair -> 1.539).
+    constexpr int GROUP = 16 * BAIL_VECTORS;
+    for (; k + GROUP <= n; k += GROUP) {
+        d += neq16x<BAIL_VECTORS>(a + k, b + k);
+        if (d > dmax) return REJECT;
+    }
+    for (; k + 16 <= n; k += 16) {
+        d += neq16(a + k, b + k);
         if (d > dmax) return REJECT;
     }
 #endif
