@@ -1,15 +1,21 @@
 """zna read-merge: overlap-merge paired-end reads for ZNA / LLM pretraining.
 
 Replaces the fastp PE-merge step. Every pair is scored once, over one axis of candidate
-fragment lengths, as a log-likelihood ratio in bits against chance alignment; the
-best-scoring shift is then read at two thresholds:
+fragment lengths, as a log-likelihood ratio in bits against chance alignment, and the
+best-scoring shift is then either **merged** or the pair is **kept** whole
+(``docs/archive/MERGE_ACCURACY_PLAN.md`` §2):
 
-* **merge** (``score >= t_merge``) — an overlapping pair becomes one full-fragment
-  sequence,
-* **trim** (``t_trim <= score < t_merge``) — the overlap is real but not worth risking a
-  chimera, so both reads are kept and R2's redundant 3' bases are cut (the overlapping
-  bases are not counted twice in pretraining),
-* **keep** (``score < t_trim``) — both reads unchanged.
+* **merge** — the best shift reaches the pair's floor ``T = log2((len1 + len2 - 1) /
+  alpha)`` and its mismatches are plausible as sequencing error at the same ``alpha``
+  (a repeat outscoring the true overlap is not) -> one full-fragment sequence;
+* **keep** — anything else -> both reads unchanged.
+
+The error rate the score and the plausibility test use is ``--error-rate`` (default
+0.01), a documented setting rather than an estimate; each run reports the disagreement
+its detected overlaps actually show, and warns when at that disagreement the
+plausibility test is expected to refuse more than 0.1% of true overlaps.
+``--adapter-trimmed`` declares that no read runs past its molecule, which makes
+read-through alignments impossible.
 
 Output is a single **mixed interleaved** FASTQ stream (merged reads as singles with the
 pair suffix stripped; unmerged pairs as adjacent ``/1``,``/2`` records) consumed by
@@ -34,6 +40,7 @@ __all__ = [
     "PairOutcome",
     "process_pair",
     "find_overlap",
+    "scan_unrestricted",
     "reverse_complement",
     "score_weights",
     "threshold_bits",
@@ -47,6 +54,7 @@ _LAZY = {
     "PairOutcome": ".pairs",
     "process_pair": ".pairs",
     "find_overlap": ".overlap",
+    "scan_unrestricted": ".overlap",
     "reverse_complement": ".overlap",
     "score_weights": ".params",
     "threshold_bits": ".params",

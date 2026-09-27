@@ -1,21 +1,23 @@
-"""Per-pair classification and merged/trimmed sequence construction.
+"""Per-pair classification and merged-sequence construction.
 
 This module is the public interface; the work happens in the selected backend —
 :mod:`zna.merge._pymerge` (the reference oracle) or the accelerated extension. All
 sequences are ``bytes``; headers carry no leading ``@`` and no newline.
 
-The decision reads **one** likelihood-ratio score (from :mod:`overlap`, in the
-fixed-point scale of :mod:`params`) at **two** thresholds, because a wrong merge and a
-wrong trim cost different amounts: a wrong merge produces a chimera — actively false
-sequence — while a wrong trim removes a few real bases from a read tail. See
-``docs/METHODS.md``.
+A pair has two outcomes (``docs/archive/MERGE_ACCURACY_PLAN.md`` §2): **merged** into one
+full-fragment record when :func:`zna.merge.overlap.find_overlap`'s verdict is
+``merge``, otherwise **kept** as its two mates, unchanged apart from the N policy. 0.5.x
+had a third, a trim band that cut the redundant overlap off both mates' 3' ends; it
+removed ~0.55 duplicated bases per pair while causing every wrong trim, and is gone.
 
 The emitted overlap comes from R1, but where the two mates *disagree* the base is
-resolved by posterior from the two Phred scores — the §7 quality-aware consensus the
-redesign wanted, which removed the last of fastp's tuning knobs. Its table lives in
-:mod:`params`, built once in Python and handed to whichever backend runs.
+resolved by posterior from the two Phred scores — the quality-aware consensus that
+removed the last of fastp's tuning knobs. Its table lives in :mod:`params`, built once
+in Python and handed to whichever backend runs.
 """
 from __future__ import annotations
+
+from typing import NamedTuple
 
 from . import backend as _backend
 from .names import base_name  # noqa: F401  (re-exported: callers look for it here)
@@ -25,40 +27,67 @@ from .params import DISAGREE_Q, MergeParams  # noqa: F401  (MergeParams re-expor
 class PairOutcome:
     """Decision categories (for statistics)."""
     MERGED = "merged"
-    TRIMMED = "trimmed"
     KEPT = "kept"
 
 
 #: Backends return an integer outcome; this maps it back. Index order must match the
-#: MERGED/TRIMMED/KEPT constants in _pymerge and merge_core.hpp.
-_OUTCOMES = (PairOutcome.MERGED, PairOutcome.TRIMMED, PairOutcome.KEPT)
+#: MERGED/KEPT constants in _pymerge and merge_core.hpp.
+_OUTCOMES = (PairOutcome.MERGED, PairOutcome.KEPT)
 
 
-def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None):
-    """Classify one pair and build output records.
+class PairResult(NamedTuple):
+    """What :func:`process_pair` did with one pair.
 
-    ``counters`` (optional list of two ints) accumulates ``[bases_consensus_changed,
-    trim_guard_kept]``; leave ``None`` to skip counting.
-
-    Returns ``(records, outcome, n_dropped, score, olen, diff)``:
-
-    * ``records`` — list of ``(header, seq, qual)`` bytes triples to emit (after the
-      minimum-read-length filter). A MERGED result is one single; a KEPT/TRIMMED result
-      is a two-record mate pair, emitted all-or-nothing.
+    * ``records`` — ``(header, seq, qual)`` bytes triples to emit (after the
+      minimum-read-length filter). A MERGED result is one single; a KEPT result is a
+      two-record mate pair, emitted all-or-nothing.
     * ``outcome`` — a :class:`PairOutcome` value.
     * ``n_dropped`` — reads removed by the length filter.
-    * ``score`` — the winning shift's log-likelihood ratio as a fixed-point integer
-      (0 if nothing reached ``t_trim``). See :mod:`zna.merge.params`.
-    * ``olen``/``diff`` — the winning overlap's length and mismatch count (0 if none).
-      Their ratio, accumulated over a library, is a direct calibration check on
-      ``err_rate``: it should sit near it, and a chance-alignment regime drives it up.
+    * ``score``, ``olen``, ``diff``, ``shift`` — the alignment the pair was merged
+      from: fixed-point score (:mod:`zna.merge.params`), overlap length, mismatches and
+      signed shift (fragment length ``shift + len(R2)``). All 0 when no overlap was
+      admitted -- including when one was refused as implausible.
+    * ``implausible`` — the best alignment reached the floor but failed the
+      plausibility gate, so the pair was kept.
+    * ``detected_bases``, ``detected_mismatches`` — informative positions and
+      informative mismatches of the best alignment whenever it reached the floor,
+      merged or refused (0 when nothing did): the overlap as detected, BEFORE the gate.
+    * ``detected_overlap_len`` — that alignment's length (0 when nothing reached the
+      floor): the ``n`` the gate looked ``dfit[n]`` up at.
+
+    Over a library ``sum(diff) / sum(olen)`` is the post-admission disagreement rate,
+    reported as ``overlap_mismatch_rate``, and ``sum(detected_mismatches) /
+    sum(detected_bases)`` the pre-gate one ``--error-rate`` is checked against,
+    ``detected_overlap_mismatch_rate``; the histogram of ``detected_overlap_len``,
+    with that rate, gives ``expected_refused_true_overlap_fraction``.
     """
-    (records, outcome, n_dropped, score, olen, diff,
-     n_consensus, trim_guard, _npolicy_bases, _n_rescued) = _backend.active().process_pair(
-        h1, s1, q1, h2, s2, q2,
-        p.match_q, p.step_q, p.t_merge_q, p.t_trim_q, p.min_read_length, DISAGREE_Q,
+    records: list
+    outcome: str
+    n_dropped: int
+    score: int
+    olen: int
+    diff: int
+    shift: int
+    implausible: bool
+    detected_bases: int
+    detected_mismatches: int
+    detected_overlap_len: int
+
+
+def process_pair(h1, s1, q1, h2, s2, q2, p: MergeParams, counters=None) -> PairResult:
+    """Classify one pair and build output records under ``p``.
+
+    ``counters`` (optional list of two ints) accumulates ``[bases_consensus_changed,
+    implausible_refused]``; leave ``None`` to skip counting.
+    """
+    p.ensure(max(len(s1), len(s2)))
+    (records, outcome, n_dropped, shift, score, olen, diff, n_consensus, implausible,
+     _npolicy_bases, _n_rescued, det_bases, det_mismatches,
+     _rt, det_len) = _backend.active().process_pair(
+        h1, s1, q1, h2, s2, q2, *p.kernel_args(), p.min_read_length, DISAGREE_Q,
         p.npolicy_code, p.rng_seed)
     if counters is not None:
         counters[0] += n_consensus
-        counters[1] += trim_guard
-    return records, _OUTCOMES[outcome], n_dropped, score, olen, diff
+        counters[1] += implausible
+    return PairResult(records, _OUTCOMES[outcome], n_dropped, score, olen, diff, shift,
+                      bool(implausible), det_bases, det_mismatches, det_len)

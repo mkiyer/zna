@@ -7,7 +7,9 @@
 // allocator actually enforces.
 //
 // Every read here is placed so that its LAST byte is the last byte of its allocation,
-// which is what makes a one-byte overread trap instead of landing in slack.
+// which is what makes a one-byte overread trap instead of landing in slack. The 0.6
+// policy tables are allocated the same way, exactly as long as their capacity, so a
+// T or dfit lookup one past the end traps too.
 //
 //   c++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 //       -I../../src/zna/merge -o asan_scan asan_scan.cpp && ./asan_scan
@@ -29,7 +31,31 @@ constexpr int64_t MATCH_Q = 33311170;
 constexpr int64_t STEP_Q = 137813407;
 constexpr int64_t FLOOR_Q = 8 * (1 << 24);
 
+/// Capacity of the policy tables: the longest read below. T_q[N] needs N = len1 + len2
+/// - 1 < 2 * CAP entries, dfit[n] needs n <= CAP.
+constexpr size_t CAP = 2048;
+
 long long checks = 0;
+
+/// Exactly-sized tables (see the header comment). The values are plausible, not exact --
+/// a 28-bit floor and dfit ~ n/16 -- since only the indexing is under test here.
+struct OwnedTables {
+    int64_t* t;
+    int64_t* d;
+    zna_merge::Tables tab;
+    OwnedTables() {
+        t = static_cast<int64_t*>(std::malloc(2 * CAP * sizeof(int64_t)));
+        d = static_cast<int64_t*>(std::malloc((CAP + 1) * sizeof(int64_t)));
+        for (size_t i = 0; i < 2 * CAP; ++i) t[i] = 28 * (int64_t(1) << 24);
+        for (size_t i = 0; i <= CAP; ++i) d[i] = static_cast<int64_t>(i / 16);
+        tab = {t, 2 * CAP, d, CAP + 1};
+    }
+    ~OwnedTables() { std::free(t); std::free(d); }
+};
+const OwnedTables& tables() {
+    static const OwnedTables o;
+    return o;
+}
 
 /// Exactly-sized heap buffers, so ASAN's redzones sit immediately after the data.
 void run(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
@@ -37,10 +63,18 @@ void run(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     uint8_t* p2 = static_cast<uint8_t*>(std::malloc(b.size() ? b.size() : 1));
     if (!a.empty()) std::memcpy(p1, a.data(), a.size());
     if (!b.empty()) std::memcpy(p2, b.data(), b.size());
-    volatile auto r = zna_merge::scan(p1, static_cast<int>(a.size()),
-                                      p2, static_cast<int>(b.size()),
-                                      MATCH_Q, STEP_Q, FLOOR_Q);
-    (void)r;
+    for (bool at : {false, true}) {
+        volatile auto r = zna_merge::scan(p1, static_cast<int>(a.size()),
+                                          p2, static_cast<int>(b.size()),
+                                          MATCH_Q, STEP_Q, FLOOR_Q, at);
+        (void)r;
+        if (a.size() <= CAP && b.size() <= CAP) {
+            volatile auto dec = zna_merge::decide(p1, static_cast<int>(a.size()),
+                                                  p2, static_cast<int>(b.size()),
+                                                  MATCH_Q, STEP_Q, tables().tab, at);
+            (void)dec;
+        }
+    }
     std::free(p1);
     std::free(p2);
     ++checks;
@@ -103,9 +137,8 @@ int main() {
     // The parser is where the audit's raw-blob prototype had four defects, three of
     // them out-of-bounds reads on malformed input. Feed it truncations at EVERY byte
     // offset, out of exactly-sized allocations so a one-byte overread traps.
-    const uint8_t table[256 * 256] = {};                 // contents irrelevant here
-    const zna_merge::Params params{33311170, 137813407, 28 * (1 << 24), 8 * (1 << 24),
-                                   40, table};
+    static uint8_t table[256 * 256];                     // contents irrelevant here
+    const zna_merge::Params params{MATCH_Q, STEP_Q, tables().tab, false, 40, table};
     std::string good;
     for (int i = 0; i < 6; ++i) {
         auto s = draw(rng, 60 + (size_t)(rng() % 40), "ACGT", 4);
@@ -128,7 +161,7 @@ int main() {
             size_t p1 = 0, p2 = 0;
             try {
                 zna_merge::merge_chunk(a1, cut, p1, a2, cut2, p2, params, true, 0,
-                                       sc, blob, st);
+                                       100000, sc, blob, st);
             } catch (const zna_merge::InputError&) {
                 // malformed input is supposed to raise; the point is that it does not
                 // read out of bounds on the way
@@ -153,12 +186,60 @@ int main() {
         zna_merge::ChunkStats st;
         size_t p1 = 0, p2 = 0;
         try {
-            zna_merge::merge_chunk(a1, n, p1, a1, n, p2, params, false, 0, sc, blob, st);
+            zna_merge::merge_chunk(a1, n, p1, a1, n, p2, params, false, 0, 100000, sc,
+                                   blob, st);
         } catch (const zna_merge::InputError&) {}
         std::free(a1);
         ++chunks;
     }
 
-    std::printf("asan_scan: %lld scans and %lld chunks clean\n", checks, chunks);
+    // ---- whole pairs with no-calls, every N policy, both contracts ----------------
+    //
+    // The copy-on-write buffers, the N policy's in-place substitution, and the path a
+    // merge verdict takes back to KEPT when trim3 breaks tiling (R1 re-derived from the
+    // input) all write into the scratch arena; exactly-sized reads keep them honest.
+    long long pairs = 0;
+    zna_merge::Scratch ps;
+    for (int i = 0; i < 20000; ++i) {
+        const size_t fl = 20 + rng() % 300;
+        auto frag = draw(rng, fl, "ACGT", 4);
+        const size_t l1 = 1 + rng() % 200, l2 = 1 + rng() % 200;
+        std::vector<uint8_t> s1(l1), s2(l2);
+        for (size_t k = 0; k < l1; ++k) s1[k] = k < fl ? frag[k] : 'A';
+        for (size_t k = 0; k < l2; ++k) {
+            const uint8_t c = k < fl ? frag[fl - 1 - k] : 'C';
+            s2[k] = c == 'A' ? 'T' : c == 'T' ? 'A' : c == 'C' ? 'G' : 'C';
+        }
+        for (auto* s : {&s1, &s2}) {
+            const int nn = static_cast<int>(rng() % 6);
+            for (int k = 0; k < nn; ++k) (*s)[rng() % s->size()] = 'N';
+            if (rng() % 4 == 0) (*s)[rng() % s->size()] = static_cast<uint8_t>(rng());
+        }
+        std::vector<uint8_t> q1(l1, 'I'), q2(l2, '5');
+        std::string h1 = "p" + std::to_string(i) + "/1", h2 = "p" + std::to_string(i) + "/2";
+        auto own = [](const void* src, size_t n) {
+            uint8_t* p = static_cast<uint8_t*>(std::malloc(n ? n : 1));
+            if (n) std::memcpy(p, src, n);
+            return p;
+        };
+        uint8_t* bs1 = own(s1.data(), l1); uint8_t* bq1 = own(q1.data(), l1);
+        uint8_t* bs2 = own(s2.data(), l2); uint8_t* bq2 = own(q2.data(), l2);
+        uint8_t* bh1 = own(h1.data(), h1.size()); uint8_t* bh2 = own(h2.data(), h2.size());
+        const zna_merge::Read r1{{bh1, (int)h1.size()}, {bs1, (int)l1}, {bq1, (int)l1}};
+        const zna_merge::Read r2{{bh2, (int)h2.size()}, {bs2, (int)l2}, {bq2, (int)l2}};
+        for (int npol = 0; npol < 3; ++npol) {
+            for (bool at : {false, true}) {
+                const zna_merge::Params pp{MATCH_Q, STEP_Q, tables().tab, at, 40, table,
+                                           npol, 42};
+                volatile auto r = zna_merge::process_pair(r1, r2, pp, ps, i, (i & 1) != 0);
+                (void)r;
+                ++pairs;
+            }
+        }
+        for (uint8_t* p : {bs1, bq1, bs2, bq2, bh1, bh2}) std::free(p);
+    }
+
+    std::printf("asan_scan: %lld scans, %lld chunks and %lld pairs clean\n", checks,
+                chunks, pairs);
     return 0;
 }

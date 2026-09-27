@@ -1,8 +1,20 @@
 """CLI for zna read-merge (the ``zna merge`` subcommand).
 
-Reads two positionally-synced FASTQ files, merges/trims/keeps each pair, and writes one
+Reads two positionally-synced FASTQ files, merges or keeps each pair, and writes one
 mixed interleaved FASTQ stream for ``zna encode --interleaved`` (see
 ``docs/METHODS.md``). Also invocable as ``python -m zna.merge``.
+
+Every parameter a decision uses is fixed before the first pair is read
+(:func:`params_from_args`): ``--alpha``, ``--error-rate`` and ``--adapter-trimmed``, and
+what :mod:`zna.merge.params` derives from them. The input is only ever *checked* against
+them, by two run-level diagnostics that ride along in the chunk loop and never change a
+decision (``docs/archive/MERGE_ACCURACY_PLAN.md`` §4): the disagreement rate of every overlap
+the scan detects, and from it the share of true overlaps the plausibility test is
+expected to refuse at ``--error-rate``, and the read-through share of the first
+:data:`~zna.merge.params.READTHROUGH_CHECK_PAIRS` pairs, against ``--adapter-trimmed``.
+``zna encode --merge-pairs`` reports and warns through the same functions
+(:func:`log_policy`, :func:`run_warnings`, :func:`_assemble_stats`), so the two commands
+cannot disagree about a library.
 
 All per-pair work happens inside one backend call per chunk, which releases the GIL,
 so ``--threads`` are real worker threads. Output is written in submission order and is
@@ -15,12 +27,15 @@ import logging
 import platform
 import sys
 import time
+from decimal import ROUND_CEILING, Decimal, localcontext
+from fractions import Fraction
 
 from .. import _gzip
 from . import backend as _backend
+from . import params as _params
 from .args import add_merge_arguments, add_merge_parser, build_parser  # noqa: F401
 from .fastqio import FastqWriter, InputError, _open_binary_read
-from .params import DISAGREE_Q, SCALE, score_weights, threshold_bits
+from .params import DISAGREE_Q, SCALE, decimal_str, score_weights
 from .pairs import MergeParams
 
 logger = logging.getLogger("zna.merge")
@@ -33,14 +48,14 @@ logger = logging.getLogger("zna.merge")
 # its whole duration. That is what makes worker THREADS worth having where the previous
 # design needed worker processes, and it deletes the fork context, the pickling of
 # chunks and blobs, the per-worker globals, and the sparse-histogram workaround that
-# only existed because dense ones were being pickled 
+# only existed because dense ones were being pickled
 # --------------------------------------------------------------------------- #
 
-#: Counter fields, in the order every backend returns them.
-_N_COUNTERS = 15
-(_N_PAIRS, _MERGED, _TRIMMED, _KEPT, _EMITTED, _DROPPED, _BASES_TRIMMED,
- _FRAGS_SHORT, _BASES_CONSENSUS, _TRIM_GUARD, _SUM_OLEN, _SUM_DIFF,
- _MAX_READ_LEN, _NPOLICY_BASES, _N_RESCUED) = range(_N_COUNTERS)
+#: Counter fields, in the order every backend returns them (``_pymerge._Tally``).
+_N_COUNTERS = 16
+(N_PAIRS, MERGED, KEPT, EMITTED, DROPPED, FRAGS_SHORT, BASES_CONSENSUS,
+ IMPLAUSIBLE, SUM_OLEN, SUM_DIFF, MAX_READ_LEN, NPOLICY_BASES,
+ N_RESCUED, DET_BASES, DET_MISMATCHES, RT_STRONG) = range(_N_COUNTERS)
 
 #: Reads longer than this get one informational line. The scan is O(L^2), so a
 #: long-read FASTQ fed here by accident is slow rather than wrong, and saying so once
@@ -49,27 +64,29 @@ _LONG_READ_NOTICE = 1024
 
 
 def _new_acc():
-    return ([0] * _N_COUNTERS, [], [], [])
+    """``(counters, len_hist, olen_hist, insert_hist, det_olen_hist)``."""
+    return ([0] * _N_COUNTERS, [], [], [], [])
 
 
-def _fold(counters, len_hist, olen_hist, insert_hist, acc):
+def _fold(counters, len_hist, olen_hist, insert_hist, det_olen_hist, acc):
     """Fold one chunk's statistics into the accumulator, in place.
 
     The histograms are uncapped and both backends return them with trailing zero bins
     dropped, so a chunk carrying a longer read than anything seen before extends the
     accumulator. Bin *i* is the count of value *i* in every one of them.
     """
-    ac, al, ao, ai = acc
-    for i in range(_MAX_READ_LEN):
+    ac, al, ao, ai, ad = acc
+    for i in range(MAX_READ_LEN):
         ac[i] += counters[i]
-    if counters[_MAX_READ_LEN] > ac[_MAX_READ_LEN]:      # a maximum, not a sum
-        ac[_MAX_READ_LEN] = counters[_MAX_READ_LEN]
+    if counters[MAX_READ_LEN] > ac[MAX_READ_LEN]:      # a maximum, not a sum
+        ac[MAX_READ_LEN] = counters[MAX_READ_LEN]
     # Everything past the maximum is a plain sum again. Adding a counter without
     # extending this loop silently reports zero -- which is how the first version of the
     # N-policy counters read 0 on input that definitely had no-calls.
-    for i in range(_MAX_READ_LEN + 1, _N_COUNTERS):
+    for i in range(MAX_READ_LEN + 1, _N_COUNTERS):
         ac[i] += counters[i]
-    for src, dst in ((len_hist, al), (olen_hist, ao), (insert_hist, ai)):
+    for src, dst in ((len_hist, al), (olen_hist, ao), (insert_hist, ai),
+                     (det_olen_hist, ad)):
         if len(src) > len(dst):
             dst.extend([0] * (len(src) - len(dst)))
         for i, c in enumerate(src):
@@ -157,14 +174,223 @@ class _RawStream:
                     f"pigz failed reading {self._path} (exit {self._proc.returncode})")
 
 
+# --------------------------------------------------------------------------- #
+# the diagnostics: what the run says about its own parameters
+# --------------------------------------------------------------------------- #
+
+#: Measured share of pairs whose unrestricted best alignment is a strong read-through:
+#: ~0.1% where ``--adapter-trimmed`` is honest, 2-23% where it is false. 1% separates
+#: them. Exact, like the other comparisons against a threshold.
+_WARN_READTHROUGH = Fraction(1, 100)
+
+
+#: The ``--error-rate`` warning fires when the plausibility test is expected to refuse
+#: more than this share of the run's true overlaps: one in a thousand. A documented
+#: definition, not a fit. For scale, at the default ``e``: the test's own promise is
+#: ``alpha`` (1e-6) at the declared rate; a library at the rate the default was measured
+#: on (~0.009 detected) expects 1.3e-7; on the dev panel's 46 benches only the extreme
+#: 5% 3'-ramp set crosses it (0.0355 detected, 0.40% expected), and the next highest
+#: expects 0.017% (R2 at 10x the error, 0.0228 detected). The trigger it replaced,
+#: "detected rate above ``e``", fired on 12 of the 46, ten of them expecting under
+#: 0.02%. Exact, like the other thresholds.
+_WARN_REFUSED = Fraction(1, 1000)
+
+
+def refusal_probability(n: int, dfit_n: int, rate: Fraction) -> Decimal:
+    """``P(Binom(n, rate) > dfit_n)``: the chance that a TRUE overlap of *n* bases
+    whose mates disagree at *rate* per base carries more mismatches than the
+    plausibility test allows, and is refused.
+
+    The upper tail, summed directly rather than as one minus the lower tail, so a tiny
+    probability keeps its digits instead of cancelling against 1. Terms are built by the
+    pmf recurrence ``p(k+1) = p(k) (n-k)/(k+1) r/(1-r)`` from ``p(0) = (1-r)^n``, in
+    :mod:`decimal` at the 50 digits the policy tables use (software, the same result on
+    every platform), and the sum stops past the mode once a term no longer changes it.
+    A diagnostic, never a decision.
+    """
+    if dfit_n >= n or rate <= 0:
+        return Decimal(0)
+    if rate >= 1:
+        return Decimal(1)
+    with localcontext(_params._CTX):
+        r = Decimal(rate.numerator) / Decimal(rate.denominator)
+        q = 1 - r
+        ratio = r / q
+        mode = rate * n
+        pmf = q ** n
+        tail = Decimal(0)
+        for k in range(n + 1):
+            if k > dfit_n:
+                grown = tail + pmf
+                if grown == tail and k > mode:
+                    break
+                tail = grown
+            pmf = pmf * (n - k) / (k + 1) * ratio
+        return tail
+
+
+def expected_refused_fraction(rate: Fraction, det_olen_hist, dfit_table) -> Decimal:
+    """The share of the run's detected overlaps the plausibility test is expected to
+    refuse if every one of them were TRUE and disagreed at *rate*::
+
+        sum_n  count[n] * P(Binom(n, rate) > dfit[n])  /  sum_n count[n]
+
+    over the histogram of detected overlap lengths (bin *n* = overlaps of *n* bases).
+    *rate* is the run's detected disagreement, before the gate; *dfit_table* must cover
+    the longest detected overlap. Counts may be weights (floats): the panel evaluation
+    projects a weighted sample through this same function. 0 when nothing was detected.
+
+    What it answers is the question ``--error-rate`` poses -- how many true overlaps a
+    too-low setting costs -- in the currency of the plan's §8 closed form, rather than
+    "is the detected rate above the setting", which fires on every clean library whose
+    repeats nudge the rate past it (hg38-noisy at full scale: 0.0051 detected at 0.0041 true) and says
+    nothing about how much is lost. It inherits the detected rate's biases in both
+    directions (see ``detected_overlap_mismatch_rate`` in :func:`_assemble_stats`), and
+    it treats every detected overlap as true, which repeats are not.
+    """
+    total = sum(det_olen_hist)
+    if not total:
+        return Decimal(0)
+    with localcontext(_params._CTX):
+        acc = Decimal(0)
+        for n, c in enumerate(det_olen_hist):
+            if c:
+                acc += Decimal(c) * refusal_probability(n, dfit_table[n], rate)
+        return acc / Decimal(total)
+
+
+def run_refused_fraction(acc, params: MergeParams) -> Decimal:
+    """:func:`expected_refused_fraction` for a finished run, at its exact detected
+    rate (the reported ``detected_overlap_mismatch_rate`` is this rounded)."""
+    c, det_hist = acc[0], acc[4]
+    if not c[DET_BASES] or not det_hist:
+        return Decimal(0)
+    params.ensure(len(det_hist) - 1)
+    return expected_refused_fraction(Fraction(c[DET_MISMATCHES], c[DET_BASES]),
+                                     det_hist, params.dfit_table)
+
+
+def readthrough_check_pairs(acc) -> int:
+    """How many pairs the ``--adapter-trimmed`` check covered: the input's first
+    :data:`~zna.merge.params.READTHROUGH_CHECK_PAIRS`, or all of them."""
+    return min(acc[0][N_PAIRS], _params.READTHROUGH_CHECK_PAIRS)
+
+
+def _suggest_error_rate(rate: Fraction):
+    """*rate* as a value to pass back: two significant figures, rounded UP, so the
+    suggestion is never below what the data showed ("0.0137..." -> "0.014"). None when
+    that is not a value ``--error-rate`` accepts (``>= 0.75``: overlaps that disagree
+    that much agree no better than chance, and no setting describes them)."""
+    d = _params._CTX.divide(Decimal(rate.numerator), Decimal(rate.denominator))
+    q = d.quantize(Decimal(1).scaleb(d.adjusted() - 1), rounding=ROUND_CEILING)
+    if q >= Decimal("0.75"):
+        return None
+    return format(q.normalize(), "f")
+
+
+def min_mergeable_overlap(acc, params: MergeParams) -> int:
+    """The shortest CLEAN overlap that reaches the floor for a pair of the run's longest
+    reads, ``ceil(T(2 * max_read_len - 1) / match_bits)`` (0 on an empty run). Shorter
+    reads need slightly less, as the floor rises with the number of shifts."""
+    longest = acc[0][MAX_READ_LEN]
+    if not longest:
+        return 0
+    return -(-params.t_q(2 * longest - 1) // params.match_q)
+
+
+def run_warnings(acc, params: MergeParams) -> list[str]:
+    """What the finished run says about its own parameters, one message each.
+
+    Diagnostics, never decisions: all are computed alongside the merge and none changed a
+    pair. Called at the END of a run by both ``zna merge`` and ``zna encode
+    --merge-pairs``, because the disagreement rate is over the whole input.
+
+    **The ``--error-rate`` warning** fires when the plausibility test is expected to
+    refuse more than :data:`_WARN_REFUSED` of the run's true overlaps
+    (:func:`run_refused_fraction`), and it states the trade rather than just the fix.
+    Raising the rate is what stops the gate refusing true overlaps, but the same number
+    sets the score's mismatch cost, so it also merges more short or divergent overlaps,
+    false ones included -- and on the dev panel's 3'-ramp sets that cost outweighed the
+    gain (MERGE_ACCURACY_PLAN.md §3). The refused count is in the message because it
+    bounds what raising the rate can recover.
+    """
+    c = acc[0]
+    out = []
+    det_d, det_n = c[DET_MISMATCHES], c[DET_BASES]
+    refused = run_refused_fraction(acc, params)
+    if Fraction(refused) > _WARN_REFUSED:
+        rate = Fraction(det_d, det_n)
+        suggestion = _suggest_error_rate(rate)
+        if suggestion is None:
+            advice = ("No --error-rate describes overlaps that disagree this much (it "
+                      "must be below 0.75): these reads do not behave like overlapping "
+                      "mates.")
+        elif rate > params.e:
+            advice = (
+                f"Rerun with --error-rate {suggestion} (the detected rate, rounded up) "
+                f"to recover them -- but the rate also sets how little a mismatch costs "
+                f"in the score, so more short or divergent overlaps merge too, false "
+                f"ones included (a simulated 3'-degraded library: 240 wrong merges at "
+                f"0.01, 745 at 0.036). Raise it only if the refused pairs matter more "
+                f"than that.")
+        else:
+            # Only reachable with a large --alpha: at a rate within the setting the
+            # test refuses a true overlap with probability below alpha, by construction.
+            advice = (
+                f"The detected rate is within --error-rate, so this is --alpha "
+                f"{decimal_str(params.alpha_exact)} itself: the test refuses up to that "
+                f"share of true overlaps by design. A smaller --alpha refuses fewer.")
+        out.append(
+            f"the overlaps this run detected disagree at {float(rate):.4g} (informative "
+            f"mismatches per compared base, {det_d} in {det_n}, before the plausibility "
+            f"test), so at --error-rate {decimal_str(params.e)} the test is expected to "
+            f"refuse {100 * float(refused):.2g}% of true overlaps (warned above "
+            f"{100 * float(_WARN_REFUSED):g}%). A refused pair is kept whole, never "
+            f"merged wrongly; this run refused {c[IMPLAUSIBLE]} as implausible, true "
+            f"overlaps and repeats together. {advice}")
+    checked = readthrough_check_pairs(acc)
+    if (params.adapter_trimmed and checked
+            and Fraction(c[RT_STRONG], checked) > _WARN_READTHROUGH):
+        out.append(
+            f"--adapter-trimmed was declared, but {c[RT_STRONG] / checked:.1%} of the "
+            f"first {checked} pairs align best as a strong read-through (an honest "
+            f"declaration measures ~0.1%): the reads appear to contain adapter. The "
+            f"declaration disables read-through merges; if these reads are raw, drop the "
+            f"flag.")
+    longest = c[MAX_READ_LEN]
+    need = min_mergeable_overlap(acc, params)
+    if need > longest:
+        out.append(
+            f"no pair in this run could merge: at --alpha "
+            f"{decimal_str(params.alpha_exact)} and --error-rate {decimal_str(params.e)} "
+            f"even a perfect overlap must be {need} bases long, and the longest read is "
+            f"{longest}. Every pair was kept whole.")
+    return out
+
+
+def log_policy(params: MergeParams, emit) -> None:
+    """Report the run's policy through *emit(level, message)*, before the first pair."""
+    emit(logging.INFO,
+         f"alpha {decimal_str(params.alpha_exact)}, error rate "
+         f"{decimal_str(params.e)} (--error-rate), adapter-trimmed "
+         f"{'declared' if params.adapter_trimmed else 'not declared'}")
+
+
+# --------------------------------------------------------------------------- #
+# the chunk loop
+#
+# **Table capacity.** A chunk stops in front of a pair whose read is longer than the
+# policy tables cover and returns `need`; the driver grows the tables (doubling) and
+# resumes from where the chunk stopped. The tables' prefix does not change when they
+# grow, so the output is identical whether or not, and wherever, that happens. They
+# start at 256 bases, so a 2x150 library never regrows.
+# --------------------------------------------------------------------------- #
+
 def _run_merge(args, params):
     """Read, merge and write the whole input. Returns the accumulator."""
     backend = _backend.active()
     acc = _new_acc()
-    kwargs = (params.match_q, params.step_q, params.t_merge_q, params.t_trim_q,
-              params.min_read_length, DISAGREE_Q, not args.no_sync_check)
-    # `base_index` is appended per call by the drivers; the policy code and seed
-    # follow it.
+    check_sync = not args.no_sync_check
 
     # Bytes to keep buffered per stream. Chunks are cut to whole records, so this only
     # has to be comfortably larger than one chunk's worth of them.
@@ -180,12 +406,11 @@ def _run_merge(args, params):
         with FastqWriter(args.out, threads=args.io_threads,
                          level=args.compress_level) as w:
             if args.threads > 1:
-                _drive_threaded(backend, r1, r2, w, acc, kwargs, target,
-                                args.threads, args.chunk_size, args.quiet,
-                                params.npolicy_code, params.rng_seed)
+                _drive_threaded(backend, r1, r2, w, acc, params, check_sync,
+                                target, args.threads, args.chunk_size, args.quiet)
             else:
-                _drive_serial(backend, r1, r2, w, acc, kwargs, target, args.quiet,
-                              params.npolicy_code, params.rng_seed)
+                _drive_serial(backend, r1, r2, w, acc, params, check_sync,
+                              target, args.quiet)
         # Both streams must run out together. A non-empty leftover here is the failure
         # the audit's prototype for this shipped silently: R1 ending first left the
         # trailing R2 records unread, and the desync check cannot see records that were
@@ -218,28 +443,54 @@ def _check_drained(backend, stream, which, other):
     raise InputError(f"{other} exhausted before {which} (unequal read counts)")
 
 
-def _drive_serial(backend, r1, r2, w, acc, kwargs, target, quiet, npolicy=1,
-                  rng_seed=42):
+def _merge_args(params, check_sync, buf1, s1, e1, buf2, s2, e2, base):
+    """``merge_chunk``'s arguments, with the tables as they stand NOW.
+
+    Resolved on the main thread, at submission: the tables are only ever grown there, so
+    a worker never builds or reads a table while another thread replaces it. ``base``
+    numbers the chunk's first pair in the whole input, which is what places the
+    read-through check on the same pairs at any chunking.
+    """
+    return (buf1, s1, e1, buf2, s2, e2, *params.kernel_args(), params.min_read_length,
+            DISAGREE_Q, check_sync, base, params.npolicy_code, params.rng_seed,
+            _params.READTHROUGH_CHECK_PAIRS)
+
+
+def _drive_serial(backend, r1, r2, w, acc, params, check_sync, target, quiet):
     while True:
         r1.fill(target)
         r2.fill(target)
         if not r1.avail or not r2.avail:
             break
-        blob, c1, c2, counters, lh, oh, ih = backend.merge_chunk(
-            r1.buf, r1.pos, len(r1.buf), r2.buf, r2.pos, len(r2.buf),
-            *kwargs, acc[0][_N_PAIRS], npolicy, rng_seed)
-        if not c1 and not c2:
-            break                      # neither stream holds a complete record
+        blob, c1, c2, counters, lh, oh, ih, dh, need = backend.merge_chunk(
+            *_merge_args(params, check_sync, r1.buf, r1.pos, len(r1.buf), r2.buf,
+                         r2.pos, len(r2.buf), acc[0][N_PAIRS]))
         w.write_raw(blob)
-        _fold(counters, lh, oh, ih, acc)
+        _fold(counters, lh, oh, ih, dh, acc)
         r1.pos += c1
         r2.pos += c2
-        if not quiet and acc[0][_N_PAIRS] % 5_000_000 < 100_000:
-            logger.info("processed %d pairs", acc[0][_N_PAIRS])
+        if need:
+            params.ensure(need)        # and resume in front of the pair that needed it
+            continue
+        if not c1 and not c2:
+            break                      # neither stream holds a complete record
+        if not quiet and acc[0][N_PAIRS] % 5_000_000 < 100_000:
+            logger.info("processed %d pairs", acc[0][N_PAIRS])
 
 
-def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_size,
-                    quiet, npolicy=1, rng_seed=42):
+def _merge_job(merge_chunk, args, job):
+    """One threaded chunk: ``(merge_chunk's result, job if it stopped for capacity)``.
+
+    *args* are resolved by the caller, on the main thread (see `_merge_args`). *job*
+    comes back only when the driver must resume the chunk, so a finished chunk pins
+    no input buffer.
+    """
+    res = merge_chunk(*args)
+    return res, (job if res[-1] else None)
+
+
+def _drive_threaded(backend, r1, r2, w, acc, params, check_sync, target, n_threads,
+                    chunk_size, quiet):
     """Fan chunks out to worker threads, writing results in SUBMISSION order.
 
     Ordered output makes the file a pure function of the input and the parameters, so
@@ -248,7 +499,16 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
     is head-of-line blocking bounded by the variance in per-chunk compute time, which for
     fixed-size chunks of Illumina reads is a few percent.
 
-    Submission is windowed so the input is streamed rather than read into memory.
+    Submission is windowed so the input is streamed rather than read into memory. A
+    chunk that stopped short for table capacity is finished here, in order, on the
+    main thread -- the only thread that grows the tables.
+
+    **Only a stopped chunk keeps its input.** ``pending`` holds futures and nothing
+    else, and a worker hands its buffers back only when it stopped for capacity (see
+    `_merge_job`). `_RawStream.fill` makes a new ~2 MB buffer about once per chunk, so a
+    window that held each chunk's buffers pinned up to 2x``window`` of them: peak
+    footprint on 1M chr22 pairs went 30 / 69 / 194 MB at 1 / 4 / 16 threads, against
+    0.5.3's flat 30-36 MB, whose finished futures had already dropped their arguments.
     """
     import concurrent.futures as cf
     from collections import deque
@@ -258,9 +518,19 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
 
     def drain(upto):
         while len(pending) > upto:
-            blob, c1, c2, counters, lh, oh, ih = pending.popleft().result()
-            w.write_raw(blob)
-            _fold(counters, lh, oh, ih, acc)
+            (blob, c1, c2, counters, lh, oh, ih, dh, need), job = \
+                pending.popleft().result()
+            if need:
+                buf1, s1, e1, buf2, s2, e2, base = job
+            while True:
+                w.write_raw(blob)
+                _fold(counters, lh, oh, ih, dh, acc)
+                if not need:
+                    break
+                params.ensure(need)
+                s1, s2, base = s1 + c1, s2 + c2, base + counters[N_PAIRS]
+                blob, c1, c2, counters, lh, oh, ih, dh, need = backend.merge_chunk(
+                    *_merge_args(params, check_sync, buf1, s1, e1, buf2, s2, e2, base))
 
     with cf.ThreadPoolExecutor(max_workers=n_threads) as pool:
         submitted_pairs = 0
@@ -279,9 +549,9 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
             if k2 != k:
                 o2, _ = backend.split_records(r2.buf, r2.pos, k)
             # No slicing: the workers read [pos, o) of a buffer they share.
-            pending.append(pool.submit(backend.merge_chunk,
-                                       r1.buf, r1.pos, o1, r2.buf, r2.pos, o2,
-                                       *kwargs, submitted_pairs, npolicy, rng_seed))
+            job = (r1.buf, r1.pos, o1, r2.buf, r2.pos, o2, submitted_pairs)
+            pending.append(pool.submit(_merge_job, backend.merge_chunk,
+                                       _merge_args(params, check_sync, *job), job))
             r1.pos, r2.pos = o1, o2
             submitted_pairs += k
             drain(window)
@@ -290,18 +560,27 @@ def _drive_threaded(backend, r1, r2, w, acc, kwargs, target, n_threads, chunk_si
         drain(0)
 
 
-def _assemble_stats(acc, params, elapsed=None, inflate="unknown"):
-    counters, hist, ohist, ihist = acc
-    n_pairs = counters[_N_PAIRS]
-    merged, trimmed, kept = counters[_MERGED], counters[_TRIMMED], counters[_KEPT]
-    n_emitted, n_dropped = counters[_EMITTED], counters[_DROPPED]
-    bases_trimmed, frags_short = counters[_BASES_TRIMMED], counters[_FRAGS_SHORT]
-    bases_consensus, trim_guard = counters[_BASES_CONSENSUS], counters[_TRIM_GUARD]
-    sum_olen, sum_diff = counters[_SUM_OLEN], counters[_SUM_DIFF]
-    max_read_len = counters[_MAX_READ_LEN]
+# --------------------------------------------------------------------------- #
+# statistics
+# --------------------------------------------------------------------------- #
+
+def _assemble_stats(acc, params: MergeParams, elapsed=None, inflate="unknown"):
+    """The run's statistics. Every value is finite and of a fixed type whatever the
+    input -- hulkrna's cohort gather rejects ``Infinity`` and type changes -- so an empty
+    input reports zeros, never ``NaN``, and ratios are floats even when integral."""
+    counters, hist, ohist, ihist, dhist = acc
+    n_pairs = counters[N_PAIRS]
+    merged, kept = counters[MERGED], counters[KEPT]
+    n_emitted, n_dropped = counters[EMITTED], counters[DROPPED]
+    sum_olen, sum_diff = counters[SUM_OLEN], counters[SUM_DIFF]
+    max_read_len = counters[MAX_READ_LEN]
+    det_n, det_d = counters[DET_BASES], counters[DET_MISMATCHES]
+    rt_pairs = readthrough_check_pairs(acc)
     total_bases = sum(i * c for i, c in enumerate(hist))
     pct = (lambda n: round(100.0 * n / n_pairs, 3) if n_pairs else 0.0)
-    match_w, mismatch_w = score_weights(params.err_rate)
+    match_w, mismatch_w = score_weights(params.e)
+    min_overlap = min_mergeable_overlap(acc, params)
+    refused = run_refused_fraction(acc, params)
     import zna
     stats = {
         # Provenance: the question every future corpus defect opens with is "which
@@ -309,6 +588,7 @@ def _assemble_stats(acc, params, elapsed=None, inflate="unknown"):
         # gather's pipeline tool; only code identity was missing.
         "tool": "zna-merge",
         "tool_version": zna.__version__,
+        "policy": _params.POLICY,
         # Which kernel ran. The reference backend is ~50x slower and silently correct,
         # so a run that quietly fell back to it looks like a slow node, not a mistake.
         "backend": _backend.active_name(),
@@ -320,72 +600,93 @@ def _assemble_stats(acc, params, elapsed=None, inflate="unknown"):
         "python": platform.python_version(),
         "input_pairs": n_pairs,
         "merged": merged,
-        "trimmed_pairs": trimmed,
         "kept_pairs": kept,
         "merged_pct": pct(merged),
-        "trimmed_pct": pct(trimmed),
         "kept_pct": pct(kept),
         "emitted_records": n_emitted,
         "dropped_below_min_length": n_dropped,
-        "fragments_dropped_short_mate": frags_short,
-        "bases_trimmed": bases_trimmed,
-        "bases_consensus_changed": bases_consensus,
+        "fragments_dropped_short_mate": counters[FRAGS_SHORT],
+        "bases_consensus_changed": counters[BASES_CONSENSUS],
+        # Pairs whose best alignment reached T but whose mismatches are implausible as
+        # sequencing error at alpha: repeats, kept whole instead of merged.
+        "implausible_refused": counters[IMPLAUSIBLE],
         # What the N policy did. Reported unconditionally, because the failure this
         # guards against is silent: one dark cycle can make a policy eat most of a
         # library while the run still finishes with "Done".
         "npolicy": params.npolicy,
-        "n_rescued_from_mate": counters[_N_RESCUED],
-        "npolicy_bases": counters[_NPOLICY_BASES],
-        # A trim that would have left R2 below min_read_length; both reads kept whole
-        # instead of discarding the fragment. Expected to be ~0 (redesign §8).
-        "trim_guard_kept_untrimmed": trim_guard,
+        "n_rescued_from_mate": counters[N_RESCUED],
+        "npolicy_bases": counters[NPOLICY_BASES],
         "mean_emitted_length": round(total_bases / n_emitted, 1) if n_emitted else 0.0,
-        # Mismatches per aligned overlap base, over every detected overlap. This is a
-        # direct calibration check on err_rate: it should sit near it (~0.009 measured
-        # against the assumed 0.01). It is also the SENSITIVE degradation channel —
-        # 5% per-base degradation moves it 5x while merged_pct moves 1% — whereas
-        # merged_pct is the catastrophic one. Note it cannot approach the 0.75 of
-        # chance alignment: the threshold caps the observable rate at ~0.22.
+        # The error rate every decision used: --error-rate, exactly (the prologue's
+        # merge record carries it as a decimal string).
+        "error_rate": float(params.e),
+        # ...and what the data say about it: informative mismatches per informative
+        # compared base over EVERY overlap the scan detected (score >= T), before the
+        # plausibility gate -- merged and refused alike. It is a check, not an
+        # estimate, and it errs both ways: repeats that reached T inflate it on clean
+        # libraries (hg38-noisy at full scale: 0.0051 detected against 0.0041 true), while on a degraded one
+        # the most divergent true overlaps never reach T, so it can read below the truth
+        # (a 3'-ramp set: 0.0355 against 0.0385).
+        "detected_overlap_mismatch_rate": round(det_d / det_n, 6) if det_n else 0.0,
+        "detected_overlap_bases": det_n,
+        # What that rate costs at `error_rate`: the share of the detected overlaps the
+        # gate is expected to refuse were they all true, sum_n count[n] * P(Binom(n,
+        # rate) > dfit[n]) / sum_n count[n] over the histogram below
+        # (expected_refused_fraction). run_warnings warns above 0.001. 4 significant
+        # figures: at the default it is ~1e-7 on a library that fits it.
+        "expected_refused_true_overlap_fraction": float(format(refused, ".4g")),
+        # Every detected overlap's length, merged and refused alike -- the n the gate
+        # looked dfit[n] up at. With the rate above it reproduces the fraction.
+        "detected_overlap_length_histogram": {str(i): c for i, c in enumerate(dhist)
+                                               if c},
+        "adapter_trimmed": bool(params.adapter_trimmed),
+        # Share of the first `readthrough_check_pairs` pairs whose unrestricted best
+        # alignment is a read-through reaching T: ~0.1% on honestly trimmed input,
+        # 2-23% on raw reads. Computed with or without the declaration; only a declared
+        # run warns on it.
+        "readthrough_check_pairs": rt_pairs,
+        "readthrough_check_strong_fraction":
+            round(counters[RT_STRONG] / rt_pairs, 6) if rt_pairs else 0.0,
+        # Mismatches per aligned base over ADMITTED overlaps -- the alignments pairs
+        # were merged from, after the plausibility gate -- counting a one-sided N as a
+        # mismatch, which the detected rate above does not. Still the sensitive
+        # degradation channel: per-base degradation moves it long before merged_pct
+        # moves.
         "overlap_mismatch_rate": round(sum_diff / sum_olen, 6) if sum_olen else 0.0,
         "overlap_bases_compared": sum_olen,
-        # Longest input read. There is no read-length limit -- buffers size themselves
-        # -- but the scan is O(L^2), so this is what explains an unexpectedly slow run.
+        # Longest input read. There is no read-length limit -- buffers and tables size
+        # themselves -- but the scan is O(L^2), so this explains an unexpectedly slow run.
         "max_read_length": max_read_len,
         "params": {
-            "threshold_merge_bits": params.t_merge,
-            "threshold_trim_bits": params.t_trim,
-            "err_rate": params.err_rate,
+            "alpha": float(params.alpha_exact),
             "match_bits": round(match_w, 4),
             "mismatch_bits": round(-mismatch_w, 4),
             "min_read_length": params.min_read_length,
             # The exact integers the scan actually used. Recorded so a corpus can be
             # audited against them rather than against a float that was re-derived
-            # somewhere else with a different libm. See zna/merge/params.py.
+            # somewhere else. The per-pair floor is T_q[N] = to_q(log2(N / alpha)),
+            # reproducible from `alpha` alone; see zna/merge/params.py.
             "score_scale": SCALE,
             "match_q": params.match_q,
             "step_q": params.step_q,
-            "threshold_merge_q": params.t_merge_q,
-            "threshold_trim_q": params.t_trim_q,
         },
         "length_histogram": {str(i): c for i, c in enumerate(hist) if c},
-        # Detected overlap length per pair. This replaced a score histogram whose
-        # integer bins aliased against the 1.9855-bits-per-base quantum (a 12.6:1
-        # odd/even comb). Overlap length is the natural quantum, and the position of
-        # its short-end cliff reads --threshold-merge directly: the shortest clean
-        # overlap that can merge is ceil(t_merge / match_bits).
+        # Admitted overlap length per merged pair, in its natural quantum (bases). Its
+        # short-end cliff reads the floor directly: the shortest clean overlap that can
+        # merge is ceil(T / match_bits).
         "overlap_length_histogram": {str(i): c for i, c in enumerate(ohist) if c},
         # Inferred fragment length, merged pairs only (a merged record IS the
         # fragment). CENSORED AT BOTH ENDS, so do not read it as the library's insert
         # distribution without accounting for that: hard-floored at min_read_length
         # (shorter fragments are dropped, not observed) and hard-capped per pair at
-        # len1 + len2 - ceil(t_merge / match_bits), beyond which the mates no longer
+        # len1 + len2 - ceil(T(N) / match_bits), beyond which the mates no longer
         # overlap enough to merge.
         "insert_size_histogram": {str(i): c for i, c in enumerate(ihist) if c},
-        # Only the upper bound needs publishing: the lower one is `min_read_length`,
-        # already in `params` above, and a second copy of it here was one more thing to
-        # keep in step for no information.
+        # The cap for a pair of the run's longest reads (the floor rises with N, so
+        # shorter reads need slightly less). The lower bound is `min_read_length`.
         "insert_size_censoring": {
-            "min_mergeable_overlap": -(-params.t_merge_q // params.match_q),
+            "min_mergeable_overlap": min_overlap,
+            "at_read_length": max_read_len,
         },
     }
     if elapsed is not None:
@@ -396,30 +697,33 @@ def _assemble_stats(acc, params, elapsed=None, inflate="unknown"):
     return stats
 
 
-def _validate(args, params) -> None:
-    """Reject argument combinations that would silently produce a wrong corpus.
+def params_from_args(args) -> MergeParams:
+    """The :class:`MergeParams` a parsed command line asks for, or a clean exit.
 
-    The realistic failure here is not a hand-typed flag, it is a config typo
-    propagating into a whole-cohort run with nothing but ``merged_pct`` to signal it —
-    ``--threshold-merge 0.5`` is accepted today and merges 94% of pairs instead of 82%.
+    Shared by ``zna merge`` and ``zna encode --merge-pairs``, whose algorithm flags are
+    one definition (:func:`zna.merge.args.add_merge_algorithm_arguments`). The realistic
+    failure is not a hand-typed flag, it is a config typo propagating into a
+    whole-cohort run, so a value the policy cannot mean is refused rather than clamped.
     """
-    if params.t_trim > params.t_merge:
-        raise SystemExit("--threshold-trim must be <= --threshold-merge")
-    if params.t_trim <= 0:
-        raise SystemExit("--threshold-trim must be > 0 (it is evidence in bits; at 0 "
-                         "every pair 'overlaps')")
-    # Floor the merge threshold at the evidence needed to beat chance over the shift
-    # space at all. threshold_bits() is the redesign's own derivation, so the bound is
-    # executable rather than folklore; 50 bp is the shortest read worth merging.
-    floor = threshold_bits(50, 0.05)
-    if params.t_merge < floor:
-        raise SystemExit(
-            f"--threshold-merge {params.t_merge:g} is below {floor:.1f} bits, the point "
-            f"at which chance alignments start passing even for 2x50 reads. The default "
-            f"is 28. If you really mean it, you want a different tool."
+    try:
+        params = MergeParams(
+            alpha=getattr(args, "alpha", _params.DEFAULT_ALPHA),
+            error_rate=getattr(args, "error_rate", _params.DEFAULT_ERROR_RATE),
+            adapter_trimmed=bool(getattr(args, "adapter_trimmed", False)),
+            min_read_length=getattr(args, "min_read_length", 40),
+            npolicy=getattr(args, "npolicy", None) or "trim3",
+            rng_seed=42 if getattr(args, "seed", None) is None else args.seed,
         )
+    except ValueError as e:
+        # The message names the parameter ("alpha ..." / "error rate ...").
+        raise SystemExit(f"invalid merge parameter: {e}") from None
     if params.min_read_length < 1:
         raise SystemExit("--min-read-length must be >= 1")
+    return params
+
+
+def _validate(args) -> None:
+    """Reject I/O arguments that cannot mean anything."""
     if args.chunk_size < 1:
         raise SystemExit("--chunk-size must be >= 1")
     if args.threads < 1:
@@ -452,14 +756,9 @@ def run(args) -> dict:
     inflate = inflate_backend_for(args.in1, args.in2)
     logger.info("backend: %s | inflate: %s | threads: %d",
                 _backend.active_name(), inflate, max(1, args.threads))
-    params = MergeParams(
-        t_merge=args.t_merge,
-        t_trim=args.t_trim,
-        min_read_length=args.min_read_length,
-        npolicy=getattr(args, "npolicy", "trim3"),
-        rng_seed=getattr(args, "seed", 42),
-    )
-    _validate(args, params)
+    params = params_from_args(args)
+    _validate(args)
+    log_policy(params, logger.log)
 
     t0 = time.perf_counter()
     try:
@@ -471,25 +770,31 @@ def run(args) -> dict:
     # An empty input is otherwise a silent success all the way down: rc=0 here, then a
     # 22-byte 0-record .zna, and a library disappears from the corpus with every stage
     # green. Cheaper to fail here than to find the hole in a trained model.
-    if acc[0][_N_PAIRS] == 0 and not args.allow_empty:
+    if acc[0][N_PAIRS] == 0 and not args.allow_empty:
         raise SystemExit(
             f"no read pairs in {args.in1} / {args.in2}. If that is expected, pass "
             f"--allow-empty; otherwise the input is truncated or the wrong file."
         )
-    if acc[0][_MAX_READ_LEN] > _LONG_READ_NOTICE:
+    if acc[0][MAX_READ_LEN] > _LONG_READ_NOTICE:
         logger.info(
             "longest read %d bp: the overlap scan is O(L^2), so expect it to be slow "
-            "in proportion (no limit is imposed)", acc[0][_MAX_READ_LEN])
+            "in proportion (no limit is imposed)", acc[0][MAX_READ_LEN])
     stats = _assemble_stats(acc, params, elapsed, inflate=inflate)
+    # Warnings go out whatever -q says: each one means a parameter may be wrong for
+    # this library, which is exactly what a quiet cluster run must not swallow.
+    for msg in run_warnings(acc, params):
+        logger.warning(msg)
 
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(stats, fh, indent=2)
     if not args.quiet:
         logger.info(
-            "done: %d pairs -> %d merged, %d trimmed, %d kept (%d records, %d dropped)",
-            stats["input_pairs"], stats["merged"], stats["trimmed_pairs"],
-            stats["kept_pairs"], stats["emitted_records"], stats["dropped_below_min_length"],
+            "done: %d pairs -> %d merged, %d kept (%d refused as implausible); "
+            "%d records, %d dropped",
+            stats["input_pairs"], stats["merged"], stats["kept_pairs"],
+            stats["implausible_refused"], stats["emitted_records"],
+            stats["dropped_below_min_length"],
         )
         # Always say what the N policy did. The failure this guards against is silent:
         # a single dark cycle can make a policy consume most of a library while the run

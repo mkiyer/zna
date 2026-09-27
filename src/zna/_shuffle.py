@@ -152,6 +152,9 @@ def shuffle_zna(
         # function IS that attestation and stamps its own True.)
         in_prov = reader.provenance
         merged_in_process = bool(in_prov is not None and in_prov.merged_in_process)
+        # ...and so does the merge record, verbatim: a permutation cannot change
+        # which policy made the records (MERGE_ACCURACY_PLAN.md §5).
+        merge_record = in_prov.merge if in_prov is not None else None
         # ZnaReader has consumed the file header and the provenance
         # prologue (if any), so f is at the first data block.
         n_units, n_records = _scan_counts(f, in_header)
@@ -288,7 +291,8 @@ def shuffle_zna(
             # that reads but refuses certification.
             out_writer = ZnaWriter(out_fh, out_header, block_size=block_size,
                                    preserve_normalization=True, shuffled=True,
-                                   merged_in_process=merged_in_process)
+                                   merged_in_process=merged_in_process,
+                                   merge_record=merge_record)
             try:
                 for bi in bucket_order:
                     bp = bucket_paths[bi]

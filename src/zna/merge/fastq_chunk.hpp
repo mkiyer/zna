@@ -44,20 +44,27 @@ struct InputError : std::runtime_error {
 };
 
 struct ChunkStats {
-    int64_t n_pairs = 0, merged = 0, trimmed = 0, kept = 0;
-    int64_t emitted = 0, dropped = 0, bases_trimmed = 0, frags_short = 0;
-    int64_t bases_consensus = 0, trim_guard = 0, sum_olen = 0, sum_diff = 0;
+    int64_t n_pairs = 0, merged = 0, kept = 0;
+    int64_t emitted = 0, dropped = 0, frags_short = 0;
+    int64_t bases_consensus = 0, implausible = 0, sum_olen = 0, sum_diff = 0;
     /// Bases the N policy removed (trim3) or invented (random), and no-calls the
     /// overlap recovered from the mate at no cost.
     int64_t npolicy_bases = 0, n_rescued = 0;
+    /// The run's diagnostics (plan §4): informative positions and mismatches of every
+    /// DETECTED overlap, before the gate, and the read-through check's strong count.
+    int64_t det_bases = 0, det_mismatches = 0, rt_strong = 0;
     /// Longest read seen. Reported rather than capped: the scan is O(L^2), so this is
     /// how an accidental long-read FASTQ becomes diagnosable instead of just slow.
     int max_read_len = 0;
+    /// The table-capacity protocol: 0 when the chunk ran to its end, else the read
+    /// length the policy tables must cover for the pair the chunk stopped in front of.
+    int64_t need = 0;
     std::vector<uint32_t> len_hist;      ///< every emitted record's length
-    std::vector<uint32_t> olen_hist;     ///< detected overlap lengths
+    std::vector<uint32_t> olen_hist;     ///< admitted (post-gate) overlap lengths
     std::vector<uint32_t> insert_hist;   ///< inferred fragment length, merged only
+    std::vector<uint32_t> det_olen_hist; ///< DETECTED (pre-gate) overlap lengths
 
-    /// Size the three histograms from the scratch arena's capacity, so indexing them
+    /// Size the four histograms from the scratch arena's capacity, so indexing them
     /// needs no bound check and no clamp.
     ///
     /// They used to be `uint32_t[1025]` with every index clamped to the last bin, which
@@ -75,6 +82,7 @@ struct ChunkStats {
         len_hist.resize(want, 0);
         olen_hist.resize(want, 0);
         insert_hist.resize(want, 0);
+        det_olen_hist.resize(want, 0);
     }
 };
 
@@ -98,8 +106,11 @@ inline void upper_into(const uint8_t* src, int n, uint8_t* dst) noexcept {
     }
 }
 
+/// Every trailing CR, as the reference's ``rstrip(b"\r")`` does. 0.5.x stripped one, so
+/// a `\r\r\n` line kept a CR in its header, sequence and quality here and not there.
 inline int strip_cr(const uint8_t* p, int n) noexcept {
-    return (n > 0 && p[n - 1] == '\r') ? n - 1 : n;
+    while (n > 0 && p[n - 1] == '\r') --n;
+    return n;
 }
 
 /// Read ID up to the first whitespace, minus any ``/1``/``/2`` suffix.
@@ -239,20 +250,37 @@ struct RecordEnd {
 ///
 /// `emit(r, i, a, b)` is called once per emitted record: the `PairResult`, the
 /// record's index within it, and the located input records for both mates.
+///
+/// **Table capacity.** A pair with a read longer than the policy tables cover is not
+/// consumed: the loop stops in front of it and sets `st.need` to that read's length,
+/// and the caller grows the tables and calls again from where this stopped. The check
+/// comes before anything else is done with the pair -- the sync check, the arena, the
+/// max-read-length statistic -- exactly as in the reference, so a stopped chunk and its
+/// resumption count every pair once.
+///
+/// **The read-through check** runs on the pairs whose INPUT index (`base_index` plus
+/// the pairs this chunk has taken) is below `rt_check_pairs`, so it covers the same
+/// pairs at any chunk size or thread count.
 template <class EmitFn>
 inline void merge_chunk_impl(const uint8_t* buf1, size_t n1, size_t& pos1,
                              const uint8_t* buf2, size_t n2, size_t& pos2,
                              const Params& p, bool check_sync, int64_t base_index,
+                             int64_t rt_check_pairs,
                              ChunkScratch& sc, ChunkStats& st, EmitFn&& emit_rec) {
     RecordSpans a, b;
     Read r1, r2;
+    const int64_t cap = p.tab.capacity();
     for (;;) {
         if (!locate_record(buf1, n1, pos1, a, "R1")) break;
         if (!locate_record(buf2, n2, pos2, b, "R2")) break;
 
+        const int longest = a.s.n > b.s.n ? a.s.n : b.s.n;
+        if (longest > cap) {
+            st.need = longest;
+            break;
+        }
         // Size the arena from the records we actually have, then copy into it. No cap
         // and no flag: the arena doubles to whatever the input turns out to need.
-        const int longest = a.s.n > b.s.n ? a.s.n : b.s.n;
         sc.ensure_reads(static_cast<size_t>(longest));
         st.ensure_bins(sc.core.cap);          // every bin index below is bounded by cap
         if (longest > st.max_read_len) st.max_read_len = longest;
@@ -262,41 +290,44 @@ inline void merge_chunk_impl(const uint8_t* buf1, size_t n1, size_t& pos1,
         r1 = {a.h, {sc.up1.data(), a.s.n}, a.q};
         r2 = {b.h, {sc.up2.data(), b.s.n}, b.q};
 
+        const int64_t index = base_index + st.n_pairs;
         if (check_sync) {
             const Span an = base_name(r1.h), bn = base_name(r2.h);
             if (an.n != bn.n || std::memcmp(an.p, bn.p, static_cast<size_t>(an.n)) != 0) {
                 throw InputError(
                     "R1/R2 out of sync at pair " +
-                    std::to_string(base_index + st.n_pairs + 1) + ": '" +
+                    std::to_string(index + 1) + ": '" +
                     std::string(reinterpret_cast<const char*>(an.p), static_cast<size_t>(an.n)) +
                     "' != '" +
                     std::string(reinterpret_cast<const char*>(bn.p), static_cast<size_t>(bn.n)) + "'");
             }
         }
 
-        const PairResult r = process_pair(r1, r2, p, sc.core,
-                                          base_index + st.n_pairs);
+        const PairResult r = process_pair(r1, r2, p, sc.core, index,
+                                          index < rt_check_pairs);
         ++st.n_pairs;
         st.dropped += r.n_dropped;
         st.bases_consensus += r.bases_consensus_changed;
-        st.trim_guard += r.trim_guard_fired;
+        st.implausible += r.implausible;
         st.npolicy_bases += r.npolicy_bases;
         st.n_rescued += r.n_rescued;
+        st.det_bases += r.det_bases;
+        st.det_mismatches += r.det_mismatches;
+        st.rt_strong += r.rt_strong;
+        // Every overlap that reached T, merged and refused alike: the lengths the gate
+        // looked dfit up at, for the expected share of true overlaps it refused.
+        if (r.det_len) st.det_olen_hist[r.det_len] += 1;
 
         if (r.outcome == OUTCOME_MERGED) {
             ++st.merged;
-        } else if (r.outcome == OUTCOME_TRIMMED) {
-            ++st.trimmed;
-            // Both mates are cut now, so charge both: this counter is "redundant bases
-            // removed", and it is the overlap length either way.
-            if (r.n_recs) {
-                st.bases_trimmed += (r1.s.n - r.recs[0].s.n) + (r2.s.n - r.recs[1].s.n);
-            }
         } else {
             ++st.kept;
+            if (!r.n_recs) ++st.frags_short;
         }
-        if (!r.n_recs && r.outcome != OUTCOME_MERGED) ++st.frags_short;
 
+        // Over ADMITTED overlaps -- the alignments pairs were merged from, after the
+        // gate -- so sum_diff / sum_olen is the post-admission disagreement rate. The
+        // pre-gate one is det_* above.
         if (r.overlap_len) {
             st.olen_hist[r.overlap_len] += 1;
             st.sum_olen += r.overlap_len;
@@ -320,14 +351,18 @@ inline void merge_chunk_impl(const uint8_t* buf1, size_t n1, size_t& pos1,
 /// Merge every whole pair available in both buffers, appending FASTQ text to *blob*.
 ///
 /// *pos1* / *pos2* are advanced to the number of bytes consumed from each stream.
-/// *base_index* is the index of the first pair in the input, carried only so a desync
-/// can be reported by absolute pair number rather than "somewhere in this chunk".
+/// *base_index* is the index of the first pair in the input. Everything that must not
+/// depend on chunking is keyed by it: the desync message's pair number, `--npolicy
+/// random`'s substitution stream, and which pairs the read-through check covers.
+/// *st.need* is the table-capacity protocol (see `merge_chunk_impl`).
 inline void merge_chunk(const uint8_t* buf1, size_t n1, size_t& pos1,
                         const uint8_t* buf2, size_t n2, size_t& pos2,
                         const Params& p, bool check_sync, int64_t base_index,
+                        int64_t rt_check_pairs,
                         ChunkScratch& sc, std::string& blob, ChunkStats& st) {
     merge_chunk_impl(
-        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, sc, st,
+        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, rt_check_pairs,
+        sc, st,
         [&blob](const PairResult& r, int i, const RecordSpans&,
                 const RecordSpans&) { emit(blob, r.recs[i]); });
 }
@@ -343,10 +378,12 @@ inline void merge_chunk_records(const uint8_t* buf1, size_t n1, size_t& pos1,
                                 const uint8_t* buf2, size_t n2, size_t& pos2,
                                 const Params& p, bool check_sync,
                                 int64_t base_index, bool want_headers,
+                                int64_t rt_check_pairs,
                                 ChunkScratch& sc, std::string& seqs,
                                 std::vector<RecordEnd>& ends, ChunkStats& st) {
     merge_chunk_impl(
-        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, sc, st,
+        buf1, n1, pos1, buf2, n2, pos2, p, check_sync, base_index, rt_check_pairs,
+        sc, st,
         [&](const PairResult& r, int i, const RecordSpans& a,
             const RecordSpans& b) {
             const OutRec& rec = r.recs[i];

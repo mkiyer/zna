@@ -10,7 +10,10 @@ algorithms work is [METHODS.md](METHODS.md).
 
 ## Scheduled
 
-### 0.6.0 — `zna encode`'s per-record driver into C++, which also lets `pigz` go
+### Next — `zna encode`'s per-record driver into C++, which also lets `pigz` go
+
+Scheduled as 0.6.0 until the merge-accuracy work took that number (a breaking change to
+the merge output belongs in a minor release of its own). Nothing about it changed.
 
 Two items in one because the second falls out of the first for free, and the second is
 the reason not to treat 0.5.2's gzip work as finished.
@@ -67,10 +70,22 @@ byte, and beating that needs `pshufb` (SSSE3, not baseline) for a ~1.5% CLI win.
 left alone.
 
 The real fix is moving the per-record loop into C++, which is what `--merge-pairs`
-already does for the paired path — a 0.6.0-shaped change, not a patch release.
+already does for the paired path — a minor-release-shaped change, not a patch release.
 
 
 ## Considered, not scheduled
+
+### Faster table building for very long reads
+
+0.6's merge floor and plausibility table are exact integers built once per run and grown
+by doubling (`docs/METHODS.md` §2.1). `dfit` is now one exact step per overlap length
+(capacity 16,384 in 0.41 s, down from 44 s in the first port), but `T(N)` is still one
+50-digit `Decimal` logarithm per entry: ~1.2 s to reach a 10 kb read, against 0.09 s for
+the whole of 0.5.3's run on the same input. Irrelevant at Illumina lengths (a 2×150
+library never regrows past 256), and paid once per run, so it was accepted. The obvious
+shortcut — a float `log2` checked against exact bounds, falling back to `Decimal` only
+near a rounding boundary — would remove it; it has to keep the tables bit-identical,
+which is the whole reason they are exact.
 
 ### `zna sample --fraction`
 
@@ -180,8 +195,9 @@ Two cases are currently *defined but not validated*, and both concern paired inp
   mates by construction) and lossy for a genuinely per-*mate* one.
 
   The subtle part: **whether a fragment contributes one label row or two is decided by the
-  overlap score**, so for a per-mate tag the column's meaning varies with sequence content
-  and with `--threshold-merge`. Nothing records which branch a fragment took.
+  merge policy**, so for a per-mate tag the column's meaning varies with sequence content
+  and with `--alpha`, `--error-rate` and `--adapter-trimmed`. Nothing per record says
+  which branch a fragment took beyond its shape (one full-fragment record or two mates).
 
   `zna merge` cannot validate this — it is a FASTQ tool with no concept of label
   definitions, and comparing all tags would false-positive on legitimately per-mate ones.
@@ -196,24 +212,66 @@ Recorded so nobody reopens these without new evidence.
 
 | Proposal | Why not |
 |---|---|
-| **Gate merges on shift ambiguity** | Posterior mass off the argmax is 1.60% of merges (0.15% off ±4). A wrong shift gives the wrong *length*, not the wrong *sequence* — 0.016% of 24-mers absent from the true fragment, and the read never overruns the fragment end. The gate would re-emit **+4.68% duplicated bases**, which is the exact redundancy the trim band exists to remove. |
+| **Gate merges on shift ambiguity** | Posterior mass off the argmax is 1.60% of merges (0.15% off ±4). A wrong shift gives the wrong *length*, not the wrong *sequence* — 0.016% of 24-mers absent from the true fragment, and the read never overruns the fragment end. The gate would re-emit **+4.68% duplicated bases**. (0.6's plausibility gate is a different test: it asks whether the winner's *mismatches* are believable, not whether its score is well separated.) |
 | **Per-record geometry tag in the FASTQ** | The seam was measured sound on 70,351 records: every merged single reports two ends, every mate exactly one, correct side, zero broken pairs, zero lone mates. A two-repo coordinated change for a hole the tool already closes. |
 | **Composition-aware null model** | Three independent lenses, all negative: −0.55 pp merge rate overall, and ~2 pp on exactly the low-complexity reads it was meant to protect. |
-| **Per-pair threshold from read length** | The uniform-null p99.9 is flat at ~10 bits from L=50 to L=300. Nothing to gain. |
-| **Estimating `err_rate` from the data** | Measured `ê = 0.00866` against the assumed 0.01; adopting it costs −0.04 pp merge rate. 0.01 sits inside the flat region. |
-| **Special-casing N; Smith-Waterman / indels** | N appears in 0.169% of pairs, every run length exactly 1, and changed **0** merge decisions. The anomalous-mismatch population is 56% two-base repeat — wrong shifts in repeats, not indels. |
-| **Raising `--threshold-trim` above 8** | The two harms added (duplicated bases left + real bases deleted) are minimised at 8: 85,611 against 97,053 / 127,398 / 167,445 at 12 / 16 / 20. It keeps minimising unless a deleted base is judged >1.63× as harmful as a duplicated one — and a duplicated base is *false* evidence while a deleted one is merely absent. |
-| **Raising `--threshold-merge` above 28** | 28 minimises false positives plus false negatives, and not marginally: 6,603 errors per million against 44,145 at the fastp-equivalent setting. Raising it trades ~11 missed merges per wrong merge prevented. See [MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md) §6 for the full curve — it is a trade-off with a number, not a recommendation. |
+| **Special-casing N in the score; Smith-Waterman / indels** | N appears in 0.169% of pairs, every run length exactly 1, and changed **0** merge decisions. The anomalous-mismatch population is 56% two-base repeat — wrong shifts in repeats, not indels. (0.6 discounts a one-sided N in the plausibility gate only, where it did matter — see below; the score is unchanged.) |
 
-**Where these numbers come from.** The last two rows — the two thresholds — are from the
-simulated ground-truth benchmark and are fully reproducible; the derivations and the
-input are in [MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md), and
-[`scripts/merge_bench/`](../scripts/merge_bench/) regenerates them. The rest were
-measured during a 2026-08 audit against **production libraries that are not
-distributable**, so the figures are recorded here rather than reproducible from this
-repository. Treat them as evidence that the question was asked and answered, not as
-something you can re-run — and if you have a reason to reopen one, measure it on your own
-data rather than arguing from these.
+**Where these numbers come from.** They were measured during a 2026-08 audit against
+**production libraries that are not distributable**, so the figures are recorded here
+rather than reproducible from this repository. Treat them as evidence that the question
+was asked and answered, not as something you can re-run — and if you have a reason to
+reopen one, measure it on your own data rather than arguing from these.
+
+### The 0.6 merge policy: what was measured and not built
+
+The alternatives weighed while designing 0.6's merge decision (`docs/archive/MERGE_ACCURACY_PLAN.md`
+has the design; its §10 evidence directory has every run). **These numbers are from
+simulation** — the 46-substrate truth panel (14.1M simulated pairs: chr22 and
+transcriptome sets from khorana's simulator and ZNA's own, hg38, read-through and
+3′-degradation stress sets) and its gene-disjoint holdouts — except where a row cites the
+2026-08 audit, because only simulation knows which merges are wrong. They say which rule is better on those substrates; they
+are not production rates.
+
+| Proposal | Why not |
+|---|---|
+| **Estimate `--error-rate` from each library** | Built and measured, then dropped. Fed into the score, a noisy library's own higher rate cheapened mismatches and admitted *more* divergent repeats and short false read-throughs: 3′-degraded sets 560 → **741** wrong merges at the estimated 0.035, against 560 → **240** at a fixed 0.01; lost fragments rose on a 1%-error hg38 set; clean libraries estimated low and refused short true overlaps carrying two errors. It also needed a buffered sample, a prior and a sorted-input caveat. The 2026-08 audit reached the same place from production data (`ê = 0.00866` against 0.01, −0.04 pp merge rate: 0.01 sits in the flat region). The rate is now a documented setting that each run *checks* (`expected_refused_true_overlap_fraction`). |
+| **Re-place an implausible winner** (the best plausible shift, or an argmax constrained to plausible shifts) | An implausible winner marks a repetitive context, and the runner-up there is usually another repeat: re-placing moved **37–38%** of the wrong merges it caught onto *another* wrong shift on the gene-disjoint holdout (9% on dev). Abstaining — keep the pair whole — removed ~10% more wrong merges than re-placing on dev and added no lost fragments. Its cost is 145–271 re-merges forgone per 500k–1M pairs where the truth was outscored. |
+| **Read-through concordance rule** (refuse an `s < 0` shift under 80 bits unless the two 8-base adapter overhangs agree within 2 mismatches) | Four tuned constants standing in for a fact the user already knows. Where the input is honestly trimmed, declaring it (`--adapter-trimmed`) beat the best rule: transcriptome fastp set **−715** wrong merges / **+332** correct against −632 / +249. Where adapters are not shared between mates (small-RNA kits) the rule is wrong by construction: it turned 18,201 of 100k raw small-RNA pairs into kept pairs carrying 4.45M adapter bases, and its strict form refused 73,150 correct merges. |
+| **A capped trim band** (keep trimming, but only overlaps with at most `dtrim[n]` mismatches, `dtrim` at α = 10⁻³) | Cut wrong trims by only 17–25% (hg38 2,948 → 2,267, still deleting 19,013 real positions), refused 245 exact trims on a 3′-degraded set, and interacted with the gate: re-placed wrong merges landed in the band (74 new wrong trims on hg38). Removing the band gives 0 wrong trims and 0 kept-mate substitutions by construction, at ~0.55 duplicated bases per pair — and khorana wants unmerged mates whole. |
+| **Displaced-winner clauses** (refuse a trim or read-through that won only because the true winner was masked) | Every variant that refused a displaced read-through winner gave *identical* merge-side results (−3,140 wrong merges on hg38); the variants differed only in trading wrong trims against duplicated bases (e.g. hg38 −681 wrong trims for +428 duplicate positions). With the trim band gone there is nothing left for them to decide. |
+| **The "lazy" kernel form** for those clauses (a capped main scan plus verification re-scans) | Measured at **2.4×** 0.5.3's scan time on hg38 and **3.6×** on read-through-rich input, where 92% of pairs re-scanned; the mismatch caps it relied on saved only 8% of shifts once bail is per 64-base group. An exact one-pass form reached 0.91–0.98×, but the 0.6 gate needs neither: it is one table lookup after an ordinary scan (`docs/METHODS.md` §2.5). |
+| **Warn when the detected rate exceeds `--error-rate`** | The first trigger fired on 12 of the 46 panel benches, ten of them expecting under 0.02% of true overlaps refused — repeats nudge the detected rate past 0.01 on clean libraries while costing nothing. Replaced by the expected refused share itself, warned above 0.1%: only the extreme 5% 3′-ramp set crosses it (0.40%). |
+| **A faster `--adapter-trimmed` check** | The check's second, unrestricted scan costs +5.4% on the first 100,000 pairs of a declared run only — about 20 ms. A cheaper existence test would need its own proof of equivalence and a matching reference implementation. |
+| **Raising the merge floor** (`--alpha` below 10⁻⁶; 0.5.x's `--threshold-merge` above 28) | On the 0.5.x benchmark 28 bits minimized false plus missed merges — 6,603 per million against 45,616 at the fastp-equivalent 60 bits (fastp itself: 44,145) — and raising it traded ~11 missed merges for each wrong merge prevented, reaching 22.5:1 at 100 bits. The gate has since removed about half of those wrong merges. See [MERGE_BENCHMARK_RESULTS.md](MERGE_BENCHMARK_RESULTS.md) §6: a trade-off with a number, not a recommendation. |
+| **A per-pair floor *tuned* to read length** | The 2026-08 audit found the uniform-null p99.9 flat at ~10 bits from 50 to 300 bp, so nothing to gain by tuning. 0.6 does vary the floor with read length, but by derivation, not tuning: `log₂(N/α)` is the same union bound at every geometry, 26.6 bits at 2×50 to 29.2 at 2×300. |
+
+---
+
+## Closed by measurement in 0.6
+
+### The merge-accuracy work — DONE in 0.6.0
+
+khorana's chr22 merge review (2026-09-25) is answered by the 0.6 policy: a floor derived
+per pair from one tolerance, a plausibility gate at the same tolerance, an
+`--adapter-trimmed` declaration, and no trim band (`docs/METHODS.md` §1). Qualified at
+full scale against 0.5.3, pair by pair against simulated truth over 4.11M pairs: wrong
+merges 11,875 → 5,151, lost fragments 719 → 544, wrong trims and kept-mate
+substitutions to 0, 7 correct merges forgone and 502 gained, compiled CPU 9–29% lower
+(`docs/MERGE_BENCHMARK_RESULTS.md` §9). Every acceptance criterion fixed before the run
+held, except where the adapter declaration was not fully honest: declaring the output
+of hulkrna's fastp pass forgoes 0.011% of correct merges and emits 47 adapter bases per
+500k pairs, because its `--cut_tail` hides a 1–2 bp overhang from fastp's adapter
+detection and leaves 1–3 bp of adapter on 42 pairs. The recommended trimmer is the same
+single pass without `--cut_tail` (fastp 1.1.0 and 1.3.6 identical): it leaves 1–3 bp on
+7 pairs per 500k and, declared, emits 8 adapter bases in 3 of them (forgone 0.002%,
+within the limit). Hence the declaration is documented as for honest input only, with
+that residual stated.
+
+**Left open, by design.** Near-identical repeats still merge wrongly (a perfect 15-base
+repeat is plausible under any error model), and the residual is more concentrated than
+0.5.3's: on transcriptome input one transcript carries a third of it. Distinguishing
+those needs information the merger does not have.
 
 ---
 

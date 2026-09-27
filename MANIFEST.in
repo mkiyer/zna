@@ -11,8 +11,9 @@ recursive-include src *.cpp *.h *.hpp
 # Include Python source files
 recursive-include src *.py
 
-# Include tests
+# Include tests, and their fixture data (the merge review's 19 ground-truth cases)
 recursive-include tests *.py
+recursive-include tests/data *
 
 # Exclude build artifacts
 global-exclude *.pyc

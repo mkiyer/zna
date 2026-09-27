@@ -8,6 +8,7 @@ reason several current invariants exist.
 
 | Document | Executed in | What it was |
 |---|---|---|
+| [MERGE_ACCURACY_PLAN.md](MERGE_ACCURACY_PLAN.md) | 0.6.0 | the merge policy by derivation: α-derived floor, plausibility gate, `--adapter-trimmed`, no trim band — with its measurements, rejected alternatives and qualification |
 | [MERGE_PAIRS_PLAN.md](MERGE_PAIRS_PLAN.md) | 0.5.0 | `zna encode --merge-pairs`, with the three audit blockers that shaped it |
 | [NPOLICY_PLAN.md](NPOLICY_PLAN.md) | 0.4.0 | the `--npolicy` redesign and the seeded position-derived streams |
 

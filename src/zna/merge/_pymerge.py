@@ -1,4 +1,4 @@
-"""The reference merge backend: the scan, in readable Python.
+"""The reference merge backend: the scan, the decision, in readable Python.
 
 This is the **oracle** the accelerated backend is defined to agree with, not a fallback
 for when the fast one is missing. It is never deleted and never optimised at the cost of
@@ -10,12 +10,20 @@ speed here would only buy the ability to be wrong in the same way as the thing i
 checks.
 
 Scores are integers throughout — see :mod:`zna.merge.params` for why, and
-``docs/METHODS.md`` for the argmax total order the visiting order realises.
+``docs/METHODS.md`` for the argmax total order the visiting order realises. The policy
+the functions below implement is ``docs/archive/MERGE_ACCURACY_PLAN.md`` §2; every parameter
+arrives already derived, as integers and two ``int64`` tables (``T_q`` indexed by the
+pair's shift count, ``dfit`` by overlap length).
 """
 from __future__ import annotations
 
 from .fastqio import InputError
 from .names import base_name, strip_pair_suffix
+
+#: The backend contract this module implements. :mod:`zna.merge.backend` refuses a
+#: backend whose marker differs, which is what stops a compiled extension built for an
+#: older policy (0.5.x has no marker at all) from running with the new arguments.
+POLICY_ABI = 2
 
 #: Which mate of the pair an emitted record came from -- the whole geometry
 #: transfer of ``zna encode --merge-pairs``.  Mirrors ``Slot`` in
@@ -27,10 +35,42 @@ SLOT_MATE2 = 2
 # Sentinel for "this shift cannot beat the incumbent"; far below any reachable score.
 _REJECT = -(1 << 62)
 
+#: The input bounds of every entry point, mirrored by ``MAX_WEIGHT_Q``/``MAX_FLOOR_Q``
+#: in ``_accel.cpp``. Python's integers are unbounded and the kernel's are ``int64``, so
+#: past these the two backends would disagree (and the kernel's arithmetic would be
+#: undefined): with reads under 2^31 bases, a weight ``<= 2^30`` keeps every score under
+#: 2^61, and a floor within ``+-2^61`` keeps ``floor - 1`` above ``_REJECT`` and
+#: ``ceiling - best - 1`` under 2^63. Real values are far inside: ``step_q`` is 1.4e8
+#: at ``e = 0.01`` and 5.3e8 at the smallest accepted, 1e-9; ``T`` is ~2^29.
+MAX_WEIGHT_Q = 1 << 30
+MAX_FLOOR_Q = 1 << 61
+
+
+def _check_weights(match_q, step_q, fn):
+    if not (0 < match_q <= MAX_WEIGHT_Q and 0 < step_q <= MAX_WEIGHT_Q):
+        raise ValueError(f"{fn}: match_q and step_q must be in [1, 2^30]")
+
+
+def _check_tables(t_table, dfit_table, fn):
+    """``T_q`` needs entries 0 and 1 (one base per mate), ``dfit`` entry 0, and every
+    ``T_q`` entry is a floor within ``+-MAX_FLOOR_Q``. Checked once per call, over the
+    whole table, as the compiled backend does when it borrows it."""
+    if len(t_table) < 2 or len(dfit_table) < 1:
+        raise ValueError(f"{fn}: the T and dfit tables are empty")
+    if min(t_table) < -MAX_FLOOR_Q or max(t_table) > MAX_FLOOR_Q:
+        raise ValueError(f"{fn}: a T table entry is out of range")
+
+
+def _check_npolicy(npolicy, fn):
+    if npolicy not in (0, 1, 2):          # NPOLICY_KEEP, _TRIM3, _RANDOM
+        raise ValueError(f"{fn}: npolicy must be 0, 1 or 2")
+
 # Complement table. A/C/G/T/N in both cases; everything else passes through
 # UNCOMPLEMENTED -- deliberate, so an IUPAC ambiguity code survives as itself and the
 # kernel's N-vs-N semantics are unchanged: rc(b"RYKMSWBDHVN") == b"NVHDBWSMKYR".
 _COMPLEMENT = bytes.maketrans(b"ACGTNacgtn", b"TGCANtgcan")
+
+_N = 0x4E                          # ord('N'); the parser upper-cases every sequence
 
 
 def reverse_complement(seq: bytes) -> bytes:
@@ -89,19 +129,33 @@ def _shift_score(s1, s2rc, s, n, match_q, step_q, best):
     return ceiling - d * step_q, d
 
 
-def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
-    """Best-scoring shift over ``s in [-(len2-1), len1-1]``.
+def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q, adapter_trimmed=0):
+    """Best-scoring eligible shift, with ``floor_q`` as the least score that counts.
 
     Returns ``(shift, score_q, overlap_len, mismatches)`` on the signed single axis
-    (``shift < 0`` is read-through). ``overlap_len == 0`` means no shift reached
+    (``shift < 0`` is read-through). ``overlap_len == 0`` means no eligible shift reached
     ``floor_q``. Shifts are visited in decreasing overlap length, so the scan can stop
     outright once the remaining ceiling cannot beat the incumbent.
+
+    **Eligible shifts.** All of ``s in [-(len2-1), len1-1]`` by default. Under
+    ``adapter_trimmed`` -- the declaration that no read extends past its molecule --
+    only ``s >= max(0, len1 - len2)``, i.e. inferred fragment ``L = s + len2 >=
+    max(len1, len2)``: a shorter ``L`` would put a read past the fragment's end, which
+    the declaration makes impossible. That is not merely ``s >= 0``: with ``len1 >
+    len2``, ``0 <= s < len1 - len2`` puts R1 past the end. In the loops below the
+    restriction is exactly two things -- the plateau shrinks to its last shift, and the
+    read-through flank is never visited (every shift on it is ``< plo <= 0``).
 
     The visiting order — plateau first at maximal ``n`` and ascending ``s``, then the
     flanks at decreasing ``n``, read-through side (the smaller ``s``) before the normal
     side — combined with strict ``>`` is what realises the specified argmax order
-    (maximise score, then minimise ``s``). Do not reorder these loops.
+    (maximise score, then minimise ``s``). Restricting eligibility removes shifts from
+    that order without reordering the rest, so the same holds over the eligible set. Do
+    not reorder these loops.
     """
+    _check_weights(match_q, step_q, "scan()")
+    if not -MAX_FLOOR_Q <= floor_q <= MAX_FLOOR_Q:
+        raise ValueError("scan(): floor_q is out of range")
     best = floor_q - 1             # a score exactly equal to `floor_q` must win
     best_s = 0
     best_n = 0
@@ -113,6 +167,8 @@ def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
     # Shifts achieving the maximal overlap: a plateau of width |len1 - len2| + 1.
     plo = 0 if len1 >= len2 else len1 - len2
     phi = len1 - len2 if len1 >= len2 else 0
+    if adapter_trimmed:
+        plo = phi                  # the one plateau shift with L >= max(len1, len2)
     s = plo
     while s <= phi:
         sc, d = _shift_score(s1, s2rc, s, nmax, match_q, step_q, best)
@@ -128,13 +184,14 @@ def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
     while n > 0:
         if n * match_q <= best:
             break
-        s = n - len2                       # read-through flank (s < plo)
-        sc, d = _shift_score(s1, s2rc, s, n, match_q, step_q, best)
-        if sc > best:
-            best = sc
-            best_s = s
-            best_n = n
-            best_d = d
+        if not adapter_trimmed:
+            s = n - len2                   # read-through flank (s < plo)
+            sc, d = _shift_score(s1, s2rc, s, n, match_q, step_q, best)
+            if sc > best:
+                best = sc
+                best_s = s
+                best_n = n
+                best_d = d
         s = len1 - n                       # normal-overlap flank (s > phi)
         sc, d = _shift_score(s1, s2rc, s, n, match_q, step_q, best)
         if sc > best:
@@ -149,6 +206,90 @@ def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
     return best_s, best, best_n, best_d
 
 
+def _n_positions(s1, s2rc, s, n):
+    """``(one_sided, both)``: positions of the overlap at shift *s* where exactly one
+    mate reads ``N``, and where both do.
+
+    Neither says anything about whether the mates agree. A one-sided ``N`` is a
+    mismatch in the scan (a no-call never equals a call), so the plausibility gate
+    discounts it from the mismatches; ``N`` against ``N`` is a match in the scan, so the
+    detected-overlap disagreement rate discounts it from the compared bases (plan §3:
+    "informative positions only"). The gate's ``dfit`` stays indexed by the overlap
+    length, as §2 specifies. Byte ``N`` only: lower case never reaches here from the
+    parser, and IUPAC codes compare as themselves (they carry partial information).
+    """
+    if _N not in s1 and _N not in s2rc:
+        return 0, 0
+    i1 = s if s > 0 else 0
+    i2 = -s if s < 0 else 0
+    one = both = 0
+    for k in range(n):
+        a = s1[i1 + k] == _N
+        b = s2rc[i2 + k] == _N
+        one += a != b
+        both += a and b
+    return one, both
+
+
+def table_capacity(t_table, dfit_table):
+    """The longest read the two tables cover: ``T_q`` needs ``N = len1 + len2 - 1 <
+    len(t_table)``, ``dfit`` needs ``n <= len(dfit_table) - 1``."""
+    cap = len(t_table) // 2
+    dcap = len(dfit_table) - 1
+    return cap if cap < dcap else dcap
+
+
+#: `overlap` verdicts. Mirror the VERDICT_* constants in merge_core.hpp.
+VERDICT_NONE, VERDICT_MERGE, VERDICT_IMPLAUSIBLE = 0, 1, 2
+
+
+def overlap(s1, s2rc, len1, len2, match_q, step_q, t_table, dfit_table,
+            adapter_trimmed):
+    """The authoritative overlap decision for one pair.
+
+    Returns ``(verdict, shift, score_q, overlap_len, mismatches, informative)``:
+
+    * ``W`` = the best eligible shift (:func:`scan`) with the pair's own floor
+      ``T_q[len1 + len2 - 1]``: nothing reaching it is ``VERDICT_NONE``.
+    * ``informative`` = ``W``'s mismatches minus the positions where exactly one base is
+      ``N`` (:func:`_n_positions`).
+    * ``informative > dfit[n_W]`` is ``VERDICT_IMPLAUSIBLE``: that many disagreements
+      would happen in a true overlap of this length with probability below ``alpha``,
+      so ``W`` is a repeat, not the fragment. The pair has no overlap. Nothing is
+      searched for in its place -- a runner-up in a repetitive context re-placed 37-38%
+      of caught wrong merges onto *another* wrong shift on the gene-disjoint holdout.
+    * otherwise ``VERDICT_MERGE``: ``W`` is the alignment the pair is built from.
+
+    The alignment fields describe ``W`` for both MERGE and IMPLAUSIBLE -- for the latter
+    it is the refused alignment, reported for diagnostics; nothing is built from it --
+    and are all zero for NONE. The tables must cover ``max(len1, len2)``.
+    """
+    _check_weights(match_q, step_q, "overlap()")
+    _check_tables(t_table, dfit_table, "overlap()")
+    return _decide(s1, s2rc, len1, len2, match_q, step_q, t_table, dfit_table,
+                   adapter_trimmed)[:6]
+
+
+def _decide(s1, s2rc, len1, len2, match_q, step_q, t_table, dfit_table,
+            adapter_trimmed):
+    """:func:`overlap`, plus a seventh field: ``W``'s positions where both mates read
+    ``N`` (:func:`_n_positions`), which the detected-overlap diagnostic discounts."""
+    if len1 <= 0 or len2 <= 0:
+        return VERDICT_NONE, 0, 0, 0, 0, 0, 0
+    longest = len1 if len1 > len2 else len2
+    if longest > table_capacity(t_table, dfit_table):
+        raise ValueError(f"read of {longest} bases exceeds the policy tables "
+                         f"(capacity {table_capacity(t_table, dfit_table)})")
+    shift, score, olen, diff = scan(s1, s2rc, len1, len2, match_q, step_q,
+                                    t_table[len1 + len2 - 1], adapter_trimmed)
+    if olen == 0:
+        return VERDICT_NONE, 0, 0, 0, 0, 0, 0
+    one_sided, both_n = _n_positions(s1, s2rc, shift, olen)
+    informative = diff - one_sided
+    verdict = VERDICT_IMPLAUSIBLE if informative > dfit_table[olen] else VERDICT_MERGE
+    return verdict, shift, score, olen, diff, informative, both_n
+
+
 # =========================================================================== #
 # Level 2: one pair -- consensus, decision, record construction.
 #
@@ -156,7 +297,9 @@ def scan(s1, s2rc, len1, len2, match_q, step_q, floor_q):
 # tests/test_merge.py compares them record by record.
 # =========================================================================== #
 
-MERGED, TRIMMED, KEPT = 0, 1, 2
+#: Pair outcomes: a pair is merged into one record or kept as two. There is no third
+#: outcome -- 0.6 removed the trim band (MERGE_ACCURACY_PLAN.md §2).
+MERGED, KEPT = 0, 1
 
 #: What to do with a no-call the overlap could not rescue. Same vocabulary as
 #: ``zna encode --npolicy``, deliberately: one flag, one meaning, both tools.
@@ -164,8 +307,10 @@ NPOLICY_KEEP, NPOLICY_TRIM3, NPOLICY_RANDOM = 0, 1, 2
 
 #: Per-record provenance bits, emitted as the ``ZN:i:<bits>`` header tag. Mirrors the
 #: ``PROV_*`` constants in ``merge_core.hpp``; see there for why the byte exists and why
-#: there is deliberately no "merged" bit.
-PROV_TRIMMED, PROV_RESCUED, PROV_NTRIMMED, PROV_NSUBBED = 1, 2, 4, 8
+#: there is deliberately no "merged" bit. Bit 1 was ``PROV_TRIMMED`` until 0.6 removed
+#: the trim band; it is retired rather than reused, so a set bit in any corpus still
+#: means one thing.
+PROV_RESCUED, PROV_NTRIMMED, PROV_NSUBBED = 2, 4, 8
 
 _M64 = 0xFFFFFFFFFFFFFFFF
 _SUB = b"ACGT"
@@ -198,20 +343,22 @@ def _sub_n(seq, seed, rec):
     return bytes(out), n
 
 
-def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
-                            write_r2):
-    """Resolve overlap disagreements by posterior, into every emitted copy.
+def _consensus_r1_overlap(s1, q1, s2rc, q2r, s, olen, disagree_q):
+    """Resolve overlap disagreements by posterior, into R1's copy of the overlap.
 
-    Returns ``(s1, q1, s2, q2, s2rc, n, rescued1, rescued2)``; ``n`` counts bases changed
-    in R1, and the two rescue counts are charged to the mate that was *repaired*, so each
-    emitted record's ``rescued_<n>`` token counts only its own recovered no-calls. Their
-    sum is the run-level counter, unchanged.
+    Returns ``(s1, q1, n, rescued)``: ``n`` counts R1 bases changed and ``rescued`` the
+    no-calls among them recovered from R2. New ``bytes`` if anything changed, else the
+    originals.
+
+    R1 alone, because the merged record is the only record built from the overlap: it
+    takes the overlap from R1 and R2 contributes only outside it, so R2's copy is
+    discarded. (0.5.x also wrote R2 on its trim path, where each mate kept part of the
+    overlap; the trim path is gone.) A KEPT pair gets no consensus at all -- nothing
+    about it depends on the alignment being right.
 
     The decision is symmetric — the better-supported base by posterior from the two
     Phred scores, with the winner's quality derated because a contested base is less
-    certain.  The only question is which emitted copies of the overlap receive it, and
-    the rule is *every copy that reaches the corpus*.  :func:`process_pair` decides and
-    passes ``write_r2``; its comment gives the four cases.
+    certain. On equal quality R1 stands (derated).
 
     **N rescue.**  An ``N`` carries no base information, so a real call on the other
     mate beats it whatever the two qualities say, and the rescued base keeps the
@@ -222,84 +369,39 @@ def _consensus_pair_overlap(s1, q1, s2, q2, s2rc, q2r, s, olen, disagree_q,
     information.
 
     Rescue does not touch the *scan*: an N still counts as a mismatch when the shift is
-    scored, so which shift wins — and therefore whether the pair merges — is unchanged.
-
-    ``s2``/``q2`` are R2 in its own orientation, which is how it is emitted: overlap slot
-    ``b`` on the reverse-complemented axis is R2 index ``len2 - 1 - b``, holding the
-    complement of the resolved call.  New ``bytes`` if anything changed, else the
-    originals unchanged.
+    scored, so which shift wins is unchanged. It is discounted only where the plausibility
+    gate asks whether the mismatches look like sequencing error (:func:`_n_positions`).
     """
     a0 = s if s > 0 else 0        # mirrors the scan's overlap alignment
     b0 = -s if s < 0 else 0
-    len2 = len(s2)
-    s1b = q1b = s2b = q2b = s2rcb = None
-    n = rescued1 = rescued2 = 0
+    s1b = q1b = None
+    n = rescued = 0
     for i in range(olen):
         a = a0 + i
         b = b0 + i
-        qa = q1[a]
-        qb = q2r[b]
         if s1[a] != s2rc[b]:
             if s1b is None:
                 s1b, q1b = bytearray(s1), bytearray(q1)
-                if write_r2:
-                    s2b, q2b = bytearray(s2), bytearray(q2)
-                    s2rcb = bytearray(s2rc)
-            j2 = len2 - 1 - b                 # the same base, in R2's own frame
-            a_is_n = s1[a] == 0x4E            # ord('N'); sequences are upper-cased
-            b_is_n = s2rc[b] == 0x4E
+            a_is_n = s1[a] == _N
+            b_is_n = s2rc[b] == _N
             if a_is_n != b_is_n:              # rescue: a real call beats an N
                 if a_is_n:                    # R2 rescues R1
                     s1b[a] = s2rc[b]
-                    q1b[a] = qb
-                    n += 1                    # `n` counts R1 only, by contract
-                    rescued1 += 1
-                elif write_r2:                # R1 rescues R2
-                    s2rcb[b] = s1b[a]
-                    s2b[j2] = _COMPLEMENT[s1b[a]]
-                    q2b[j2] = qa
-                    rescued2 += 1             # only where it is actually WRITTEN
+                    q1b[a] = q2r[b]
+                    n += 1
+                    rescued += 1
+                # R1 rescuing R2 would write a copy nothing emits: skip it.
             elif a_is_n:                      # both are N: nothing to rescue from
                 pass
-            elif qb > qa:                     # R2 is the better-supported call
-                nq = disagree_q[qb * 256 + qa]
-                s1b[a] = s2rc[b]              # R2's base already stands in s2rc/s2
-                q1b[a] = nq
-                if write_r2:
-                    q2b[j2] = nq
+            elif q2r[b] > q1[a]:              # R2 is the better-supported call
+                s1b[a] = s2rc[b]
+                q1b[a] = disagree_q[q2r[b] * 256 + q1[a]]
                 n += 1
             else:                             # R1 wins, but it is contested: derate it
-                nq = disagree_q[qa * 256 + qb]
-                q1b[a] = nq
-                if write_r2:
-                    s2rcb[b] = s1b[a]         # keep s2rc the exact revcomp of s2
-                    s2b[j2] = _COMPLEMENT[s1b[a]]
-                    q2b[j2] = nq
+                q1b[a] = disagree_q[q1[a] * 256 + q2r[b]]
     if s1b is None:
-        return s1, q1, s2, q2, s2rc, 0, 0, 0
-    if not write_r2:
-        return bytes(s1b), bytes(q1b), s2, q2, s2rc, n, rescued1, rescued2
-    return (bytes(s1b), bytes(q1b), bytes(s2b), bytes(q2b), bytes(s2rcb), n,
-            rescued1, rescued2)
-
-
-def _balanced_split(L, len1, len2):
-    """Emitted lengths for a trimmed pair: as close to equal as the geometry allows.
-
-    The pair must tile the fragment exactly once, so ``keep1 + keep2 == L`` is forced and
-    the only freedom is where the cut falls. Splitting the overlap down the middle rather
-    than taking all of it off R2 keeps the two emitted reads the same length -- what
-    downstream aligners and models expect -- and discards the *last* cycles of both
-    reads, the lowest-quality bases in the pair, instead of one read's entire copy.
-
-    ``keep1`` is clamped into ``[L - len2, len1]``, the range in which both reads can
-    supply their share; for equal-length mates the clamp never binds and this is exactly
-    "cut ``olen / 2`` from each".
-    """
-    k = (L + 1) // 2                  # an odd overlap leaves the extra base on R1
-    k = max(k, L - len2)
-    k = min(k, len1)
-    return k, L - k
+        return s1, q1, 0, 0
+    return bytes(s1b), bytes(q1b), n, rescued
 
 
 def _build_merged(s, s1, q1, s2rc, q2, len1, len2):
@@ -357,13 +459,6 @@ def _prov_name(header, bits, trim3_n, subn_n, rescued_n):
     return out
 
 
-def _trim_is_allowed(L, len1, len2, lr):
-    """May this pair be trimmed? Each mate must reach at least ``lr`` past the other's
-    3' end — which both keeps every emitted read above the length filter and caps the
-    overlap the trim band may act on."""
-    return (L - len1) >= lr and (L - len2) >= lr
-
-
 def _trim3(seq, qual):
     """Cut a read at its first ``N``, keeping ``[0, first_N)``.
 
@@ -380,55 +475,83 @@ def _trim3(seq, qual):
     return seq[:k], qual[:k], k
 
 
-def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-                 min_read_length, disagree_q, npolicy=NPOLICY_TRIM3, rng_seed=0,
-                 pair_index=0):
+def _npolicy_mate(seq, qual, npolicy, seed, rec):
+    """The N policy on one mate. Returns ``(seq, qual, k)``, ``k`` the bases it touched:
+    substituted under ``random`` (``rec`` = ``2 * pair_index + mate``, which is what
+    makes substitution position-derived), cut off under ``trim3``, none under ``keep``.
+    """
+    if npolicy == NPOLICY_RANDOM:
+        seq, k = _sub_n(seq, seed, rec)
+        return seq, qual, k
+    if npolicy == NPOLICY_TRIM3:
+        t_seq, t_qual, k = _trim3(seq, qual)
+        return t_seq, t_qual, len(seq) - k
+    return seq, qual, 0
+
+
+def process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table,
+                 adapter_trimmed, min_read_length, disagree_q, npolicy=NPOLICY_TRIM3,
+                 rng_seed=0, pair_index=0, rt_check=0):
     """Classify one pair and build its output records.
 
-    Returns ``(records, outcome, n_dropped, score_q, overlap_len, mismatches,
-    bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)``,
-    with each record a ``(header, seq, qual)`` tuple.  The thin public shim over
-    :func:`_process_pair_ex`, which additionally carries each record's PROV_*
-    byte -- the record adapter reads the bits there directly, with no
-    ``ZN:i:`` tag round-trip, mirroring ``PairResult::prov`` in the C++ core.
+    Returns ``(records, outcome, n_dropped, shift, score_q, overlap_len, mismatches,
+    bases_consensus_changed, implausible, npolicy_bases, n_rescued, detected_bases,
+    detected_mismatches, readthrough_strong, detected_overlap_len)``, with each record a
+    ``(header, seq, qual)`` tuple. ``shift``/``score_q``/``overlap_len``/``mismatches``
+    are the alignment the pair was merged from (``overlap_len == 0``: none); a refused
+    implausible alignment reports zeros there and ``implausible == 1``. The last four
+    are the run's
+    diagnostics (see :func:`_process_pair_ex`); none of them affects a decision. The thin
+    public shim over :func:`_process_pair_ex`, which additionally carries each record's
+    PROV_* byte -- the record adapter reads the bits there directly, with no ``ZN:i:``
+    tag round-trip, mirroring ``PairResult::prov`` in the C++ core.
     """
+    _check_weights(match_q, step_q, "process_pair()")
+    _check_npolicy(npolicy, "process_pair()")
+    _check_tables(t_table, dfit_table, "process_pair()")
     records, *rest = _process_pair_ex(
-        h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-        min_read_length, disagree_q, npolicy, rng_seed, pair_index)
+        h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table, adapter_trimmed,
+        min_read_length, disagree_q, npolicy, rng_seed, pair_index, rt_check)
     return ([r[:3] for r in records], *rest)
 
 
-def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-                     min_read_length, disagree_q, npolicy=NPOLICY_TRIM3, rng_seed=0,
-                     pair_index=0):
+def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table,
+                     adapter_trimmed, min_read_length, disagree_q,
+                     npolicy=NPOLICY_TRIM3, rng_seed=0, pair_index=0, rt_check=0):
     """:func:`process_pair` with records as ``(header, seq, qual, prov)``.
 
-    The last two are pair totals. Their per-mate splits stay local: they exist only to
-    build each record's provenance tokens, and summing them here keeps the run-level
-    counter tuple at its existing width — see :func:`_prov_name` and trap 6 in
-    ``docs/HANDOFF_0.4.0.md``.
+    **The decision** is :func:`overlap`'s verdict, and there are two outcomes::
 
-    **The decision** is a single ``argmax`` shift read at two thresholds::
+        verdict MERGE           -> one full-fragment record (R1 wins ties in the
+                                   posterior consensus), unless trim3 has cut the mates
+                                   so far that they no longer tile the fragment, and
+                                   then as below
+        verdict NONE/IMPLAUSIBLE -> both mates, unchanged apart from the N policy --
+                                   never the consensus, which only a merged record uses
 
-        score >= t_merge_q            -> merge (one full-fragment record)
-        t_trim_q <= score < t_merge_q -> keep both, split the redundant overlap between
-                                         their 3' ends so the fragment is tiled once
-        score <  t_trim_q             -> keep both unchanged
+    A merged record shorter than ``min_read_length`` is dropped (it is its fragment, so
+    nothing is lost that was not already too short).
 
-    **The trim is symmetric.** The overlap sits at the 3' end of *both* mates (each read
-    starts at a fragment end and reads inward), so cutting half from each tiles the
-    fragment exactly once just as taking it all off R2 did -- and leaves the two emitted
-    reads the same length, which is what downstream aligners and models expect, while
-    discarding the last cycles of both reads rather than one read's whole copy. Because
-    both mates now keep part of the overlap, the consensus is written into both.
+    **Two diagnostics ride along; neither changes anything above** (plan §4):
 
-    Trimming applies only to the normal (``s >= 0``) geometry: in a read-through the
-    redundant bases are R2's *5'* fragment copy and its 3' end is adapter, so there is
-    nothing sensible to cut -- such a pair is either merged or kept whole.
-
-    **Trim guard:** a trim that would leave *either* read below ``min_read_length`` keeps
-    both *untrimmed* instead, turning a would-be whole-fragment discard into a no-op. It
-    binds far less often than it did, because balancing puts both reads near ``L / 2``.
+    * ``detected_bases``/``detected_mismatches`` -- informative positions and
+      informative mismatches of the best alignment (every position where either mate
+      reads ``N`` left out, :func:`_n_positions`) whenever it reached ``T``, i.e. for the
+      MERGE *and* the IMPLAUSIBLE verdict: every overlap the scan detected, before the
+      gate. Summed over a run they are the disagreement
+      rate ``--error-rate`` is checked against. Before the gate, because the gate is
+      what a too-low ``e`` makes wrong: a rate measured on its survivors could never
+      exceed the ``e`` that filtered them.
+    * ``detected_overlap_len`` -- that alignment's length, the ``n`` the gate looked
+      ``dfit[n]`` up at (0 when nothing reached ``T``). Its histogram over a run is what
+      the expected share of refused true overlaps is summed over
+      (:func:`zna.merge.cli.expected_refused_fraction`).
+    * ``readthrough_strong`` -- with *rt_check* set, 1 when the UNRESTRICTED best shift
+      reaches ``T`` as a read-through (``L = s + len2 < max(len1, len2)``): the
+      ``--adapter-trimmed`` check. Without the declaration every shift is eligible, so
+      that shift is the scan's own winner and costs nothing; under it, the shifts it
+      forbids were never visited and one extra unrestricted scan runs. The caller sets
+      *rt_check* for the input's first pairs only.
 
     **Pair integrity:** an unmerged pair is emitted all-or-nothing. A lone surviving mate
     would be encoded as a spurious "single" -- a full molecule with both endpoints --
@@ -437,104 +560,81 @@ def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_
     """
     len1, len2 = len(s1), len(s2)
     s2rc = reverse_complement(s2)
-    shift, score, olen, diff = scan(s1, s2rc, len1, len2, match_q, step_q, t_trim_q)
+    verdict, shift, score, olen, diff, informative, both_n = _decide(
+        s1, s2rc, len1, len2, match_q, step_q, t_table, dfit_table, adapter_trimmed)
+    implausible = 1 if verdict == VERDICT_IMPLAUSIBLE else 0
+    # Compared positions minus the uninformative ones: the one-sided N positions (all
+    # mismatches, so `diff - informative` counts them) and the N-against-N ones.
+    det_bases = olen - (diff - informative) - both_n
+    det_mismatches = informative
+    det_len = olen
+    rt_strong = 0
+    if rt_check and len1 and len2:
+        if adapter_trimmed:
+            rs, _rsc, rn, _rd = scan(s1, s2rc, len1, len2, match_q, step_q,
+                                     t_table[len1 + len2 - 1], 0)
+        else:
+            rs, rn = shift, olen
+        rt_strong = 1 if rn and rs + len2 < (len1 if len1 > len2 else len2) else 0
+    if verdict != VERDICT_MERGE:
+        shift = score = olen = diff = 0    # nothing is built from a refused alignment
 
     lr = min_read_length
-    L = shift + len2                       # the inferred fragment length; 0 if no overlap
+    L = shift + len2                       # the inferred fragment length, if merging
 
-    # PROVISIONAL decision, on the full reads. It settles where the consensus is written
-    # (below) and carries the evidence forward: the score is a statement about this
-    # pair's fragment length, and trimming interior bases cannot change a fragment's
-    # length. The final decision is re-taken after trimming, in `_decide` -- but on
-    # GEOMETRY, never by re-scoring. See docs/NPOLICY_PLAN.md D4a.
-    prov_merge = olen > 0 and score >= t_merge_q
-    prov_band = olen > 0 and shift >= 0 and t_trim_q <= score < t_merge_q
-    prov_trim = prov_band and _trim_is_allowed(L, len1, len2, lr)
+    # The consensus is written only into R1, and only on the merge verdict: the merged
+    # record takes the overlap from R1. A pair with no admitted overlap is emitted
+    # untouched -- an alignment too suspect to merge on is too suspect to rewrite bases
+    # on (measured under 0.5.x: of 3,068 kept pairs with a detected overlap, zero had
+    # found the true shift, and writing R1 there turned 1,379 correct bases wrong to fix
+    # 78).
+    s1_in, q1_in = s1, q1
+    n_consensus = n_rescued = 0
+    if diff > 0:
+        s1, q1, n_consensus, n_rescued = _consensus_r1_overlap(
+            s1, q1, s2rc, q2[::-1], shift, olen, disagree_q)
 
-    # WHERE the consensus is written: into the records whose CONSTRUCTION depends on
-    # the overlap being real, and nowhere else.
-    #
-    #   merged  -> R1 alone. R1's overlap region becomes the merged record; R2
-    #              contributes only outside it, so its copy is discarded.
-    #   trimmed -> both. Each mate keeps part of the overlap, so both copies are emitted
-    #              and both must carry the same call.
-    #   kept    -> neither. Nothing emitted depends on the alignment being right.
-    #
-    # The kept case is what the measurements say, not a symmetry nicety. A detection
-    # that lands in KEPT is spurious almost by construction: at `shift >= 0` it is here
-    # only because `trim_is_allowed` refused it, which needs an inferred overlap over
-    # ~110 bases -- and a genuine one of that length scores ~218 bits and would have
-    # merged; at `shift < 0` a genuine read-through overlap equals the fragment length,
-    # so scoring in [8, 28) needs a 5-14 bp fragment. An overlap too suspect to CUT on is
-    # too suspect to REWRITE BASES on.
-    #
-    # Measured on 1M ground-truth pairs: of 3,068 kept pairs with a detected overlap,
-    # ZERO found the true shift and 97.3% had no true overlap at all. Wrong emitted bases
-    # in the overlap window -- correct-neither 208, correct-R1-only (the old behaviour)
-    # 1,509, correct-both 17,870. The old R1 write turned 1,379 correct bases wrong to
-    # fix 78.
-    write_r1 = prov_merge or prov_trim
-    write_r2 = prov_trim
+    # ---- the N policy, after the rescue, so a no-call the mate could answer costs
+    #      nothing. trim3 is 3' only, so both 5' anchors -- the two fragment termini --
+    #      are untouched however short the reads get.
+    s1p, q1p, npolicy_1 = _npolicy_mate(s1, q1, npolicy, rng_seed, pair_index * 2)
+    s2p, q2p, npolicy_2 = _npolicy_mate(s2, q2, npolicy, rng_seed, pair_index * 2 + 1)
 
-    n_consensus = trim_guard = 0
-    npolicy_1 = npolicy_2 = rescued_1 = rescued_2 = 0
-    if diff > 0 and write_r1:
-        s1, q1, s2, q2, s2rc, n_consensus, rescued_1, rescued_2 = \
-            _consensus_pair_overlap(
-                s1, q1, s2, q2, s2rc, q2[::-1], shift, olen, disagree_q, write_r2)
-
-    # ---- trim3: cut each read at its first SURVIVING N -------------------------
-    #
-    # After the rescue, so a no-call the mate could answer costs nothing. 3' only, so
-    # both 5' anchors -- the two fragment termini -- are untouched however short the
-    # reads get.
-    if npolicy == NPOLICY_RANDOM:
-        # Substitution does not change a length, so the coverage test below is
-        # unaffected and `random` never costs a merge -- unlike trim3.
-        s1n, k1 = _sub_n(s1, rng_seed, pair_index * 2)
-        s2n, k2 = _sub_n(s2, rng_seed, pair_index * 2 + 1)
-        npolicy_1, npolicy_2 = k1, k2
-        if k1 or k2:
-            s1, s2 = s1n, s2n
-            s2rc = reverse_complement(s2)
-    elif npolicy == NPOLICY_TRIM3:
-        s1t, q1t, k1 = _trim3(s1, q1)
-        s2t, q2t, k2 = _trim3(s2, q2)
-        if k1 != len1 or k2 != len2:
-            npolicy_1, npolicy_2 = len1 - k1, len2 - k2
-            s1, q1, s2, q2 = s1t, q1t, s2t, q2t
-            len1, len2 = k1, k2
-            s2rc = reverse_complement(s2)
-            # `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to
-            # len2. R2 keeps its 5' anchor at fragment position L-1, so the trimmed mate
-            # covers [L - len2, L) and the offset becomes L - len2. L itself is unchanged
-            # -- that is the whole point.
-            shift = L - len2
-
-    # ---- the final decision, on GEOMETRY, reusing the original evidence --------
+    # ---- merge on GEOMETRY, reusing the evidence ------------------------------
     #
     # The pair still tiles the fragment iff len1 + len2 >= L. When it does, the
     # reconstruction IS the fragment, exactly and N-free. Nothing is re-scored: trimming
     # cuts 3' ends, which is where a normal overlap lives, so a re-scan would refuse
-    # merges it had ample evidence for a moment earlier.
-    covers = olen > 0 and (len1 + len2) >= L
-    will_merge = prov_merge and covers
-    will_trim = (not will_merge) and prov_band and (len1 + len2) > L \
-        and _trim_is_allowed(L, len1, len2, lr)
-    if will_trim:
-        keep1, keep2 = _balanced_split(L, len1, len2)
+    # merges it had ample evidence for a moment earlier. Only trim3 changes a length, so
+    # only trim3 can turn a merge verdict into a kept pair here.
+    will_merge = olen > 0 and len(s1p) + len(s2p) >= L
 
-    # The run-level counters are the per-mate ones summed, so they keep their exact
-    # previous values and the 15-field counter tuple does not grow -- `_fold` in
-    # merge/cli.py sums a fixed prefix, and a counter added past it reports zero.
+    if not will_merge and s1 is not s1_in:
+        # A merge verdict that trim3 cut below tiling: the pair is KEPT, and a kept mate
+        # is the input with the N policy applied and nothing else (plan §2, and §8's
+        # "kept-mate substitutions are zero by construction"). The consensus -- its
+        # substitutions, derated qualities and rescues -- existed only to build the
+        # merged record, so R1 is re-derived from the input and none of it is counted.
+        # Under 0.5.x the rewritten R1 was emitted here (167 kept pairs on the dev
+        # panel's N benches, 10 of their substitutions to a wrong base).
+        s1p, q1p, npolicy_1 = _npolicy_mate(s1_in, q1_in, npolicy, rng_seed,
+                                            pair_index * 2)
+        n_consensus = n_rescued = 0
+
+    # The run-level counters are the per-mate ones summed.
     npolicy_bases = npolicy_1 + npolicy_2
-    n_rescued = rescued_1 + rescued_2
     # Which policy bit a touched record earns, and which token carries its count.
     rnd = npolicy == NPOLICY_RANDOM
     npolicy_bit = PROV_NSUBBED if rnd else PROV_NTRIMMED
 
     if will_merge:
-        seq, qual, n1, n2 = _build_merged(shift, s1, q1, s2rc, q2, len1, len2)
+        # `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to R2's
+        # length. R2 keeps its 5' anchor at fragment position L-1, so a trimmed mate
+        # covers [L - len2', L) and the offset becomes L - len2'. L itself is unchanged
+        # -- that is the whole point.
+        s2prc = s2rc if s2p is s2 else reverse_complement(s2p)
+        seq, qual, n1, n2 = _build_merged(L - len(s2p), s1p, q1p, s2prc, q2p,
+                                          len(s1p), len(s2p))
         # A merged record is built from BOTH mates, so its provenance is the pair's: the
         # policy counts are the two summed, and the rescues are R1's, the only ones that
         # reached the emitted bases.
@@ -549,37 +649,23 @@ def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_
                           n_rescued) + b" merged_%d_%d" % (n1, n2)
         cand = [(name, seq, qual, bits)]
         paired, outcome = False, MERGED
-    elif will_trim:
-        b1 = (PROV_TRIMMED | (PROV_RESCUED if rescued_1 else 0)
-              | (npolicy_bit if npolicy_1 else 0))
-        b2 = (PROV_TRIMMED | (PROV_RESCUED if rescued_2 else 0)
-              | (npolicy_bit if npolicy_2 else 0))
-        cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
-                            npolicy_1 if rnd else 0, rescued_1),
-                 s1[:keep1], q1[:keep1], b1),
-                (_prov_name(h2, b2, 0 if rnd else npolicy_2,
-                            npolicy_2 if rnd else 0, rescued_2),
-                 s2[:keep2], q2[:keep2], b2)]
-        paired, outcome = True, TRIMMED
     else:
-        if prov_band and not prov_trim:
-            trim_guard = 1                                  # guard fired
-        # No consensus is written on this path, so a kept record can never carry
-        # PROV_RESCUED -- only the N policy can have touched it.
+        # A kept record never carries PROV_RESCUED -- only the N policy has touched it.
         b1 = npolicy_bit if npolicy_1 else 0
         b2 = npolicy_bit if npolicy_2 else 0
         cand = [(_prov_name(h1, b1, 0 if rnd else npolicy_1,
-                            npolicy_1 if rnd else 0, 0), s1, q1, b1),
+                            npolicy_1 if rnd else 0, 0), s1p, q1p, b1),
                 (_prov_name(h2, b2, 0 if rnd else npolicy_2,
-                            npolicy_2 if rnd else 0, 0), s2, q2, b2)]
+                            npolicy_2 if rnd else 0, 0), s2p, q2p, b2)]
         paired, outcome = True, KEPT
 
     if paired:
         kept = cand if (len(cand[0][1]) >= lr and len(cand[1][1]) >= lr) else []
     else:
         kept = [r for r in cand if len(r[1]) >= lr]
-    return (kept, outcome, len(cand) - len(kept), score, olen, diff,
-            n_consensus, trim_guard, npolicy_bases, n_rescued)
+    return (kept, outcome, len(cand) - len(kept), shift, score, olen, diff,
+            n_consensus, implausible, npolicy_bases, n_rescued, det_bases,
+            det_mismatches, rt_strong, det_len)
 
 
 # =========================================================================== #
@@ -593,7 +679,23 @@ def _process_pair_ex(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_
 # never scans for record boundaries. A partial record at the end of a buffer is not an
 # error -- it is simply not consumed, and at EOF the caller checks that both buffers
 # came out empty.
+#
+# **The read-through check** runs on the pairs numbered below `rt_check_pairs` -- the
+# input's first ones, counted from `base_index`, not from the chunk -- so it covers the
+# same pairs at any chunk size or thread count (params.READTHROUGH_CHECK_PAIRS).
+#
+# **Table capacity.** The policy tables cover reads up to a capacity (params.py). A pair
+# with a longer read is not consumed: the chunk stops in front of it and returns
+# `need`, the read length the tables must cover, and the caller grows them and calls
+# again from where this one stopped. `need == 0` means the chunk ran to its end. The
+# table prefix never changes when it grows, so where a chunk happened to stop leaves no
+# trace in the output.
 # =========================================================================== #
+
+#: Counter fields, in the order every chunk function returns them. Mirrors
+#: `ChunkCounters` in fastq_chunk.hpp and `_N_COUNTERS` in merge/cli.py.
+N_COUNTERS = 16
+
 
 def _bump(hist, i):
     """Count one observation of value *i*, growing *hist* to fit.
@@ -638,20 +740,88 @@ def _next_record(buf, pos, limit, which):
     return h, s, q, e4 + 1
 
 
-def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge_q,
-                t_trim_q, min_read_length, disagree_q, check_sync, base_index,
-                npolicy=NPOLICY_TRIM3, rng_seed=0):
-    """Merge every whole pair available in both buffers.
+def _check_sync(h1, h2, index):
+    if base_name(h1) != base_name(h2):
+        raise InputError(
+            f"R1/R2 out of sync at pair {index + 1}: "
+            f"'{base_name(h1).decode('latin-1')}' != "
+            f"'{base_name(h2).decode('latin-1')}'")
 
-    Returns ``(blob, consumed1, consumed2, counters, len_hist, olen_hist,
-    insert_hist)``.
+
+class _Tally:
+    """The per-chunk counters and histograms both chunk adapters accumulate."""
+
+    __slots__ = ("n_pairs", "merged", "kept", "emitted", "dropped", "frags_short",
+                 "bases_consensus", "implausible", "sum_olen", "sum_diff",
+                 "max_read_len", "npolicy_bases", "n_rescued", "det_bases",
+                 "det_mismatches", "rt_strong",
+                 "len_hist", "olen_hist", "insert_hist", "det_olen_hist")
+
+    def __init__(self):
+        for name in self.__slots__[:N_COUNTERS]:
+            setattr(self, name, 0)
+        self.len_hist, self.olen_hist, self.insert_hist = [], [], []
+        self.det_olen_hist = []
+
+    def pair(self, outcome, records, n_dropped, olen, diff, n_consensus, implausible,
+             npol_bases, rescued, det_bases, det_mismatches, rt_strong, det_len):
+        self.n_pairs += 1
+        self.dropped += n_dropped
+        self.bases_consensus += n_consensus
+        self.implausible += implausible
+        self.npolicy_bases += npol_bases
+        self.n_rescued += rescued
+        self.det_bases += det_bases
+        self.det_mismatches += det_mismatches
+        self.rt_strong += rt_strong
+        # Every overlap that reached T, merged and refused alike: the lengths the gate
+        # looked dfit up at, for the expected share of true overlaps it refused.
+        if det_len:
+            _bump(self.det_olen_hist, det_len)
+        if outcome == MERGED:
+            self.merged += 1
+        else:
+            self.kept += 1
+            if not records:
+                self.frags_short += 1
+        # The overlap statistics are over ADMITTED overlaps -- the alignments pairs were
+        # merged from, after the plausibility gate -- so `sum_diff / sum_olen` is the
+        # post-admission disagreement rate. The pre-gate one is det_* above.
+        if olen:
+            _bump(self.olen_hist, olen)
+            self.sum_olen += olen
+            self.sum_diff += diff
+
+    def record(self, outcome, length):
+        self.emitted += 1
+        _bump(self.len_hist, length)
+        if outcome == MERGED:
+            _bump(self.insert_hist, length)
+
+    def counters(self):
+        return (self.n_pairs, self.merged, self.kept, self.emitted, self.dropped,
+                self.frags_short, self.bases_consensus, self.implausible,
+                self.sum_olen, self.sum_diff, self.max_read_len, self.npolicy_bases,
+                self.n_rescued, self.det_bases, self.det_mismatches, self.rt_strong)
+
+
+def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_table,
+                dfit_table, adapter_trimmed, min_read_length, disagree_q, check_sync,
+                base_index, npolicy=NPOLICY_TRIM3, rng_seed=0, rt_check_pairs=0):
+    """Merge every whole pair available in both buffers (see "Table capacity" and "The
+    read-through check" above).
+
+    Returns ``(blob, consumed1, consumed2, counters, len_hist, olen_hist, insert_hist,
+    det_olen_hist, need)``: ``olen_hist`` bins the ADMITTED overlaps (the merged
+    pairs'), ``det_olen_hist`` every DETECTED one, before the gate.
     """
+    _check_weights(match_q, step_q, "merge_chunk()")
+    _check_npolicy(npolicy, "merge_chunk()")
+    _check_tables(t_table, dfit_table, "merge_chunk()")
     parts = []
-    n_pairs = merged = trimmed = kept = emitted = dropped = 0
-    bases_trimmed = frags_short = bases_consensus = trim_guard = 0
-    sum_olen = sum_diff = max_read_len = 0
-    npolicy_bases = n_rescued_tot = 0
-    len_hist, olen_hist, insert_hist = [], [], []
+    tally = _Tally()
+    cap = table_capacity(t_table, dfit_table)
+    need = 0
     pos1, pos2 = start1, start2
 
     while True:
@@ -664,70 +834,44 @@ def merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_merge
         h1, s1, q1, try1 = a
         h2, s2, q2, try2 = b
         longest = len(s1) if len(s1) > len(s2) else len(s2)
-        if longest > max_read_len:
-            max_read_len = longest
+        if longest > cap:
+            need = longest
+            break
+        if longest > tally.max_read_len:
+            tally.max_read_len = longest
+        if check_sync:
+            _check_sync(h1, h2, base_index + tally.n_pairs)
 
-        if check_sync and base_name(h1) != base_name(h2):
-            raise InputError(
-                f"R1/R2 out of sync at pair {base_index + n_pairs + 1}: "
-                f"'{base_name(h1).decode('latin-1')}' != "
-                f"'{base_name(h2).decode('latin-1')}'")
-
-        (records, outcome, n_dropped, score, olen, diff,
-         n_consensus, guard, npol_bases, rescued) = process_pair(
-            h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-            min_read_length, disagree_q, npolicy, rng_seed, base_index + n_pairs)
-
-        n_pairs += 1
-        dropped += n_dropped
-        bases_consensus += n_consensus
-        trim_guard += guard
-        npolicy_bases += npol_bases
-        n_rescued_tot += rescued
-        if outcome == MERGED:
-            merged += 1
-        elif outcome == TRIMMED:
-            trimmed += 1
-            # Both mates are cut now, so charge both: the counter is "redundant bases
-            # removed", which is the overlap length either way.
-            if records:
-                bases_trimmed += ((len(s1) - len(records[0][1]))
-                                  + (len(s2) - len(records[1][1])))
-        else:
-            kept += 1
-        if not records and outcome != MERGED:
-            frags_short += 1
-        if olen:
-            _bump(olen_hist, olen)
-            sum_olen += olen
-            sum_diff += diff
-        for header, seq, qual in records:
+        index = base_index + tally.n_pairs
+        (records, outcome, n_dropped, _shift, _score, olen, diff, n_consensus,
+         implausible, npol_bases, rescued, det_b, det_d, rt,
+         det_len) = _process_pair_ex(
+            h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table,
+            adapter_trimmed, min_read_length, disagree_q, npolicy, rng_seed, index,
+            1 if index < rt_check_pairs else 0)
+        tally.pair(outcome, records, n_dropped, olen, diff, n_consensus, implausible,
+                   npol_bases, rescued, det_b, det_d, rt, det_len)
+        for header, seq, qual, _prov in records:
             parts.append(b"@%b\n%b\n+\n%b\n" % (header, seq, qual))
-            emitted += 1
-            L = len(seq)
-            _bump(len_hist, L)
-            if outcome == MERGED:
-                _bump(insert_hist, L)
+            tally.record(outcome, len(seq))
         pos1, pos2 = try1, try2
 
-    counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
-                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
-                max_read_len, npolicy_bases, n_rescued_tot)
-    return (b"".join(parts), pos1 - start1, pos2 - start2, counters,
-            len_hist, olen_hist, insert_hist)
+    return (b"".join(parts), pos1 - start1, pos2 - start2, tally.counters(),
+            tally.len_hist, tally.olen_hist, tally.insert_hist, tally.det_olen_hist,
+            need)
 
 
 def merge_chunk_records(buf1, start1, end1, buf2, start2, end2, match_q, step_q,
-                        t_merge_q, t_trim_q, min_read_length, disagree_q,
-                        check_sync, base_index, want_headers,
-                        npolicy=NPOLICY_TRIM3, rng_seed=0):
+                        t_table, dfit_table, adapter_trimmed, min_read_length,
+                        disagree_q, check_sync, base_index, want_headers,
+                        npolicy=NPOLICY_TRIM3, rng_seed=0, rt_check_pairs=0):
     """Merge every whole pair available, emitting RECORDS instead of FASTQ text.
 
     The reference half of the ``zna encode --merge-pairs`` adapter; the
     specification the C++ ``merge_chunk_records`` must match element for
     element.  Returns ``(seqs, ends, consumed1, consumed2, counters, len_hist,
-    olen_hist, insert_hist)`` where *seqs* is one bytes blob and each end is
-    ``(seq_off, seq_len, hdr_off, hdr_len, slot, prov)``.
+    olen_hist, insert_hist, det_olen_hist, need)`` where *seqs* is one bytes blob and each end
+    is ``(seq_off, seq_len, hdr_off, hdr_len, slot, prov)``.
 
     Conventions mirror the text adapter exactly, and the two differ on purpose:
     *consumed* counts are RELATIVE to ``start`` (the caller does ``pos += c``),
@@ -737,13 +881,14 @@ def merge_chunk_records(buf1, start1, end1, buf2, start2, end2, match_q, step_q,
     false.  ``prov`` is the record's PROV_* byte taken directly from the pair
     result -- no ``ZN:i:`` tag round-trip.
     """
+    _check_weights(match_q, step_q, "merge_chunk_records()")
+    _check_npolicy(npolicy, "merge_chunk_records()")
+    _check_tables(t_table, dfit_table, "merge_chunk_records()")
     seq_parts, ends = [], []
     seq_off = 0
-    n_pairs = merged = trimmed = kept = emitted = dropped = 0
-    bases_trimmed = frags_short = bases_consensus = trim_guard = 0
-    sum_olen = sum_diff = max_read_len = 0
-    npolicy_bases = n_rescued_tot = 0
-    len_hist, olen_hist, insert_hist = [], [], []
+    tally = _Tally()
+    cap = table_capacity(t_table, dfit_table)
+    need = 0
     pos1, pos2 = start1, start2
 
     while True:
@@ -756,41 +901,23 @@ def merge_chunk_records(buf1, start1, end1, buf2, start2, end2, match_q, step_q,
         h1, s1, q1, try1 = a
         h2, s2, q2, try2 = b
         longest = len(s1) if len(s1) > len(s2) else len(s2)
-        if longest > max_read_len:
-            max_read_len = longest
+        if longest > cap:
+            need = longest
+            break
+        if longest > tally.max_read_len:
+            tally.max_read_len = longest
+        if check_sync:
+            _check_sync(h1, h2, base_index + tally.n_pairs)
 
-        if check_sync and base_name(h1) != base_name(h2):
-            raise InputError(
-                f"R1/R2 out of sync at pair {base_index + n_pairs + 1}: "
-                f"'{base_name(h1).decode('latin-1')}' != "
-                f"'{base_name(h2).decode('latin-1')}'")
-
-        (records, outcome, n_dropped, score, olen, diff,
-         n_consensus, guard, npol_bases, rescued) = _process_pair_ex(
-            h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-            min_read_length, disagree_q, npolicy, rng_seed, base_index + n_pairs)
-
-        n_pairs += 1
-        dropped += n_dropped
-        bases_consensus += n_consensus
-        trim_guard += guard
-        npolicy_bases += npol_bases
-        n_rescued_tot += rescued
-        if outcome == MERGED:
-            merged += 1
-        elif outcome == TRIMMED:
-            trimmed += 1
-            if records:
-                bases_trimmed += ((len(s1) - len(records[0][1]))
-                                  + (len(s2) - len(records[1][1])))
-        else:
-            kept += 1
-        if not records and outcome != MERGED:
-            frags_short += 1
-        if olen:
-            _bump(olen_hist, olen)
-            sum_olen += olen
-            sum_diff += diff
+        index = base_index + tally.n_pairs
+        (records, outcome, n_dropped, _shift, _score, olen, diff, n_consensus,
+         implausible, npol_bases, rescued, det_b, det_d, rt,
+         det_len) = _process_pair_ex(
+            h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table,
+            adapter_trimmed, min_read_length, disagree_q, npolicy, rng_seed, index,
+            1 if index < rt_check_pairs else 0)
+        tally.pair(outcome, records, n_dropped, olen, diff, n_consensus, implausible,
+                   npol_bases, rescued, det_b, det_d, rt, det_len)
 
         for i, (_header, seq, _qual, prov) in enumerate(records):
             slot = (SLOT_MERGED if outcome == MERGED
@@ -808,18 +935,12 @@ def merge_chunk_records(buf1, start1, end1, buf2, start2, end2, match_q, step_q,
             ends.append((seq_off, len(seq), hdr_off, hdr_len, slot, prov))
             seq_parts.append(seq)
             seq_off += len(seq)
-            emitted += 1
-            L = len(seq)
-            _bump(len_hist, L)
-            if outcome == MERGED:
-                _bump(insert_hist, L)
+            tally.record(outcome, len(seq))
         pos1, pos2 = try1, try2
 
-    counters = (n_pairs, merged, trimmed, kept, emitted, dropped, bases_trimmed,
-                frags_short, bases_consensus, trim_guard, sum_olen, sum_diff,
-                max_read_len, npolicy_bases, n_rescued_tot)
-    return (b"".join(seq_parts), ends, pos1 - start1, pos2 - start2, counters,
-            len_hist, olen_hist, insert_hist)
+    return (b"".join(seq_parts), ends, pos1 - start1, pos2 - start2, tally.counters(),
+            tally.len_hist, tally.olen_hist, tally.insert_hist, tally.det_olen_hist,
+            need)
 
 
 def split_records(buf, start, max_records):

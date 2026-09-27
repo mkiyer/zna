@@ -312,6 +312,14 @@ def _canonical_json(obj) -> bytes:
     ).encode("ascii")
 
 
+def _merge_record_of(prologue: dict) -> dict | None:
+    """The prologue's ``merge`` object, or ``None``; a present one must be an object."""
+    m = prologue.get("merge")
+    if m is not None and not isinstance(m, dict):
+        raise TypeError(f"'merge' is a {type(m).__name__}, not an object")
+    return m
+
+
 @dataclass(slots=True)
 class ZnaProvenance:
     """The prologue: facts known at encode START, readable before any record.
@@ -327,6 +335,14 @@ class ZnaProvenance:
     writer_version: str
     shuffled: bool
     merged_in_process: bool
+    #: The merge policy the records were produced under, as ``zna encode
+    #: --merge-pairs`` recorded it (``policy``, ``zna_version``, ``alpha``,
+    #: ``error_rate``, ``adapter_trimmed``, ``min_read_length``, ``npolicy``;
+    #: see ``MergeParams.merge_record``).
+    #: ``None`` when the file's merge history is UNKNOWN -- written by a
+    #: two-step pipeline, or by zna < 0.6 -- which a consumer must treat as
+    #: unknown, never as some default policy.
+    merge: dict | None
     #: crc32 of the prologue payload as written; :class:`ZnaTrailer` re-states
     #: it, so the end of the file attests the start.
     crc32: int
@@ -431,6 +447,7 @@ class ZnaWriter:
         "_batch_labels",
         "_shuffled",
         "_merged_in_process",
+        "_merge_record",
         "_len_char",
         "_flag_counts",
         "_len_hist",
@@ -453,6 +470,7 @@ class ZnaWriter:
         rng_seed: int = 0,
         shuffled: bool = False,
         merged_in_process: bool = False,
+        merge_record: dict | None = None,
     ) -> None:
         self._fh = fh
         self._header = header
@@ -512,6 +530,7 @@ class ZnaWriter:
         # holds.  The fuzz suite recounts every generated file against these.
         self._shuffled = shuffled
         self._merged_in_process = merged_in_process
+        self._merge_record = merge_record
         self._len_char = {1: "B", 2: "H", 4: "I"}[header.seq_len_bytes]
         self._flag_counts = [0] * 256
         self._len_hist: dict[int, int] = {}
@@ -980,8 +999,12 @@ class ZnaWriter:
         A count-0 pseudo-block right after the header, so a streaming consumer
         learns what wrote the file -- and whether its order is shuffled --
         before decoding a single record.  Facts that need the whole encode go
-        in the trailer instead; parameter echoes (thresholds, npolicy) go
-        nowhere, because they are QC material, not file facts.
+        in the trailer instead.  Parameter echoes are QC material, not file
+        facts, with one exception: the ``merge`` record, because WHICH merge
+        policy made the records decides whether they may enter training, and
+        nothing else in the file can answer that (MERGE_ACCURACY_PLAN.md §5).
+        It is written only when known -- by ``--merge-pairs``, or copied from
+        the input by re-encode and shuffle -- and absent otherwise.
 
         A 0.4.1 reader decodes this as a valid empty block and moves on.
         """
@@ -994,6 +1017,8 @@ class ZnaWriter:
         }
         if self._merged_in_process:
             prov["merged_in_process"] = True
+        if self._merge_record is not None:
+            prov["merge"] = dict(self._merge_record)
 
         raw = _canonical_json(prov)
         payload = (self._compressor.compress(raw)
@@ -1210,6 +1235,7 @@ class ZnaReader:
                 writer_version=d["writer_version"],
                 shuffled=bool(d["shuffled"]),
                 merged_in_process=bool(d.get("merged_in_process", False)),
+                merge=_merge_record_of(d),
                 crc32=zlib.crc32(payload) & 0xFFFFFFFF,
                 raw=d,
             )

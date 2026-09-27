@@ -1,31 +1,50 @@
-"""Tests for src/zna/merge (single-axis LR overlap scoring + merge/trim/keep).
+"""Tests for src/zna/merge: single-axis LR overlap scoring and the 0.6 merge policy.
 
 Runs with or without the compiled backend. The reference kernel in ``_pymerge`` is the
 oracle the compiled one is defined to agree with, so most of what is checked here is
-checked against both.
+checked against both; the cross-backend classes skip when no compatible extension is
+built (a 0.5.x build is refused by its missing ``POLICY_ABI``).
 
-The suite covers, in order:
+The policy is ``docs/archive/MERGE_ACCURACY_PLAN.md`` §2: merge the best eligible shift when it
+reaches the pair's floor ``T = log2((len1 + len2 - 1) / alpha)`` and its informative
+mismatches are plausible at the same ``alpha`` (``d <= dfit[n]``); keep the pair whole
+otherwise. The suite covers, in order:
 
-  1. threshold arithmetic      5. boundary invariant
-  2. spurious detection rate   6. trim guard
-  3. detection / shift recovery 7. parity with the old rule where it should hold
-  4. read-through
+  1. exact derivations (T, dfit, weights)     7. find_overlap and the contract range
+  2. the run's diagnostics                    8. the plausibility gate
+  3. backend selection and the ABI marker     9. detection, read-through, boundaries
+  4. cross-backend equivalence               10. process_pair
+  5. the fixed-point scale                   11. the CLI, its warnings, table growth
+  6. the argmax total order                  12. the merge review's 19 cases
+
+0.5.3's trim band is gone, and with it every test of the balanced split, the trim guard,
+the trim-path consensus, PROV_TRIMMED and the ``--threshold-*`` flags.
 """
 import gzip
 import json
+import math
 import random
 import sys
+from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
+from zna.merge import cli
+from zna.merge import params as zparams
+from zna.merge.cli import (
+    BASES_CONSENSUS, DET_BASES, DET_MISMATCHES, IMPLAUSIBLE, MAX_READ_LEN, MERGED,
+    N_PAIRS, N_RESCUED, NPOLICY_BASES, RT_STRONG,
+)
 from zna.merge.overlap import (
-    FORWARD, NO_OVERLAP, REVERSE, find_overlap, reverse_complement,
+    IMPLAUSIBLE as V_IMPLAUSIBLE, MERGE as V_MERGE, NONE as V_NONE,
+    find_overlap, reverse_complement, scan_unrestricted,
 )
 from zna.merge.params import (
-    DISAGREE_Q, SCALE, MergeParams, score_weights, threshold_bits, to_bits, to_q,
+    DISAGREE_Q, SCALE, MergeParams, binom_cap, decimal_str, exact, score_weights,
+    threshold_bits, threshold_q, to_q, weights_q,
 )
 from zna.merge.pairs import PairOutcome, base_name, process_pair
-from zna.merge import cli
 
 
 # --------------------------------------------------------------------------- #
@@ -35,19 +54,29 @@ from zna.merge import cli
 ADAPTER1 = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
 ADAPTER2 = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
 
-# Score weights at the default error rate, used to build exact expectations.
+# Score weights at e = 0.01 -- the default, and the rate every fixture below pins -- used
+# to build exact expectations.
 MATCH_W, MISMATCH_W = score_weights(0.01)
 
-#: The reference backend is ~50x slower than the compiled one, so the statistical
-#: sweeps below size themselves to whichever is running.
+
 def _fast_backend():
+    """The reference backend is ~50x slower than the compiled one, so the statistical
+    sweeps below size themselves to whichever is running."""
     from zna.merge.backend import available_merge_backends
     return "accel" in available_merge_backends()
 
+
 # The kernel scores in fixed point (zna/merge/params.py), so every expectation here is
 # an exact integer -- no pytest.approx, and no float anywhere near a decision.
-_P = MergeParams()
-T_MERGE_Q, T_TRIM_Q = _P.t_merge_q, _P.t_trim_q
+_P = MergeParams(error_rate="0.01")
+
+# e = 0.01, min_read_length=1 so tiny test reads survive the QC filter.
+P = MergeParams(error_rate="0.01", min_read_length=1)
+
+
+def t_q(len1, len2, p=_P):
+    """The pair's merge floor in fixed point."""
+    return p.t_q(len1 + len2 - 1)
 
 
 def rc(seq: bytes) -> bytes:
@@ -77,8 +106,7 @@ def cycle_pair(fragment: bytes, read_len: int, rng, name=b"frag"):
     """Full-cycle reads: fragment, then adapter, then random filler to the cycle length.
 
     A shorter-than-cycle read makes the true shift ``L - len(read2)`` rather than
-    ``L - readlen``; building reads at full length keeps the geometry unambiguous
-    (redesign §8c.5).
+    ``L - readlen``; building reads at full length keeps the geometry unambiguous.
     """
     r1 = (fragment + ADAPTER1 + draw(rng, read_len))[:read_len]
     r2 = (rc(fragment) + ADAPTER2 + draw(rng, read_len))[:read_len]
@@ -91,6 +119,11 @@ def mutate(seq: bytes, rng, err: float) -> bytes:
         if rng.random() < err:
             b[i] = ord(rng.choice("ACGT"))
     return bytes(b)
+
+
+def flip(b: int) -> int:
+    """A base guaranteed to differ from *b*."""
+    return ord("A") if b != ord("A") else ord("C")
 
 
 def score_of(matches: int, mismatches: int = 0) -> int:
@@ -111,12 +144,14 @@ def min_matches(threshold_q: int, mismatches: int) -> int:
     return m
 
 
-# Default thresholds, but min_read_length=1 so tiny test reads survive the QC filter.
-P = MergeParams(min_read_length=1)
+def one_n(s1, s2rc, s, n):
+    """Positions of the overlap at shift s where exactly one base is N (brute force)."""
+    i1, i2 = max(s, 0), max(-s, 0)
+    return sum((s1[i1 + k] == 78) != (s2rc[i2 + k] == 78) for k in range(n))
 
 
 # --------------------------------------------------------------------------- #
-# the pre-redesign rule, kept ONLY to pin parity where parity is expected (§8c.7)
+# the pre-redesign rule, kept ONLY to pin parity where parity is expected
 # --------------------------------------------------------------------------- #
 
 def legacy_scan(s1, s2rc, len1, len2, require, diff_limit, diff_pct):
@@ -179,52 +214,402 @@ class TestReverseComplement:
 
 
 # --------------------------------------------------------------------------- #
-# §8c.1 threshold arithmetic — the score must not silently drift
+# 1. exact derivations -- the policy's integers must not silently drift
 # --------------------------------------------------------------------------- #
 
-class TestScoreArithmetic:
-    def test_weights(self):
-        """+2 bits per match (log2 4), -6.23 per mismatch at e = 1%."""
+def _binom_tail(n, e, d):
+    """P(Binom(n, e) >= d), exactly, the slow way."""
+    return sum(math.comb(n, j) * e ** j * (1 - e) ** (n - j) for j in range(d, n + 1))
+
+
+class TestDerivations:
+    """Every number the kernel compares against is derived once, exactly, in params.py.
+
+    These goldens are the integers a corpus was made with. A failure here is not a
+    rounding nuisance: it means the same FASTQ now produces a different corpus.
+    """
+
+    def test_weights_at_one_percent_are_0_5_3s_integers(self):
+        """0.5.3 derived these with libm's log2 and pinned them per platform; exact
+        decimal arithmetic lands on the same two integers."""
+        assert weights_q(Fraction(1, 100)) == (33_311_170, 137_813_407)
+        assert (_P.match_q, _P.step_q) == (33_311_170, 137_813_407)
+
+    def test_float_weights_for_humans(self):
         assert round(MATCH_W, 4) == 1.9855
         assert round(MISMATCH_W, 4) == 6.2288
 
-    @pytest.mark.parametrize("threshold,expected", [
-        (18.0, [10, 13, 16, 19]),      # redesign §5b table, mismatches 0..3
-        (21.0, [11, 14, 17, 20]),
-        (28.0, [15, 18, 21, 24]),
+    @pytest.mark.parametrize("n_shifts,golden", [
+        (99, 445_618_379),     # 2x50: 26.56 bits
+        (199, 462_517_532),    # 2x100: 27.57
+        (299, 472_372_084),    # 2x150: 28.16 -- 0.5.3's fixed 28 was this, rounded
+        (599, 489_189_741),    # 2x300: 29.16
     ])
-    def test_matches_needed(self, threshold, expected):
-        assert [min_matches(to_q(threshold), d) for d in range(4)] == expected
+    def test_the_floor_goldens(self, n_shifts, golden):
+        assert threshold_q(n_shifts, "1e-6") == golden
+        assert _P.t_q(n_shifts) == golden
 
-    def test_threshold_is_derived_not_chosen(self):
-        """T = log2(N / alpha) over N ~ 2*readlen shifts: 2x150 at alpha=1e-6 -> 28."""
-        assert round(threshold_bits(150, 1e-6)) == 28
-        assert round(threshold_bits(150, 1e-3)) == 18
+    def test_the_floor_is_log2_n_over_alpha(self):
+        assert round(threshold_bits(299, "1e-6"), 3) == 28.156
+        assert round(threshold_bits(99, "1e-6"), 2) == 26.56
+        assert round(threshold_bits(599, "1e-6"), 2) == 29.16
+        # each factor of 10 in alpha is log2(10) = 3.32 bits
+        assert round(threshold_bits(299, "1e-7") - threshold_bits(299, "1e-6"), 4) \
+            == round(math.log2(10), 4)
 
-    def test_kernel_score_matches_the_arithmetic(self):
-        """The kernel's reported score is exactly matches*w+ - mismatches*w-."""
-        rng = random.Random(4242)
-        frag = draw(rng, 60)
-        (_, r1, _), (_, r2, _) = make_pair(frag, 40)      # insert 60, L 40 -> overlap 20
-        r2 = bytearray(r2)
-        r2[-1] = ord("A") if r2[-1] != ord("A") else ord("C")   # 1 mismatch in overlap
-        direction, shift, olen, diff, score = find_overlap(r1, rc(bytes(r2)))
-        assert (direction, shift, olen, diff) == (FORWARD, 20, 20, 1)
-        assert score == score_of(19, 1)
+    def test_the_floor_table_is_monotone_and_starts_empty(self):
+        tab = _P.t_table
+        assert tab[0] == 0                                  # N = 0 is never looked up
+        assert all(tab[i] < tab[i + 1] for i in range(1, len(tab) - 1))
 
-    def test_four_perfect_bases_falls_just_under_the_trim_threshold(self):
-        """4 matches = 7.94 bits, just below the 8-bit default; 5 = 9.93, above.
+    @pytest.mark.parametrize("n,golden", [(20, 5), (64, 7), (122, 9), (150, 10)])
+    def test_dfit_goldens_at_one_percent(self, n, golden):
+        """The review's C01 (19 mismatches in 122 bases) is 10 past dfit[122] = 9."""
+        assert _P.dfit(n) == golden
 
-        The redesign calls T_trim=8 "4 perfect matches"; with the exact match weight
-        (1.9855, the value its own §5b arithmetic table requires) 4 bases fall 0.06
-        bits short. Pinned so the boundary is a decision, not an accident.
-        """
-        assert score_bits(4) < 8.0 < score_bits(5)
-        assert score_of(4) < T_TRIM_Q < score_of(5)      # ...and in fixed point too
+    def test_dfit_head(self):
+        assert list(_P.dfit_table[:10]) == [0, 1, 2, 3, 3, 3, 3, 3, 3, 4]
+
+    @pytest.mark.parametrize("e,alpha", [("0.01", "1e-6"), ("0.003", "1e-6"),
+                                         ("0.05", "1e-3"), ("0.00016", "1e-6"),
+                                         ("0.2", "0.01")])
+    def test_dfit_is_the_definition(self, e, alpha):
+        """max d with P(Binom(n, e) >= d) >= alpha, checked against brute force."""
+        e, alpha = Fraction(e), Fraction(alpha)
+        tab = binom_cap(60, e, alpha)
+        for n in range(61):
+            d = tab[n]
+            assert _binom_tail(n, e, d) >= alpha, (n, d)
+            if d < n:
+                assert _binom_tail(n, e, d + 1) < alpha, (n, d)
+        assert all(tab[i] <= tab[i + 1] for i in range(60))     # monotone in n
+
+    def test_tables_grow_by_doubling_and_keep_their_prefix(self):
+        p = MergeParams(error_rate="0.0123", alpha="1e-5")
+        t0, d0 = list(p.t_table), list(p.dfit_table)
+        assert p.capacity == 256 and len(t0) == 512 and len(d0) == 257
+        p.ensure(300)
+        assert p.capacity == 512
+        assert list(p.t_table[:512]) == t0 and list(p.dfit_table[:257]) == d0
+        p.ensure(1500)
+        assert p.capacity == 2048 and len(p.dfit_table) == 2049
+        # a fresh table built straight to that size is the same table
+        assert list(p.dfit_table) == binom_cap(2048, Fraction("0.0123"),
+                                               Fraction("1e-5"))
+
+    def test_dfit_moves_one_step_per_n_and_is_the_definition_at_long_overlaps(self):
+        """`binom_cap` tests one candidate per n (a trial adds at most one success, so
+        dfit[n+1] is dfit[n] or dfit[n] + 1). Checked against the definition, in exact
+        integers, far past the brute-force range above, and resumed from prefixes."""
+        e, alpha = Fraction("0.0087"), Fraction("1e-6")
+        a, b, A, B = e.numerator, e.denominator, alpha.numerator, alpha.denominator
+        tab = binom_cap(1200, e, alpha)
+        assert all(tab[i + 1] - tab[i] in (0, 1) for i in range(1200))
+
+        def reaches(n, d):             # P(Binom(n, e) >= d) >= alpha
+            tail = sum(math.comb(n, j) * a ** j * (b - a) ** (n - j)
+                       for j in range(d, n + 1))
+            return tail * B >= b ** n * A
+        for n in (257, 700, 1200):
+            assert reaches(n, tab[n]) and not reaches(n, tab[n] + 1), n
+        for cut in (0, 1, 2, 99, 600):
+            assert binom_cap(1200, e, alpha, start=tab[:cut + 1]) == tab
+
+    def test_the_gate_refuses_a_true_overlap_with_probability_at_most_alpha(self):
+        """The closed form of the gate's sensitivity (plan §8, layer 1): a true overlap
+        of n bases at true rate e' is refused with P(Binom(n, e') > dfit[n]). At e' = e
+        that is <= alpha by construction; setting e below the library's true rate
+        costs in proportion -- which is what the detected-rate warning is for."""
+        e, alpha = Fraction(1, 100), Fraction(1, 10 ** 6)
+        for n in (20, 50, 100, 150):
+            d = _P.dfit(n)
+            assert _binom_tail(n, e, d + 1) <= alpha
+        # the plan's numbers: at 3%, 0.07-0.6%; at 5%, 1-13% (n = 50..150)
+        at3 = [float(_binom_tail(n, Fraction(3, 100), _P.dfit(n) + 1)) for n in (50, 150)]
+        at5 = [float(_binom_tail(n, Fraction(5, 100), _P.dfit(n) + 1)) for n in (50, 150)]
+        assert 5e-4 < at3[0] < 1e-3 and 5e-3 < at3[1] < 7e-3, at3
+        assert 0.01 < at5[0] < 0.02 and 0.12 < at5[1] < 0.14, at5
+
+    def test_inputs_are_exact_rationals(self):
+        assert exact("1e-6") == Fraction(1, 10 ** 6)
+        assert exact(0.01) == Fraction(1, 100)              # through repr, not binary
+        assert exact("0.01") == Fraction(1, 100)
+        assert decimal_str(Fraction(1, 100)) == "0.01"
+        assert decimal_str(Fraction(1, 10 ** 6)) == "0.000001"
+        assert decimal_str(Fraction(87404, 10 ** 7)) == "0.0087404"
+
+    def test_the_error_rate_defaults_to_one_percent(self):
+        """0.5.3's hidden constant, now a documented default: the goldens above are
+        the default's."""
+        assert MergeParams().e == Fraction(1, 100)
+        assert MergeParams() == MergeParams(error_rate="0.01")
+
+    def test_the_error_rate_is_used_exactly_as_given(self):
+        """Nothing is rounded: the value typed is the value derived from and recorded."""
+        a = MergeParams(error_rate="0.0087404")
+        b = MergeParams(error_rate="0.00874")
+        assert a.e == Fraction(87404, 10 ** 7) and b.e == Fraction(874, 10 ** 5)
+        assert a.match_q != b.match_q or a.step_q != b.step_q
+        assert a.merge_record()["error_rate"] == "0.0087404"
+        # a float means its shortest repr, not the nearest double
+        assert MergeParams(error_rate=0.03).e == Fraction(3, 100)
+        # a tiny rate is a legitimate setting, not a rounding casualty
+        assert MergeParams(error_rate="4e-7").e == Fraction(4, 10 ** 7)
+
+    @pytest.mark.parametrize("kw,match", [
+        (dict(alpha="0"), "alpha"), (dict(alpha="1"), "alpha"),
+        (dict(alpha="-1e-6"), "alpha"), (dict(alpha="abc"), "alpha"),
+        (dict(error_rate="0"), "must be > 0"), (dict(error_rate="-0.01"), "must be > 0"),
+        (dict(error_rate="0.75"), "must be < 0.75"),
+        (dict(error_rate="0.9"), "must be < 0.75"), (dict(error_rate="x"), "not a number"),
+        (dict(error_rate=None), "not a number"),
+        (dict(error_rate=Fraction(1, 3)), "no exact decimal form"),
+        (dict(alpha=Fraction(1, 3 * 10 ** 6)), "no exact decimal form"),
+        # a decimal string, and only that: Fraction() alone would take all three
+        (dict(error_rate="1/100"), "not a number"),
+        (dict(error_rate="1_0e-3"), "not a number"),
+        (dict(error_rate="\u0661\u0660"), "not a number"),
+        # a mistyped exponent is refused, not left building tables
+        (dict(alpha="1e-301"), "alpha must be >= 1e-300"),
+        (dict(error_rate="9e-10"), "error rate must be >= 1e-9"),
+        (dict(alpha="1e-10000000"), "out of range"),
+        (dict(error_rate="1e+10000000"), "out of range"),
+    ])
+    def test_values_the_policy_cannot_mean_are_refused(self, kw, match):
+        with pytest.raises(ValueError, match=match):
+            MergeParams(**kw)
+
+    def test_the_bounds_themselves_are_accepted(self):
+        assert MergeParams(alpha="1e-300").alpha_exact == Fraction(1, 10 ** 300)
+        assert MergeParams(error_rate="1e-9").e == Fraction(1, 10 ** 9)
+        assert MergeParams(error_rate="0.7499").e == Fraction(7499, 10 ** 4)
+
+    def test_the_merge_record_is_exact_and_complete(self):
+        p = MergeParams(alpha="1e-7", error_rate="0.0042", adapter_trimmed=True,
+                        min_read_length=35, npolicy="random")
+        rec = p.merge_record()
+        assert rec == {
+            "policy": "zna-merge-0.6", "zna_version": rec["zna_version"],
+            "alpha": "0.0000001", "error_rate": "0.0042",
+            "adapter_trimmed": True, "min_read_length": 35, "npolicy": "random",
+        }
+        import zna
+        assert rec["zna_version"] == zna.__version__
+
+    def test_the_version_that_writes_the_record_is_the_policys_release(self):
+        """The 0.6 policy is a breaking release: a merge record, a stats JSON or a
+        prologue written by this tree must not claim a 0.5.x version, or a consumer that
+        pins versions would read 0.6 output as 0.5.3's."""
+        import zna
+        major, minor, patch = (int(x) for x in zna.__version__.split(".")[:3])
+        assert (major, minor, patch) >= (0, 6, 0), zna.__version__
+
+    def test_the_conda_recipe_carries_the_package_version(self):
+        """Two places spell the version (pyproject reads ``__init__``); the recipe's
+        sha256 is set at release, the version is not. Skipped where the recipe is not
+        shipped (an sdist)."""
+        import re
+        import zna
+        meta = Path(__file__).resolve().parents[1] / "conda" / "meta.yaml"
+        if not meta.exists():
+            pytest.skip("no conda/meta.yaml beside the tests")
+        m = re.search(r'\{% set version = "([^"]+)" %\}', meta.read_text())
+        assert m and m.group(1) == zna.__version__
 
 
 # --------------------------------------------------------------------------- #
-# backend selection
+# 2. the run's diagnostics: the detected-overlap rate and the read-through check
+# --------------------------------------------------------------------------- #
+
+def _bufs(pairs, tag=b""):
+    """Two FASTQ buffers from ``(s1, s2)`` pairs, in input order."""
+    b1 = b"".join(b"@p%d/1%b\n%b\n+\n%b\n" % (i, tag, s1, qual(s1))
+                  for i, (s1, _s2) in enumerate(pairs))
+    b2 = b"".join(b"@p%d/2%b\n%b\n+\n%b\n" % (i, tag, s2, qual(s2))
+                  for i, (_s1, s2) in enumerate(pairs))
+    return b1, b2
+
+
+def _chunk_out(pairs, p=_P, base=0, rt_check_pairs=0, backend="python"):
+    """One reference-backend chunk over *pairs*; returns merge_chunk's whole result."""
+    from zna.merge.backend import get_merge_backend
+    b1, b2 = _bufs(pairs)
+    out = get_merge_backend(backend).merge_chunk(
+        b1, 0, len(b1), b2, 0, len(b2), *_chunk_args(p, lr=1, base=base), 1, 0,
+        rt_check_pairs)
+    assert out[8] == 0
+    return out
+
+
+def _counters(pairs, p=_P, base=0, rt_check_pairs=0, backend="python"):
+    """One reference-backend chunk over *pairs*; returns its counters."""
+    return _chunk_out(pairs, p, base, rt_check_pairs, backend)[3]
+
+
+def _readthrough_pair(rng, frag_len=60):
+    """A raw 2x150 pair whose fragment is shorter than the reads: a strong read-through,
+    which is also the fragment -- it merges when read-through is allowed."""
+    frag = draw(rng, frag_len)
+    return ((frag + ADAPTER1 + draw(rng, 150))[:150],
+            (rc(frag) + ADAPTER2 + draw(rng, 150))[:150])
+
+
+class TestTheRunDiagnostics:
+    """Two diagnostics ride along with the merge and never change a decision
+    (plan §4). They are counted in the kernel, per pair, and summed like the other
+    counters, so they need no buffer and cannot depend on how the input was chunked."""
+
+    def test_the_detected_rate_counts_informative_positions_only(self):
+        """An N against a call is neither a mismatch nor a compared base: it says
+        nothing about whether the mates agree."""
+        frag = rand_seq(200, 3)
+        r1 = bytearray(frag[:150])
+        r1[120] = ord("N")                          # inside the 100-base overlap
+        r1[130] = flip(r1[130])                     # one real disagreement
+        c = _counters([(bytes(r1), rc(frag[50:]))])
+        assert (c[MERGED], c[DET_BASES], c[DET_MISMATCHES]) == (1, 99, 1)
+
+    def test_n_against_n_is_not_a_compared_base_either(self):
+        """Both mates reading N is a match in the scan, but it says no more about
+        agreement than a one-sided N does: the detected rate leaves it out of the
+        denominator. (The gate's dfit stays indexed by the overlap length, plan §2.)"""
+        frag = rand_seq(200, 3)
+        r1 = bytearray(frag[:150])
+        r2 = bytearray(rc(frag[50:]))
+        r1[120] = ord("N")
+        r2[len(r2) - 1 - (120 - 50)] = ord("N")      # the same fragment position
+        r1[130] = flip(r1[130])
+        c = _counters([(bytes(r1), bytes(r2))])
+        assert (c[DET_BASES], c[DET_MISMATCHES]) == (99, 1)
+        # an all-N pair "overlaps" perfectly in the scan and adds nothing here
+        c = _counters([(b"N" * 150, b"N" * 150)])
+        assert c[DET_BASES] == c[DET_MISMATCHES] == 0
+
+    def test_the_detected_rate_is_taken_before_the_gate(self):
+        """A refused alignment is still a DETECTED overlap, and it counts: the rate is
+        what `--error-rate` is checked against, and a rate measured only on what the
+        gate let through could never exceed the rate the gate was built from."""
+        frag = TestPlausibilityGate._repeat_beats_truth()
+        L = len(frag)
+        r1, r2 = frag[:150], rc(frag[L - 150:])
+        o = find_overlap(r1, rc(r2), P)
+        assert o.verdict == V_IMPLAUSIBLE
+        out = _chunk_out([(r1, r2)])
+        c, olen_hist, det_olen_hist = out[3], out[5], out[7]
+        assert (c[MERGED], c[IMPLAUSIBLE]) == (0, 1)
+        assert (c[DET_BASES], c[DET_MISMATCHES]) == (o.overlap_len,
+                                                     o.informative_mismatches)
+        # its length is binned among the detected overlaps, where dfit was looked up...
+        assert det_olen_hist == [0] * o.overlap_len + [1]
+        # ...while the post-admission statistics see nothing
+        assert c[cli.SUM_OLEN] == c[cli.SUM_DIFF] == 0 and olen_hist == []
+
+    def test_nothing_detected_counts_nothing(self):
+        out = _chunk_out([(rand_seq(100, 4), rand_seq(100, 5)), (b"", b"ACGT")])
+        c = out[3]
+        assert c[N_PAIRS] == 2 and c[DET_BASES] == c[DET_MISMATCHES] == 0
+        assert out[7] == []
+
+    def test_the_readthrough_check_counts_the_unrestricted_winner(self):
+        """Undeclared, the scan's own winner IS the unrestricted one; declared, the
+        read-through side was never visited and the check scans it separately -- and
+        counts the same pair either way."""
+        rng = random.Random(8)
+        rt_pair = _readthrough_pair(rng)
+        normal = make_pair(draw(rng, 250), 150)
+        pairs = [rt_pair, (normal[0][1], normal[1][1])]
+        free = _counters(pairs, rt_check_pairs=10)
+        declared = _counters(pairs, MergeParams(adapter_trimmed=True), rt_check_pairs=10)
+        assert free[RT_STRONG] == declared[RT_STRONG] == 1
+        assert (free[MERGED], declared[MERGED]) == (2, 1)
+        # the check never touches a decision: with it off, the same outcomes
+        off = _counters(pairs, MergeParams(adapter_trimmed=True), rt_check_pairs=0)
+        assert off[RT_STRONG] == 0 and off[:RT_STRONG] == declared[:RT_STRONG]
+
+    def test_the_readthrough_check_covers_the_first_pairs_of_the_INPUT(self):
+        """Pairs are numbered from base_index, not from the chunk: a chunk that starts
+        at pair 3 of a 4-pair check window checks exactly its first pair."""
+        rng = random.Random(9)
+        pairs = [_readthrough_pair(rng) for _ in range(5)]
+        declared = MergeParams(adapter_trimmed=True)
+        assert _counters(pairs, declared, base=0, rt_check_pairs=4)[RT_STRONG] == 4
+        assert _counters(pairs, declared, base=3, rt_check_pairs=4)[RT_STRONG] == 1
+        assert _counters(pairs, declared, base=4, rt_check_pairs=4)[RT_STRONG] == 0
+
+
+def _brute_refusal(n, dfit_n, rate):
+    """``P(Binom(n, rate) > dfit_n)`` by exact rational enumeration of every term --
+    no recurrence, no rounding: what :func:`cli.refusal_probability` must equal."""
+    return sum(Fraction(math.comb(n, k)) * rate ** k * (1 - rate) ** (n - k)
+               for k in range(dfit_n + 1, n + 1))
+
+
+class TestTheExpectedRefusedFraction:
+    """The ``--error-rate`` check (plan §3, §8): the share of the run's detected
+    overlaps the plausibility gate is expected to refuse were they all true and
+    disagreeing at the detected rate, ``sum_n count[n] P(Binom(n, rate) > dfit[n]) /
+    sum_n count[n]``. A diagnostic, computed once at the end of a run."""
+
+    @pytest.mark.parametrize("rate", ["0.009", "0.01", "0.0123457", "0.03", "0.0355",
+                                      "0.05", "0.25", "0.7"])
+    def test_the_tail_equals_exact_enumeration(self, rate):
+        """50 digits, like the tables: agreement to 1e-45, relative, over every n a
+        2x150 run can detect, at the default dfit."""
+        r = Fraction(rate)
+        dfit = _P.dfit_table
+        for n in range(1, 151):
+            got = Fraction(cli.refusal_probability(n, dfit[n], r))
+            want = _brute_refusal(n, dfit[n], r)
+            assert abs(got - want) <= want * Fraction(1, 10 ** 45), (rate, n)
+
+    def test_the_plans_closed_form_numbers(self):
+        """§8 layer 1, and the --error-rate help text: a rule built for 1% refuses a
+        true overlap ~1e-6 of the time at 1%, 0.07-0.6% at 3% and 1-13% at 5%, over
+        overlaps of 50-150 bases."""
+        dfit = _P.dfit_table
+
+        def at(n, rate):
+            return float(cli.refusal_probability(n, dfit[n], Fraction(rate)))
+        assert all(1e-7 < at(n, "0.01") < 1e-6 for n in (50, 100, 150))
+        assert round(100 * at(50, "0.03"), 2) == 0.07
+        assert round(100 * at(150, "0.03"), 1) == 0.6
+        assert round(100 * at(50, "0.05")) == 1 and round(100 * at(150, "0.05")) == 13
+
+    def test_the_edges(self):
+        assert cli.refusal_probability(10, 10, Fraction(1, 2)) == 0   # d > n impossible
+        assert cli.refusal_probability(10, 3, Fraction(0)) == 0
+        assert cli.refusal_probability(10, 3, Fraction(1)) == 1
+        assert cli.refusal_probability(0, 0, Fraction(1, 2)) == 0
+        assert cli.expected_refused_fraction(Fraction(1, 2), [], [0]) == 0
+        assert cli.expected_refused_fraction(Fraction(1, 2), [0, 0], [0, 0]) == 0
+
+    def test_the_fraction_is_the_histogram_weighted_mean(self):
+        """Integer counts (a run) and float weights (the panel's projection) alike."""
+        dfit = _P.dfit_table
+        rate = Fraction(355, 10000)
+        hist = [0] * 151
+        hist[40], hist[97], hist[150] = 3, 11, 2
+        want = sum(c * _brute_refusal(n, dfit[n], rate)
+                   for n, c in enumerate(hist) if c) / sum(hist)
+        got = cli.expected_refused_fraction(rate, hist, dfit)
+        assert abs(Fraction(got) - want) <= want * Fraction(1, 10 ** 45)
+        weighted = [c * 2.5 for c in hist]                   # a uniform weight cancels
+        assert abs(Fraction(cli.expected_refused_fraction(rate, weighted, dfit)) - want) \
+            <= want * Fraction(1, 10 ** 45)
+
+    def test_a_uniform_run_reduces_to_one_tail(self):
+        """Every detected overlap the same length: the fraction IS that length's
+        refusal probability, whatever the count."""
+        acc = cli._new_acc()
+        acc[0][DET_BASES], acc[0][DET_MISMATCHES] = 60 * 50, 240          # 8%
+        acc[4].extend([0] * 50 + [60])
+        assert cli.run_refused_fraction(acc, MergeParams()) == \
+            cli.refusal_probability(50, 6, Fraction(8, 100))
+        assert cli.run_refused_fraction(cli._new_acc(), MergeParams()) == 0
+
+
+# --------------------------------------------------------------------------- #
+# 3. backend selection
 # --------------------------------------------------------------------------- #
 
 class TestExtensionsAreDistinct:
@@ -273,10 +658,26 @@ class TestBackendSelection:
         from zna.merge.backend import available_merge_backends
         assert "python" in available_merge_backends()
 
-    def test_auto_prefers_accel_when_it_is_built(self):
+    def test_auto_prefers_accel_when_it_is_built(self, merge_backend_option):
         from zna.merge.backend import available_merge_backends, get_merge_backend_name
+        if merge_backend_option == "python":
+            # tests/conftest.py narrowed the preference on purpose: configuration 2.
+            assert get_merge_backend_name() == "python"
+            return
         expected = "accel" if "accel" in available_merge_backends() else "python"
         assert get_merge_backend_name() == expected
+
+    def test_the_session_runs_the_backend_it_was_asked_for(self, merge_backend_option):
+        """What ``--merge-backend`` (tests/conftest.py) promises: under ``python``,
+        ``zna merge --backend auto`` resolves to the reference kernel on every run, and
+        an explicit ``accel`` still loads the compiled one where it is built."""
+        from zna.merge import backend
+        if merge_backend_option != "python":
+            pytest.skip("configuration 2 only (--merge-backend=python)")
+        assert backend._PREFERENCE == ("python",)
+        assert backend.use("auto") == "python" and backend.active_name() == "python"
+        if "accel" in backend.available_merge_backends():
+            assert backend.get_merge_backend_name("accel") == "accel"
 
     def test_an_unknown_backend_is_a_loud_error(self):
         from zna.merge.backend import get_merge_backend
@@ -290,30 +691,59 @@ class TestBackendSelection:
             assert overlap.use_backend("python") == "python"
             frag = rand_seq(40, 3)
             (_, s1, _), (_, s2, _) = make_pair(frag, 30)
-            assert find_overlap(s1, rc(s2))[0] == FORWARD
+            assert find_overlap(s1, rc(s2)).verdict == V_MERGE
         finally:
             overlap.use_backend(original)
         assert overlap.backend_name() == original
 
+    def test_a_backend_built_for_another_policy_is_refused(self, monkeypatch):
+        """A 0.5.x extension takes different arguments under the same names. Calling it
+        with 0.6's would be a crash at best and a silently different corpus at worst,
+        so it is refused like a missing build -- by its ABI marker, or its absence."""
+        import types
+        from zna.merge import backend
+        from zna.merge import _pymerge
+        stale = types.ModuleType("zna_merge_stale_test")
+        for name in backend._REQUIRED_FUNCTIONS:
+            setattr(stale, name, getattr(_pymerge, name))       # everything but the ABI
+        monkeypatch.setitem(sys.modules, "zna_merge_stale_test", stale)
+        monkeypatch.setitem(backend._BACKEND_MODULES, "stale", "zna_merge_stale_test")
+        with pytest.raises(ImportError, match="ABI None"):
+            backend.get_merge_backend("stale")
+        assert "stale" not in backend.available_merge_backends()
+        stale.POLICY_ABI = backend.POLICY_ABI + 1
+        with pytest.raises(ImportError, match="ABI"):
+            backend.get_merge_backend("stale")
+
+    def test_the_installed_extension_is_used_only_if_it_speaks_this_abi(self):
+        from zna.merge.backend import POLICY_ABI, available_merge_backends
+        try:
+            import zna.merge._accel as accel
+        except ImportError:
+            pytest.skip("no compiled merge extension")
+        speaks = getattr(accel, "POLICY_ABI", None) == POLICY_ABI
+        assert ("accel" in available_merge_backends()) is speaks
+
 
 # --------------------------------------------------------------------------- #
-# cross-backend equivalence: the accelerated scan must agree EXACTLY
+# 4. cross-backend equivalence: the accelerated kernel must agree EXACTLY
 # --------------------------------------------------------------------------- #
 
-def _backends():
+def _backend_pair(fn):
+    """``fn`` from the reference and the compiled backend, or skip."""
     from zna.merge.backend import available_merge_backends, get_merge_backend
     if "accel" not in available_merge_backends():
-        pytest.skip("C++ merge backend not built")
-    return get_merge_backend("python").scan, get_merge_backend("accel").scan
+        pytest.skip("no C++ merge backend built for this policy ABI")
+    return getattr(get_merge_backend("python"), fn), getattr(get_merge_backend("accel"), fn)
+
+
+def _backends():
+    return _backend_pair("scan")
 
 
 def _chunk_backends():
     """The two `merge_chunk` implementations, for the level-3 differential."""
-    from zna.merge.backend import available_merge_backends, get_merge_backend
-    if "accel" not in available_merge_backends():
-        pytest.skip("C++ merge backend not built")
-    return (get_merge_backend("python").merge_chunk,
-            get_merge_backend("accel").merge_chunk)
+    return _backend_pair("merge_chunk")
 
 
 @pytest.fixture(params=["python", "accel"])
@@ -338,11 +768,23 @@ def any_backend(request):
         overlap.use_backend(original)
 
 
-def exhaustive_scan(s1, s2rc, floor_q):
-    """Every shift, no pruning, no early exit — the slow truth to check a scan against."""
+#: A deliberately LOW floor for the scan differentials: 8 bits, so that far more
+#: shifts survive to be compared than the policy's ~28 would leave.
+LOW_FLOOR = to_q(8)
+
+
+def _chunk_args(p=_P, lr=40, check_sync=True, base=0):
+    return (*p.kernel_args(), lr, DISAGREE_Q, check_sync, base)
+
+
+def exhaustive_scan(s1, s2rc, floor_q, adapter_trimmed=False):
+    """Every eligible shift, no pruning — the slow truth to check a scan against."""
     out = []
-    for s in range(-(len(s2rc) - 1), len(s1)):
-        lo, hi = max(s, 0), min(len(s1), s + len(s2rc))
+    len1, len2 = len(s1), len(s2rc)
+    for s in range(-(len2 - 1), len1):
+        if adapter_trimmed and s + len2 < max(len1, len2):
+            continue
+        lo, hi = max(s, 0), min(len1, s + len2)
         n = hi - lo
         if n <= 0:
             continue
@@ -434,6 +876,24 @@ class TestPopcount:
         assert fn(0xDEAD_FFFF) == 16
 
 
+def _library(rng, n, lmin=30, lmax=151, err=0.01, with_n=0.0, tags=b""):
+    """A realistic-ish chunk: fragments 40-320, independent mate lengths, varied Q."""
+    r1s, r2s = [], []
+    for i in range(n):
+        frag = draw(rng, rng.randrange(40, 320))
+        l1, l2 = rng.randrange(lmin, lmax), rng.randrange(lmin, lmax)
+        s1 = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, err))
+        s2 = bytearray(mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, err))
+        for sb in (s1, s2):
+            if sb and rng.random() < with_n:
+                sb[rng.randrange(len(sb))] = ord("N")
+        q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
+        q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
+        r1s.append(b"@f%d/1%b\n%b\n+\n%b\n" % (i, tags, bytes(s1), q1))
+        r2s.append(b"@f%d/2%b\n%b\n+\n%b\n" % (i, tags, bytes(s2), q2))
+    return b"".join(r1s), b"".join(r2s)
+
+
 class TestCrossBackend:
     """The oracle and the accelerated kernel are one algorithm with two implementations.
 
@@ -444,14 +904,15 @@ class TestCrossBackend:
     divergence changes which bases a merged read is built from.
     """
 
-    ARGS = (_P.match_q, _P.step_q, _P.t_trim_q)
-
-    def _agree(self, s1, s2rc, label):
+    def _agree(self, s1, s2rc, label, floor=LOW_FLOOR):
         py, cc = _backends()
-        a = py(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
-        b = cc(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
-        assert a == b, (label, a, b)
-        return a
+        out = None
+        for at in (0, 1):
+            a = py(s1, s2rc, len(s1), len(s2rc), _P.match_q, _P.step_q, floor, at)
+            b = cc(s1, s2rc, len(s1), len(s2rc), _P.match_q, _P.step_q, floor, at)
+            assert a == b, (label, at, a, b)
+            out = a if at == 0 else out
+        return out
 
     def test_overlapping_pairs(self):
         rng = random.Random(11)
@@ -462,6 +923,7 @@ class TestCrossBackend:
             r1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
             r2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
             self._agree(r1, rc(r2), f"ovl{i}")
+            self._agree(r1, rc(r2), f"ovl{i}@T", floor=t_q(l1, l2))
 
     def test_unrelated_pairs_exercise_the_rejection_path(self):
         """Where the scan spends nearly all its time: every shift bails early."""
@@ -500,7 +962,7 @@ class TestCrossBackend:
             frag = draw(rng, n)
             for i in range(n):
                 r1 = bytearray(frag)
-                r1[i] = ord("A") if r1[i] != ord("A") else ord("C")
+                r1[i] = flip(r1[i])
                 got = self._agree(bytes(r1), frag, f"n{n}pos{i}")
                 assert got[3] == 1, (n, i, got)      # exactly one mismatch, found
 
@@ -523,21 +985,23 @@ class TestCrossBackend:
 
         Ties need periodic content on unequal-length mates. Here both backends must not
         only agree with each other but land on the specified winner: maximise score,
-        then minimise s.
+        then minimise s -- over every shift, and over the contract's eligible ones.
         """
         py, cc = _backends()
         n_tied = 0
-        for s1, s2rc, label in tie_fixtures():
-            a = py(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
-            b = cc(s1, s2rc, len(s1), len(s2rc), *self.ARGS)
-            assert a == b, (label, a, b)
-            scored = exhaustive_scan(s1, s2rc, _P.t_trim_q)
-            if not scored:
-                assert a[2] == 0, label
-                continue
-            (want_s, want_n, want_d, want_sc), ties = argmax_by_rule(scored)
-            assert a == (want_s, want_sc, want_n, want_d), (label, a, want_s, ties)
-            n_tied += ties - 1
+        for at in (0, 1):
+            for s1, s2rc, label in tie_fixtures():
+                args = (len(s1), len(s2rc), _P.match_q, _P.step_q, LOW_FLOOR, at)
+                a = py(s1, s2rc, *args)
+                b = cc(s1, s2rc, *args)
+                assert a == b, (label, at, a, b)
+                scored = exhaustive_scan(s1, s2rc, LOW_FLOOR, bool(at))
+                if not scored:
+                    assert a[2] == 0, label
+                    continue
+                (want_s, want_n, want_d, want_sc), ties = argmax_by_rule(scored)
+                assert a == (want_s, want_sc, want_n, want_d), (label, at, a, ties)
+                n_tied += ties - 1
         assert n_tied >= 100, f"only {n_tied} ties exercised; the tie-break is untested"
 
     def test_random_bytes_not_just_nucleotides(self):
@@ -548,6 +1012,52 @@ class TestCrossBackend:
             self._agree(bytes(rng.randrange(256) for _ in range(n1)),
                         bytes(rng.randrange(256) for _ in range(n2)), f"bytes{i}")
 
+    def test_the_overlap_decision_agrees(self):
+        """`overlap` -- scan, floor lookup, informative count, gate -- on pairs built to
+        land in all three verdicts, under both contracts and several error rates."""
+        py, cc = _backend_pair("overlap")
+        rng = random.Random(21)
+        seen = set()
+        for e in ("0.01", "0.0003", "0.03"):
+            for at in (False, True):
+                p = MergeParams(error_rate=e, adapter_trimmed=at)
+                for i in range(300):
+                    unit = draw(rng, rng.randrange(8, 40))
+                    frag = (unit * 20)[:rng.randrange(40, 320)]      # repeat-rich
+                    frag = mutate(frag, rng, 0.08)
+                    l1, l2 = rng.randrange(20, 151), rng.randrange(20, 151)
+                    s1 = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1],
+                                          rng, 0.02))
+                    s2 = (rc(frag) + ADAPTER2 + draw(rng, 160))[:l2]
+                    if rng.random() < 0.3 and l1 > 10:
+                        k = rng.randrange(l1 - 5)
+                        s1[k:k + 5] = b"NNNNN"
+                    s1, s2rc = bytes(s1), rc(s2)
+                    args = (len(s1), len(s2rc), *p.kernel_args())
+                    a, b = py(s1, s2rc, *args), cc(s1, s2rc, *args)
+                    assert a == b, (e, at, i, a, b)
+                    seen.add(a[0])
+        assert seen == {0, 1, 2}, f"the fixture only reached verdicts {seen}"
+
+    def test_the_diagnostics_agree(self):
+        """The detected-overlap counters and the read-through check, with the check
+        window ending mid-chunk and mid-input, under both contracts, on input with N
+        runs (the informative count) and read-through (the check)."""
+        py, cc = _chunk_backends()
+        rng = random.Random(22)
+        buf1, buf2 = _library(rng, 300, lmin=20, with_n=0.3)
+        for at in (False, True):
+            for base, window in ((0, 250), (100, 250), (0, 0)):
+                args = (*_chunk_args(MergeParams(adapter_trimmed=at), base=base), 1, 0,
+                        window)
+                a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+                b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+                assert a[3] == b[3], (at, base, window)
+                assert a[0] == b[0]
+                if window:
+                    assert a[3][RT_STRONG] > 0, "no read-through: not exercised"
+                assert a[3][DET_BASES] > 0 and a[3][DET_MISMATCHES] > 0
+
     def test_chunks_agree_blob_for_blob(self):
         """Level 3: the production path. Same bytes out, same counters, same histograms.
 
@@ -556,115 +1066,86 @@ class TestCrossBackend:
         completely on a realistic input.
         """
         py, cc = _chunk_backends()
-        rng = random.Random(17)
-        r1s, r2s = [], []
-        for i in range(400):
-            frag = draw(rng, rng.randrange(40, 320))
-            l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
-            s1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
-            s2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
-            # quality varies so the posterior consensus actually has work to do
-            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
-            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
-            r1s.append(b"@f%d/1 tag\n%b\n+\n%b\n" % (i, s1, q1))
-            r2s.append(b"@f%d/2 tag\n%b\n+\n%b\n" % (i, s2, q2))
-        buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
-
-        a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
-        b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
-        assert a[0] == b[0], "blobs differ"
-        assert a[1:3] == b[1:3], "consumed byte counts differ"
-        assert a[3] == b[3], "counters differ"
-        assert list(a[4]) == list(b[4]) and list(a[5]) == list(b[5]) \
-            and list(a[6]) == list(b[6]), "histograms differ"
-        assert a[3][0] == 400 and a[3][1] > 100, a[3]      # the fixture proves nothing
-        assert a[3][8] > 0, "no consensus changes: the fixture is not exercising it"
+        buf1, buf2 = _library(random.Random(17), 400)
+        for p in (_P, MergeParams(error_rate="0.03", adapter_trimmed=True)):
+            args = (*_chunk_args(p), 1, 0, 300)      # read-through check on 300 of 400
+            a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+            b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
+            assert a[0] == b[0], "blobs differ"
+            assert a[1:3] == b[1:3], "consumed byte counts differ"
+            assert a[3] == b[3], "counters differ"
+            assert [list(x) for x in a[4:8]] == [list(x) for x in b[4:8]], \
+                "histograms differ"
+            assert a[8] == b[8] == 0
+            # a detected overlap is merged or refused (no N here, so trim3 demotes none)
+            assert sum(a[7]) == a[3][MERGED] + a[3][IMPLAUSIBLE]
+            # This library carries raw adapter read-through, which the declaration makes
+            # unmergeable: 169 merged undeclared, 79 declared.
+            assert a[3][N_PAIRS] == 400, a[3]
+            assert a[3][MERGED] > (50 if p.adapter_trimmed else 100), a[3]
+            assert a[3][BASES_CONSENSUS] > 0, "no consensus changes: not exercised"
 
     def test_record_adapter_agrees_with_merge_chunk(self):
         """The record adapter and the FASTQ adapter share one inner loop; this
         holds them to it: same sequences record for record, same slot the
-        FASTQ names imply, same consumed counts, all 15 counters, all three
+        FASTQ names imply, same consumed counts, all counters, all four
         histograms.  (MERGE_PAIRS_PLAN.md §4 step 1.)"""
         from zna.merge.backend import available_merge_backends, get_merge_backend
         if "accel" not in available_merge_backends():
-            pytest.skip("C++ merge backend not built")
-        cc = get_merge_backend("accel")
-        rng = random.Random(23)
-        r1s, r2s = [], []
-        for i in range(300):
-            frag = draw(rng, rng.randrange(40, 320))
-            l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
-            s1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
-            s2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
-            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
-            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
-            r1s.append(b"@f%d/1 XA:i:%d\n%b\n+\n%b\n" % (i, i, s1, q1))
-            r2s.append(b"@f%d/2 XB:i:%d\n%b\n+\n%b\n" % (i, i, s2, q2))
-        buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
-
-        blob, c1, c2, counters, lh, oh, ih = cc.merge_chunk(
-            buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
-        seqs, ends, rc1, rc2, rcounters, rlh, roh, rih = cc.merge_chunk_records(
-            buf1, 0, len(buf1), buf2, 0, len(buf2), *args, True)
-
-        assert (c1, c2) == (rc1, rc2)
-        assert counters == rcounters
-        assert (list(lh), list(oh), list(ih)) == (list(rlh), list(roh), list(rih))
-        # sequences equal record for record...
-        fastq = [ln for ln in blob.split(b"\n")[1::4] if ln]
-        recs = [seqs[o:o + l] for (o, l, _ho, _hl, _slot, _p) in ends]
-        assert fastq == recs
-        # ...and the slot each record reports is the one its FASTQ name implies
-        names = [ln[1:] for ln in blob.split(b"\n")[0::4] if ln]
-        for name, (o, l, ho, hl, slot, prov) in zip(names, ends):
-            implied = (1 if b"/1" in name.split(b" ")[0]
-                       else 2 if b"/2" in name.split(b" ")[0] else 0)
-            assert slot == implied, (name, slot)
-            # headers point into the record's own source buffer, tags intact
-            src = buf2 if slot == 2 else buf1
-            hdr = src[ho:ho + hl]
-            assert hdr.startswith(b"f") and (b"XB:" in hdr if slot == 2
-                                             else b"XA:" in hdr)
+            pytest.skip("no C++ merge backend built for this policy ABI")
+        for name in ("python", "accel"):
+            be = get_merge_backend(name)
+            rng = random.Random(23)
+            r1s, r2s = [], []
+            for i in range(300):
+                frag = draw(rng, rng.randrange(40, 320))
+                l1, l2 = rng.randrange(30, 151), rng.randrange(30, 151)
+                s1 = mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01)
+                s2 = mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01)
+                q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
+                q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
+                r1s.append(b"@f%d/1 XA:i:%d\n%b\n+\n%b\n" % (i, i, s1, q1))
+                r2s.append(b"@f%d/2 XB:i:%d\n%b\n+\n%b\n" % (i, i, s2, q2))
+            buf1, buf2 = b"".join(r1s), b"".join(r2s)
+            args = _chunk_args()
+            blob, c1, c2, counters, lh, oh, ih, dh, need = be.merge_chunk(
+                buf1, 0, len(buf1), buf2, 0, len(buf2), *args, 1, 0, 200)
+            seqs, ends, rc1, rc2, rcounters, rlh, roh, rih, rdh, rneed = \
+                be.merge_chunk_records(buf1, 0, len(buf1), buf2, 0, len(buf2), *args,
+                                       True, 1, 0, 200)
+            assert (c1, c2, need) == (rc1, rc2, rneed)
+            assert counters == rcounters
+            assert (list(lh), list(oh), list(ih), list(dh)) == \
+                (list(rlh), list(roh), list(rih), list(rdh))
+            fastq = [ln for ln in blob.split(b"\n")[1::4] if ln]
+            recs = [seqs[o:o + l] for (o, l, _ho, _hl, _slot, _p) in ends]
+            assert fastq == recs
+            names = [ln[1:] for ln in blob.split(b"\n")[0::4] if ln]
+            for name_, (o, l, ho, hl, slot, prov) in zip(names, ends):
+                implied = (1 if b"/1" in name_.split(b" ")[0]
+                           else 2 if b"/2" in name_.split(b" ")[0] else 0)
+                assert slot == implied, (name_, slot)
+                src = buf2 if slot == 2 else buf1
+                hdr = src[ho:ho + hl]
+                assert hdr.startswith(b"f") and (b"XB:" in hdr if slot == 2
+                                                 else b"XA:" in hdr)
 
     def test_record_chunks_agree_across_backends(self):
         """Cross-backend differential for the record adapter: seqs blob, ends
         (offsets, slots, prov bytes), consumed counts, counters, histograms --
         element for element.  (MERGE_PAIRS_PLAN.md §4 step 2.)"""
-        from zna.merge.backend import available_merge_backends, get_merge_backend
-        if "accel" not in available_merge_backends():
-            pytest.skip("C++ merge backend not built")
-        py = get_merge_backend("python").merge_chunk_records
-        cc = get_merge_backend("accel").merge_chunk_records
-        rng = random.Random(29)
-        r1s, r2s = [], []
-        for i in range(250):
-            frag = draw(rng, rng.randrange(40, 320))
-            l1, l2 = rng.randrange(20, 151), rng.randrange(20, 151)
-            s1 = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01))
-            s2 = bytearray(mutate((rc(frag) + ADAPTER2 + draw(rng, 160))[:l2], rng, 0.01))
-            # sprinkle no-calls so npolicy provenance bits actually appear
-            for sb in (s1, s2):
-                if len(sb) and rng.random() < 0.3:
-                    sb[rng.randrange(len(sb))] = ord(b"N")
-            q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s1)))
-            q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(s2)))
-            r1s.append(b"@f%d/1 t\n%b\n+\n%b\n" % (i, bytes(s1), q1))
-            r2s.append(b"@f%d/2 t\n%b\n+\n%b\n" % (i, bytes(s2), q2))
-        buf1, buf2 = b"".join(r1s), b"".join(r2s)
+        py, cc = _backend_pair("merge_chunk_records")
+        buf1, buf2 = _library(random.Random(29), 250, lmin=20, with_n=0.3, tags=b" t")
         for npolicy in (1, 0, 2):
-            args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40,
-                    DISAGREE_Q, True, 0, True, npolicy, 11)
+            args = (*_chunk_args(), True, npolicy, 11, 200)
             a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
             b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
             assert a[0] == b[0], f"npolicy={npolicy}: seq blobs differ"
             assert [tuple(e) for e in a[1]] == [tuple(e) for e in b[1]], \
                 f"npolicy={npolicy}: ends differ"
             assert a[2:5] == b[2:5], f"npolicy={npolicy}: consumed/counters differ"
-            assert (list(a[5]), list(a[6]), list(a[7])) == \
-                (list(b[5]), list(b[6]), list(b[7]))
-            # the fixture must actually exercise provenance
+            assert [list(x) for x in a[5:9]] == [list(x) for x in b[5:9]]
+            assert a[9] == b[9]
             assert any(e[5] for e in a[1]), f"npolicy={npolicy}: no prov bits set"
 
     @pytest.mark.parametrize("npolicy", [1, 0, 2])   # trim3, keep, random
@@ -673,7 +1154,8 @@ class TestCrossBackend:
 
         The suite had no such fixture, and it cost twice: an N-rescue that was wrong in
         the compiled backend only, and a rescue counter that double-counted. Both passed
-        every cross-backend test that existed.
+        every cross-backend test that existed. N runs are also what the gate's
+        informative count exists for.
         """
         py, cc = _chunk_backends()
         rng = random.Random(19)
@@ -686,19 +1168,20 @@ class TestCrossBackend:
             for _ in range(rng.randrange(0, 4)):
                 if a: a[rng.randrange(len(a))] = ord("N")
                 if b: b[rng.randrange(len(b))] = ord("N")
+            if rng.random() < 0.2 and len(a) > 20:             # an N RUN
+                k = rng.randrange(len(a) - 12)
+                a[k:k + 12] = b"N" * 12
             q1 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(a)))
             q2 = bytes(rng.choice((70, 58, 44, 35)) for _ in range(len(b)))
             r1s.append(b"@f%d/1\n%b\n+\n%b\n" % (i, bytes(a), q1))
             r2s.append(b"@f%d/2\n%b\n+\n%b\n" % (i, bytes(b), q2))
         buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0,
-                npolicy, 42)
+        args = (*_chunk_args(), npolicy, 42)
         a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
         b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
         assert a[0] == b[0], "blobs differ on input containing N"
         assert a[1:3] == b[1:3] and a[3] == b[3], f"counters differ: {a[3]} vs {b[3]}"
-        assert list(a[4]) == list(b[4]) and list(a[5]) == list(b[5]) \
-            and list(a[6]) == list(b[6])
+        assert [list(x) for x in a[4:8]] == [list(x) for x in b[4:8]]
         emitted = b"".join(a[0].split(b"\n")[1::4])
         assert (b"N" not in emitted) == bool(npolicy), "trim3 must leave no N"
 
@@ -708,15 +1191,13 @@ class TestCrossBackend:
 
         `merge_core.hpp::build_name` and `_pymerge._prov_name` are one specification with
         two implementations, exactly like the scan. This fixture drives every token —
-        trimmed, rescued, trim3 — through both, on a library engineered so all three
-        outcomes and both no-call fates occur, and compares the HEADERS specifically so a
+        rescued, trim3/subn — through both, and compares the HEADERS specifically so a
         failure names the token rather than "blobs differ".
         """
         py, cc = _chunk_backends()
         rng = random.Random(23)
         r1s, r2s = [], []
         for i in range(400):
-            # Sweep the fragment length across merge / trim / keep territory.
             frag = draw(rng, rng.randrange(40, 320))
             l1, l2 = rng.randrange(60, 151), rng.randrange(60, 151)
             a = bytearray(mutate((frag + ADAPTER1 + draw(rng, 160))[:l1], rng, 0.01))
@@ -730,8 +1211,7 @@ class TestCrossBackend:
             r1s.append(b"@f%d/1\tZI:i:%d\n%b\n+\n%b\n" % (i, i, bytes(a), q1))
             r2s.append(b"@f%d/2\tZI:i:%d\n%b\n+\n%b\n" % (i, i, bytes(b), q2))
         buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q,
-                True, 0, npolicy, 42)
+        args = (*_chunk_args(), npolicy, 42)
         a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
         b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
 
@@ -740,7 +1220,6 @@ class TestCrossBackend:
         assert ha == hb, "provenance tokens differ between backends"
         assert a[0] == b[0] and a[3] == b[3]
 
-        # The fixture has to actually produce the tokens, or it proves nothing.
         seen = set()
         for h in ha:
             for tok in h.split()[1:]:
@@ -750,77 +1229,6 @@ class TestCrossBackend:
                                {b"trim3"} if npolicy == 1 else set())
         assert want <= seen, f"fixture produced only {seen}"
         assert any(t.startswith(b"ZN:i:") for h in ha for t in h.split()), "no ZN tag"
-
-    def test_a_rescue_is_charged_to_the_mate_it_repaired(self, any_backend):
-        """Each record's `rescued_<n>` counts ITS OWN recovered no-calls, not the pair's.
-
-        The trim path is the only one that repairs R2 — a merged pair discards R2's copy
-        of the overlap — so R1-rescues-R2 happens in exactly one branch, and a fixture
-        that never lands there cannot see the charge go to the wrong mate. It is a real
-        blind spot: charging both directions to mate 1 leaves the randomised
-        cross-backend fixtures green under `--npolicy trim3`, because they produce
-        R2-rescues-R1 in bulk and R1-rescues-R2 almost never.
-
-        Insert 48 with 30 bp reads gives a 12 bp overlap at 23.8 bits — real, but under
-        the 28 needed to merge, so the pair trims and both copies reach the output.
-        """
-        frag = rand_seq(48, 13)
-        (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
-        # R2 covers fragment [18, 48), so fragment position p is R2 index 47 - p. Put a
-        # no-call at R2 index 25 — fragment position 22, inside the overlap, where R1
-        # holds a real call.
-        s2 = s2[:25] + b"N" + s2[26:]
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.TRIMMED, "the fixture stopped trimming"
-        r1_out, r2_out = recs[0], recs[1]
-        # R1 repaired R2, so R2 is the record that reports the rescue — and R1, which
-        # was not repaired, must not claim it.
-        assert r2_out[0] == h2 + b" ZN:i:3 rescued_1", r2_out[0]
-        assert r1_out[0] == h1 + b" ZN:i:1", r1_out[0]
-        # ...and the rescue actually happened: no N survives into the emitted mate.
-        assert b"N" not in r2_out[1]
-
-    def test_provenance_never_disturbs_the_id_or_the_tags(self):
-        """Merge ADDS header fields; it never removes or rewrites one.
-
-        That is what lets `zna encode --label` read the same `KEY:T:VALUE` tags off an
-        emitted record that it would have read off the input, and it has to hold on all
-        three outcomes — not just the merged one, which is the only path that rebuilds a
-        name for any other reason.
-        """
-        py, cc = _chunk_backends()
-        rng = random.Random(24)
-        r1s, r2s = [], []
-        for i in range(200):
-            frag = draw(rng, rng.randrange(40, 320))
-            a = bytearray((frag + ADAPTER1 + draw(rng, 160))[:100])
-            b = bytearray((rc(frag) + ADAPTER2 + draw(rng, 160))[:100])
-            for _ in range(rng.randrange(0, 3)):
-                a[rng.randrange(len(a))] = ord("N")
-                b[rng.randrange(len(b))] = ord("N")
-            r1s.append(b"@f%d/1\tZI:i:%d\tRX:Z:ACGT\n%b\n+\n%b\n"
-                       % (i, i, bytes(a), b"I" * len(a)))
-            r2s.append(b"@f%d/2\tZI:i:%d\tRX:Z:ACGT\n%b\n+\n%b\n"
-                       % (i, i, bytes(b), b"I" * len(b)))
-        buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q,
-                True, 0, 1, 42)
-        a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)
-        assert a[0] == cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *args)[0]
-
-        headers = [h for h in a[0].split(b"\n")[0::4] if h]
-        assert headers, "the fixture emitted nothing"
-        for h in headers:
-            body = h[1:]
-            # Both original tags survive verbatim, in their original tab-separated form.
-            assert b"\tRX:Z:ACGT" in body, body
-            assert b"\tZI:i:" in body, body
-            # The ID is untouched apart from a stripped /1 /2 on a merged record, so
-            # ZNA's pairing rule still sees the same fragment.
-            assert base_name(body).startswith(b"f"), body
-            # Whatever we appended came after the tags, never inside them.
-            idtok = body.split(None, 1)[0]
-            assert b"ZN:i:" not in idtok and b"trim3_" not in idtok
 
     @pytest.mark.parametrize("payload", [
         b"",                                             # empty buffer
@@ -833,7 +1241,7 @@ class TestCrossBackend:
         """The parser is where the audit's prototype had its four defects; CRLF
         surviving into the sequence was one of them."""
         py, cc = _chunk_backends()
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 1, DISAGREE_Q, False, 0)
+        args = _chunk_args(lr=1, check_sync=False)
         a = py(payload, 0, len(payload), payload, 0, len(payload), *args)
         b = cc(payload, 0, len(payload), payload, 0, len(payload), *args)
         assert a[0] == b[0] and a[1:4] == b[1:4], (a, b)
@@ -846,8 +1254,8 @@ class TestCrossBackend:
         It did not: the compiled backend sized its scratch to 1024 bases *before*
         parsing and threw "read longer than the scratch buffer" at 1025, while the
         reference merged the same pair happily — the two backends silently disagreed on
-        an entire class of input. Nothing here fed merge_chunk a long read, so nothing
-        caught it. Sweep the boundary in both directions.
+        an entire class of input. Sweep the boundary in both directions (with policy
+        tables sized for it, which is the driver's job -- see TestTableGrowth).
         """
         py, cc = _chunk_backends()
         rng = random.Random(1000 + readlen)
@@ -855,23 +1263,25 @@ class TestCrossBackend:
         s1, s2 = frag[:readlen], rc(frag[-readlen:])
         b1 = b"@x/1\n%b\n+\n%b\n" % (s1, b"I" * len(s1))
         b2 = b"@x/2\n%b\n+\n%b\n" % (s2, b"I" * len(s2))
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+        p = MergeParams(error_rate="0.01")
+        p.ensure(readlen)
+        args = _chunk_args(p)
         a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
         b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
         assert a[0] == b[0] and a[3] == b[3], (readlen, a[3], b[3])
-        assert a[3][1] == 1, f"the fixture stopped merging at {readlen}"
-        assert a[3][12] == readlen, "max_read_length is not being reported"
+        assert a[3][MERGED] == 1, f"the fixture stopped merging at {readlen}"
+        assert a[3][MAX_READ_LEN] == readlen, "max_read_length is not being reported"
 
         # The histograms are uncapped too, and both backends bin identically. They were
         # `uint32_t[1025]` with every index clamped to the last bin, so a 2400 bp merged
         # record was counted as 1024 and the distributions silently aggregated at
         # exactly the length where the arena fix had just made long reads work.
-        assert list(a[4]) == list(b[4]) and list(a[5]) == list(b[5]) \
-            and list(a[6]) == list(b[6]), "histograms differ"
+        assert [list(x) for x in a[4:8]] == [list(x) for x in b[4:8]], "histograms"
         L = len(frag)                                  # the merged record IS the fragment
         assert a[4][L] == 1 and len(a[4]) == L + 1, "length histogram is clamped"
         assert a[6][L] == 1, "insert histogram is clamped"
         assert a[5][2 * readlen - L] == 1, "overlap histogram is clamped"
+        assert a[7] == a[5], "the detected-overlap histogram is clamped"
 
     @pytest.mark.parametrize("hdrlen", [64, 1024, 1088, 2000, 16000, 70000])
     def test_headers_longer_than_the_read_arena(self, hdrlen):
@@ -885,11 +1295,6 @@ class TestCrossBackend:
         against 51 bp reads aborted under malloc's heap check on one run and returned
         well-formed output on an identical rerun, which is the signature of an overflow
         that is usually silently corrupting whatever follows it.
-
-        The reference backend builds the name with `bytes` concatenation and was never
-        affected, so this is exactly the class of defect the cross-backend differential
-        exists to catch -- and could not, because no fixture had a long header. Sweep
-        across the old 1088-byte boundary with reads far shorter than the headers.
         """
         py, cc = _chunk_backends()
         rng = random.Random(4242 + hdrlen)
@@ -898,15 +1303,12 @@ class TestCrossBackend:
         h = b"x" * hdrlen
         b1 = b"@%b/1\tZI:i:7\n%b\n+\n%b\n" % (h, s1, b"I" * len(s1))
         b2 = b"@%b/2\tZI:i:7\n%b\n+\n%b\n" % (h, s2, b"I" * len(s2))
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+        args = _chunk_args()
         a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
         b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
-        assert a[3][1] == 1, "the fixture stopped merging"
+        assert a[3][MERGED] == 1, "the fixture stopped merging"
         assert a[0] == b[0], f"blobs differ at header length {hdrlen}"
         assert a[1:4] == b[1:4]
-        # The name is exactly R1's header with the /1 dropped and the tag appended --
-        # tags preserved, which is what keeps `--label-defs` reading the same values off
-        # a merged record as off R1.
         take1 = min(52, len(frag))                 # R1's share, then R2 supplies the rest
         expected = b"@" + h + b"\tZI:i:7 merged_%d_%d\n" % (take1, len(frag) - take1)
         assert a[0].startswith(expected), a[0][:120]
@@ -923,19 +1325,33 @@ class TestCrossBackend:
             recs1.append(b"@r%d/1\n%b\n+\n%b\n" % (i, s1, b"I" * len(s1)))
             recs2.append(b"@r%d/2\n%b\n+\n%b\n" % (i, s2, b"I" * len(s2)))
         b1, b2 = b"".join(recs1), b"".join(recs2)
-        args = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
+        p = MergeParams(error_rate="0.01")
+        p.ensure(3000)
+        args = _chunk_args(p)
         a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
         b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
         assert a[0] == b[0], "blobs differ once the arena has grown"
         assert a[3] == b[3]
-        assert a[3][0] == 7 and a[3][1] == 7, a[3]      # all seven merged
+        assert a[3][N_PAIRS] == 7 and a[3][MERGED] == 7, a[3]
+
+    def test_both_backends_stop_at_the_same_pair_for_table_capacity(self):
+        py, cc = _chunk_backends()
+        rng = random.Random(78)
+        recs1, recs2 = [], []
+        for i, readlen in enumerate((80, 100, 300, 90)):
+            frag = draw(rng, readlen * 3 // 2)
+            s1, s2 = frag[:readlen], rc(frag[-readlen:])
+            recs1.append(b"@r%d/1\n%b\n+\n%b\n" % (i, s1, b"I" * len(s1)))
+            recs2.append(b"@r%d/2\n%b\n+\n%b\n" % (i, s2, b"I" * len(s2)))
+        b1, b2 = b"".join(recs1), b"".join(recs2)
+        args = _chunk_args(MergeParams(error_rate="0.01"))       # capacity 256
+        a = py(b1, 0, len(b1), b2, 0, len(b2), *args)
+        b = cc(b1, 0, len(b1), b2, 0, len(b2), *args)
+        assert a == b
+        assert a[3][N_PAIRS] == 2 and a[8] == 300
 
     def test_split_records_agrees(self):
-        py = __import__("zna.merge._pymerge", fromlist=["x"]).split_records
-        from zna.merge.backend import available_merge_backends, get_merge_backend
-        if "accel" not in available_merge_backends():
-            pytest.skip("C++ merge backend not built")
-        cc = get_merge_backend("accel").split_records
+        py, cc = _backend_pair("split_records")
         buf = b"".join(b"@r%d\nACGTAC\n+\nIIIIII\n" % i for i in range(7)) + b"@part\nAC"
         for start in (0, 22, 44):
             for n in (0, 1, 3, 7, 99):
@@ -959,7 +1375,7 @@ class TestCrossBackend:
             try:
                 overlap.use_backend(name)
                 return [process_pair(b"x/1", s1, q1, b"x/2", s2, q2,
-                                     MergeParams(min_read_length=40))
+                                     MergeParams(error_rate="0.01", min_read_length=40))
                         for s1, q1, s2, q2 in pairs]
             finally:
                 overlap.use_backend(original)
@@ -967,8 +1383,93 @@ class TestCrossBackend:
         assert run("python") == run("accel")
 
 
+class TestInputValidationAgrees:
+    """Inputs no driver produces, refused the same way by both backends.
+
+    The drivers pass tables from params.py, weights ~2^25-2^29 and an npolicy code from
+    MergeParams, so none of this is reachable from `zna merge`; but the backends are
+    compared call for call, and past these bounds they disagreed (an unknown npolicy was
+    'random' in the kernel and 'keep' in the reference; int64 overflowed where Python
+    did not)."""
+
+    S = b"ACGTTGCAAC" * 5
+
+    def _both(self, fn, *args):
+        out = []
+        for f in _backend_pair(fn):
+            try:
+                out.append(f(*args))
+            except Exception as e:                  # noqa: BLE001 -- compared by type
+                out.append(type(e).__name__)
+        assert out[0] == out[1], out
+        return out[0]
+
+    def test_an_unknown_npolicy_is_refused(self):
+        assert self._both("process_pair", b"a", b"ACGTN", b"IIIII", b"b", b"TTTTT",
+                          b"IIIII", *_P.kernel_args(), 0, DISAGREE_Q, 3, 42) \
+            == "ValueError"
+        assert self._both("merge_chunk", b"", 0, 0, b"", 0, 0, *_chunk_args(), -1, 0) \
+            == "ValueError"
+
+    @pytest.mark.parametrize("mq,sq,floor", [
+        (1 << 58, (1 << 58) + 5, 0),                # n * match_q overflowed int64
+        (1 << 31, 1 << 32, 0),
+        (_P.match_q, _P.step_q, -(1 << 63) + 1),    # floor - 1 overflowed
+        (_P.match_q, _P.step_q, 1 << 62),
+    ])
+    def test_weights_and_floors_past_int64_safety_are_refused(self, mq, sq, floor):
+        assert self._both("scan", self.S, self.S, 50, 50, mq, sq, floor, 0) \
+            == "ValueError"
+
+    def test_the_largest_accepted_weights_still_agree(self):
+        r = self._both("scan", self.S, self.S, 50, 50, 1 << 30, 1 << 30, -(1 << 61), 0)
+        assert r == (0, 50 << 30, 50, 0)
+
+    def test_a_bad_table_is_refused(self):
+        from array import array
+        t, d = array("q", _P.t_table), _P.dfit_table
+        t[99] = -(1 << 63)
+        assert self._both("overlap", self.S, self.S, 50, 50, _P.match_q, _P.step_q,
+                          t, d, 0) == "ValueError"
+        short = array("q", [0])
+        assert self._both("merge_chunk", b"", 0, 0, b"", 0, 0, _P.match_q, _P.step_q,
+                          short, d, 0, 40, DISAGREE_Q, True, 0) == "ValueError"
+
+    def test_every_trailing_cr_is_stripped(self):
+        b1 = b"@r/1\r\r\nACGT\r\r\n+\r\r\nIIII\r\r\n"
+        b2 = b"@r/2\r\r\nACGT\r\r\n+\r\r\nIIII\r\r\n"
+        r = self._both("merge_chunk", b1, 0, len(b1), b2, 0, len(b2),
+                       *_chunk_args(lr=1))
+        assert b"\r" not in r[0] and r[3][MAX_READ_LEN] == 4
+
+    def test_a_desync_on_a_non_utf8_name_is_an_input_error_in_both(self):
+        from zna.merge.fastqio import InputError
+        c1, c2 = b"@r\xff/1\nACGT\n+\nIIII\n", b"@q/2\nACGT\n+\nIIII\n"
+        msgs = []
+        for f in _backend_pair("merge_chunk"):
+            with pytest.raises(InputError) as ei:
+                f(c1, 0, len(c1), c2, 0, len(c2), *_chunk_args())
+            msgs.append(str(ei.value))
+        assert msgs[0] == msgs[1] == "R1/R2 out of sync at pair 1: 'r\xff' != 'q'"
+
+    def test_a_refused_table_is_released(self):
+        """The compiled backend borrows a table through the buffer protocol. A table it
+        refuses AFTER borrowing (wrong item type) must still be released: it used to
+        leak the export, and the array could never be resized again."""
+        from array import array
+        _py, accel = _backend_pair("overlap")
+        wrong = array("i", range(600))
+        before = sys.getrefcount(wrong)
+        for _ in range(100):
+            with pytest.raises(TypeError):
+                accel(self.S, self.S, 50, 50, _P.match_q, _P.step_q, wrong,
+                      _P.dfit_table, 0)
+        assert sys.getrefcount(wrong) == before
+        wrong.append(1)                             # BufferError if still exported
+
+
 # --------------------------------------------------------------------------- #
-# the fixed-point scale, and the argmax total order
+# 5. the fixed-point scale
 # --------------------------------------------------------------------------- #
 
 class TestFixedPointScale:
@@ -978,43 +1479,51 @@ class TestFixedPointScale:
     same integers on every platform, and quantising must not move a decision.
     """
 
-    def test_the_default_weights_are_exactly_these_integers(self):
-        """Pin them. They are derived from `log2`, which is not correctly rounded and
-        differs between libm implementations — so a platform where this fails would
-        silently produce a different corpus from the same FASTQ. Fail loudly instead."""
-        p = MergeParams()
-        assert (SCALE, p.match_q, p.step_q) == (1 << 24, 33_311_170, 137_813_407)
-        assert (p.t_merge_q, p.t_trim_q) == (469_762_048, 134_217_728)
+    def test_the_scale(self):
+        assert SCALE == 1 << 24
 
     def test_step_is_the_sum_of_the_two_quantised_weights(self):
         """`score = n*match - d*step` and `score = (n-d)*match - d*mismatch` must agree,
         which they only do if `step` is quantised as the sum rather than separately."""
-        p = MergeParams()
-        assert p.step_q == to_q(MATCH_W) + to_q(MISMATCH_W)
+        from zna.merge.params import log2_exact, P_NULL
+        for e in (Fraction(1, 100), Fraction(874, 10 ** 5), Fraction(3, 100)):
+            match_q, step_q = weights_q(e)
+            assert step_q == match_q + to_q(log2_exact((1 - P_NULL) / e))
         for n, d in ((40, 0), (40, 1), (150, 7), (19, 2)):
-            assert n * p.match_q - d * p.step_q == score_of(n - d, d)
+            assert n * _P.match_q - d * _P.step_q == score_of(n - d, d)
 
-    def test_quantisation_flips_no_decision_over_the_reachable_domain(self):
-        """The §4 enumeration, as a test.
+    @pytest.mark.parametrize("e", ["0.01", "0.0087", "0.001"])
+    @pytest.mark.parametrize("n_shifts", [99, 299, 2047])
+    def test_quantisation_flips_no_merge_decision_over_the_reachable_domain(
+            self, e, n_shifts):
+        """The enumeration params.py's docstring reports, as a test.
 
-        A decision flips only where the true float score sits within the quantisation
-        error of a threshold, and over integer (n, d) that is exhaustively checkable.
-        At SCALE = 2**24 the first disagreement is at an *overlap* of 32,830 bases; this
-        sweeps everything up to 4,000, which is an order of magnitude past any read the
-        tool will see. At 2**20 this test fails at n = 2,575, which is why the scale is
-        not 2**20.
+        A decision flips only where the exact score sits within the quantisation error
+        of the pair's floor ``log2(N / alpha)``, and over integer (n, d) that is
+        exhaustively checkable. Checked here to an overlap of 4,000 bases for nine
+        (e, N) settings; the smallest disagreement over the 30 settings the docstring
+        reports is at n = 10,951.
         """
-        p = MergeParams()
-        for threshold, tq in ((8.0, p.t_trim_q), (28.0, p.t_merge_q)):
-            for n in range(1, 4001):
-                # only d values that put the score anywhere near the threshold matter
-                lo = max(0, int((n * MATCH_W - threshold - 5) / (MATCH_W + MISMATCH_W)) - 1)
-                hi = min(n, int((n * MATCH_W - threshold + 5) / (MATCH_W + MISMATCH_W)) + 1)
-                for d in range(lo, hi + 1):
-                    exact = (n - d) * MATCH_W - d * MISMATCH_W
-                    quant = n * p.match_q - d * p.step_q
-                    assert (exact >= threshold) == (quant >= tq), (n, d, threshold)
+        from decimal import Decimal
+        from zna.merge.params import _CTX, P_NULL, log2_exact
+        ef = Fraction(e)
+        lm, lmm = log2_exact((1 - ef) / P_NULL), log2_exact((1 - P_NULL) / ef)
+        lt = log2_exact(Fraction(n_shifts) / Fraction(1, 10 ** 6))
+        mq, sq = weights_q(ef)
+        tq = threshold_q(n_shifts, "1e-6")
+        fm, fs, ft = float(lm), float(lm + lmm), float(lt)
+        for n in range(1, 4001):
+            # only d values that put the score anywhere near the floor matter
+            dc = (n * fm - ft) / fs
+            for d in range(max(0, int(dc) - 1), min(n, int(dc) + 2) + 1):
+                exact_score = _CTX.subtract(_CTX.multiply(Decimal(n - d), lm),
+                                            _CTX.multiply(Decimal(d), lmm))
+                assert (exact_score >= lt) == (n * mq - d * sq >= tq), (n, d)
 
+
+# --------------------------------------------------------------------------- #
+# 6. the argmax total order
+# --------------------------------------------------------------------------- #
 
 class TestArgmaxTotalOrder:
     """`maximise score, then minimise s` — a specification, not an iteration artifact.
@@ -1024,116 +1533,120 @@ class TestArgmaxTotalOrder:
     ties here are built deliberately.
     """
 
-    def _check(self, s1, s2rc, label):
-        p = MergeParams()
-        direction, shift, olen, diff, score = find_overlap(s1, s2rc, p)
-        got = None if direction == NO_OVERLAP else (
-            (shift if direction == FORWARD else -shift), olen, diff)
-        allsc = exhaustive_scan(s1, s2rc, p.t_trim_q)
+    def _check(self, s1, s2rc, label, adapter_trimmed=False):
+        from zna.merge.overlap import _backend
+        got = _backend.active().scan(s1, s2rc, len(s1), len(s2rc), _P.match_q,
+                                     _P.step_q, LOW_FLOOR, int(adapter_trimmed))
+        allsc = exhaustive_scan(s1, s2rc, LOW_FLOOR, adapter_trimmed)
         if not allsc:
-            assert got is None, label
+            assert got[2] == 0, label
             return 0
         want, n_ties = argmax_by_rule(allsc)
-        assert got == (want[0], want[1], want[2]), (label, got, want, n_ties)
-        assert score == want[3], label
+        assert got == (want[0], want[3], want[1], want[2]), (label, got, want, n_ties)
         return n_ties - 1
 
-    def test_matches_an_unpruned_scan_on_real_reads(self, any_backend):
+    @pytest.mark.parametrize("adapter_trimmed", [False, True])
+    def test_matches_an_unpruned_scan_on_real_reads(self, any_backend, adapter_trimmed):
         rng = random.Random(9)
         for i in range(300):
             frag = draw(rng, rng.randrange(40, 110))
             l1, l2 = rng.randrange(20, 60), rng.randrange(20, 60)
             r1 = (frag + ADAPTER1 + draw(rng, 60))[:l1]
             r2 = (rc(frag) + ADAPTER2 + draw(rng, 60))[:l2]
-            self._check(r1, rc(r2), f"real{i}")
+            self._check(r1, rc(r2), f"real{i}", adapter_trimmed)
 
-    def test_ties_are_broken_towards_the_smallest_shift(self, any_backend):
+    @pytest.mark.parametrize("adapter_trimmed", [False, True])
+    def test_ties_are_broken_towards_the_smallest_shift(self, any_backend,
+                                                        adapter_trimmed):
         """Periodic content on unequal-length mates makes the plateau tie exactly.
 
         Without this the tie-break is untested: an earlier sweep over 7,000 random and
         adversarial pairs produced *zero* ties and proved nothing about it.
         """
-        tied = sum(self._check(s1, s2rc, label) for s1, s2rc, label in tie_fixtures())
-        assert tied >= 100, f"only {tied} ties exercised; the tie-break is untested"
+        tied = sum(self._check(s1, s2rc, label, adapter_trimmed)
+                   for s1, s2rc, label in tie_fixtures())
+        if adapter_trimmed:
+            # Under the declaration every overlap length has exactly ONE eligible shift
+            # (the plateau shrinks to its last shift, the read-through flank is gone),
+            # and ties across lengths are unreachable -- so the argmax is unique.
+            assert tied == 0
+        else:
+            assert tied >= 100, f"only {tied} ties exercised; the tie-break is untested"
 
     def test_a_tie_across_different_overlap_lengths_is_unreachable(self):
         """Why the rule needs no `n` key.
 
         Two shifts tie iff `dn * match_q == dd * step_q`, whose minimal solution is
-        `dn = step_q / gcd(match_q, step_q)`. That gcd is 1, so `dn` would have to be
-        larger than any conceivable read — ties can only ever occur at equal `n`.
+        `dn = step_q / gcd(match_q, step_q)`. For every error rate checked that is far
+        larger than any conceivable read -- ties can only ever occur at equal `n`.
         """
-        from math import gcd
-        for err in (0.001, 0.005, 0.01, 0.02, 0.05):
-            p = MergeParams(err_rate=err)
-            dn = p.step_q // gcd(p.match_q, p.step_q)
+        for err in ("0.00016", "0.001", "0.005", "0.0087", "0.01", "0.02", "0.05",
+                    "0.1", "0.3"):
+            p = MergeParams(error_rate=err)
+            dn = p.step_q // math.gcd(p.match_q, p.step_q)
             assert dn > 10_000_000, (err, dn)
 
 
 # --------------------------------------------------------------------------- #
-# find_overlap
+# 7. find_overlap, and the contract range
 # --------------------------------------------------------------------------- #
 
 class TestFindOverlap:
     def test_forward_normal_overlap(self):
         frag = rand_seq(40, 1)          # insert 40, read 30 -> overlap 20 at offset 10
         (_, r1, _), (_, r2, _) = make_pair(frag, 30)
-        direction, shift, olen, diff, score = find_overlap(r1, rc(r2))
-        assert direction == FORWARD
-        assert shift == 10 and olen == 20 and diff == 0
-        assert score == score_of(20)
+        o = find_overlap(r1, rc(r2), P)
+        assert (o.verdict, o.shift, o.overlap_len, o.mismatches) == (V_MERGE, 10, 20, 0)
+        assert o.score_q == score_of(20) and o.fragment_length == 40
 
     def test_full_overlap(self):
         frag = rand_seq(30, 2)          # insert == read len -> full overlap, shift 0
         (_, r1, _), (_, r2, _) = make_pair(frag, 30)
-        direction, shift, olen, diff, _ = find_overlap(r1, rc(r2))
-        assert direction == FORWARD and shift == 0 and olen == 30 and diff == 0
+        o = find_overlap(r1, rc(r2), P)
+        assert (o.verdict, o.shift, o.overlap_len, o.mismatches) == (V_MERGE, 0, 30, 0)
 
     def test_no_overlap(self):
-        r1 = rand_seq(50, 3)
-        r2 = rand_seq(50, 4)
-        direction, _, _, _, score = find_overlap(r1, rc(r2))
-        assert direction == NO_OVERLAP and score == 0
+        o = find_overlap(rand_seq(50, 3), rc(rand_seq(50, 4)), P)
+        assert o == (V_NONE, 0, 0, 0, 0, 0, 0)
 
     def test_mismatch_within_budget_is_accepted(self):
         frag = rand_seq(40, 5)
         (_, r1, _), (_, r2, _) = make_pair(frag, 30)
         r2 = bytearray(r2)
         # The overlap is R2's 3' end (its last bases map to the start of revcomp(R2)).
-        r2[-1] = ord("A") if r2[-1] != ord("A") else ord("C")   # 1 error in overlap
-        direction, _, olen, diff, _ = find_overlap(r1, rc(bytes(r2)))
-        assert direction == FORWARD and olen == 20 and diff == 1
+        r2[-1] = flip(r2[-1])                                    # 1 error in overlap
+        o = find_overlap(r1, rc(bytes(r2)), P)
+        assert (o.verdict, o.overlap_len, o.mismatches) == (V_MERGE, 20, 1)
 
-    def test_noise_below_threshold_is_rejected(self):
+    def test_noise_below_the_floor_is_no_overlap(self):
         frag = rand_seq(40, 6)
         (_, r1, _), (_, r2, _) = make_pair(frag, 30)
         r2 = bytearray(r2)
         for i in range(1, 12):                 # 11 errors in a 20 bp overlap: 9*1.99
-            r2[-i] = ord("A") if r2[-i] != ord("A") else ord("C")   # - 11*6.23 < 0
-        direction, _, _, _, _ = find_overlap(r1, rc(bytes(r2)))
-        assert direction == NO_OVERLAP
+            r2[-i] = flip(r2[-i])              # - 11*6.23 < 0
+        assert find_overlap(r1, rc(bytes(r2)), P).verdict == V_NONE
 
-    def test_read_through_reverse(self):
+    def test_read_through_is_a_negative_shift(self):
         # insert (20) shorter than read (30): both reads run past into adapter.
         insert = rand_seq(20, 8)
         r1 = (insert + ADAPTER1)[:30]
         r2 = (rc(insert) + ADAPTER2)[:30]
-        direction, shift, olen, diff, _ = find_overlap(r1, rc(r2))
-        assert direction == REVERSE and olen == 20 and shift == 10
+        o = find_overlap(r1, rc(r2), P)
+        assert (o.verdict, o.shift, o.overlap_len, o.fragment_length) == \
+            (V_MERGE, -10, 20, 20)
 
     def test_argmax_beats_a_spurious_short_hit(self):
         """A real 40 bp overlap wins outright over any chance 4-mer earlier in the scan.
 
-        First-accept could be captured by the short hit; argmax cannot. This is the
-        structural fix that lets T_trim stay low without suppressing merges.
+        First-accept could be captured by the short hit; argmax cannot.
         """
         rng = random.Random(99)
         for _ in range(200):
             frag = draw(rng, 160)                       # insert 160, L 100 -> overlap 40
             (_, r1, _), (_, r2, _) = make_pair(frag, 100)
-            direction, shift, olen, _, score = find_overlap(r1, rc(r2))
-            assert (direction, shift, olen) == (FORWARD, 60, 40)
-            assert score == score_of(40)
+            o = find_overlap(r1, rc(r2), P)
+            assert (o.verdict, o.shift, o.overlap_len) == (V_MERGE, 60, 40)
+            assert o.score_q == score_of(40)
 
     def test_block_loop_sees_every_position(self, any_backend):
         """Sweep a single mismatch across every position of a 40 bp overlap.
@@ -1150,10 +1663,11 @@ class TestFindOverlap:
         r2rc = rc(rc(frag))
         for i in range(40):
             r1 = bytearray(frag)
-            r1[i] = ord("A") if r1[i] != ord("A") else ord("C")
-            direction, shift, olen, diff, score = find_overlap(bytes(r1), r2rc)
-            assert (direction, shift, olen, diff) == (FORWARD, 0, 40, 1), i
-            assert score == score_of(39, 1), i
+            r1[i] = flip(r1[i])
+            o = find_overlap(bytes(r1), r2rc, P)
+            assert (o.verdict, o.shift, o.overlap_len, o.mismatches) == \
+                (V_MERGE, 0, 40, 1), i
+            assert o.score_q == score_of(39, 1), i
 
     def test_unequal_read_lengths_need_no_special_case(self):
         """s is defined by the offset; the compared region is just the intersection."""
@@ -1161,8 +1675,217 @@ class TestFindOverlap:
         frag = draw(rng, 180)
         r1 = frag[:120]                     # R1 quality-trimmed to 120
         r2 = rc(frag[-90:])                 # R2 quality-trimmed to 90
-        direction, shift, olen, diff, _ = find_overlap(r1, rc(r2))
-        assert (direction, shift, olen, diff) == (FORWARD, 90, 30, 0)   # s = 180 - 90
+        o = find_overlap(r1, rc(r2), P)
+        assert (o.verdict, o.shift, o.overlap_len, o.mismatches) == (V_MERGE, 90, 30, 0)
+
+    def test_the_diagnostic_scan_is_the_bare_argmax(self):
+        """`scan_unrestricted` ignores the contract and the gate, and says so in its
+        name: it is what the read-through check counts, never what a pair is built
+        from."""
+        insert = rand_seq(40, 9)
+        r1 = (insert + ADAPTER1 + rand_seq(80, 10))[:100]
+        r2 = (rc(insert) + ADAPTER2 + rand_seq(80, 11))[:100]
+        p = MergeParams(error_rate="0.01", adapter_trimmed=True)
+        a = scan_unrestricted(r1, rc(r2), p)
+        assert (a.shift, a.overlap_len) == (-60, 40)
+        assert find_overlap(r1, rc(r2), p).verdict == V_NONE
+
+
+class TestContractRange:
+    """``--adapter-trimmed``: only ``L = s + len2 >= max(len1, len2)`` is eligible.
+
+    That is not just ``s >= 0``. With ``len1 > len2`` the plateau shifts ``0 <= s <
+    len1 - len2`` put R1 past the fragment's end -- as impossible under the declaration
+    as a read-through -- so eligibility starts at ``len1 - len2``. With ``len1 < len2``
+    it starts at 0, and the plateau's negative shifts are read-through for R2.
+    """
+
+    @staticmethod
+    def _eligible(len1, len2):
+        return [s for s in range(-(len2 - 1), len1) if s + len2 >= max(len1, len2)]
+
+    @pytest.mark.parametrize("len1,len2", [(100, 60), (60, 100), (80, 80), (31, 7),
+                                           (7, 31)])
+    def test_the_eligible_range(self, len1, len2):
+        assert min(self._eligible(len1, len2)) == max(0, len1 - len2)
+
+    def test_len1_longer_the_plateau_start_is_ineligible(self):
+        """R1 = 100, R2 = 60, and the true fragment is 80: R1 runs 20 bases past it.
+
+        Unrestricted, the scan finds s = 20 (L = 80, a plateau shift with 0 <= s <
+        len1 - len2); declared trimmed, that is impossible, and nothing else aligns."""
+        rng = random.Random(31)
+        frag = draw(rng, 80)
+        r1 = (frag + ADAPTER1)[:100]
+        r2 = rc(frag)[:60]                                  # R2 = frag[20:80], revcomp
+        free = find_overlap(r1, rc(r2), P)
+        assert (free.verdict, free.shift, free.fragment_length) == (V_MERGE, 20, 80)
+        assert 0 <= free.shift < len(r1) - len(r2)
+        declared = MergeParams(error_rate="0.01", min_read_length=1,
+                               adapter_trimmed=True)
+        assert find_overlap(r1, rc(r2), declared).verdict == V_NONE
+
+    def test_len1_shorter_a_plateau_read_through_is_ineligible(self):
+        """R1 = 60, R2 = 100, fragment 80: s = -20 lies on the plateau (n = 60) but puts
+        R2 past the fragment."""
+        rng = random.Random(32)
+        frag = draw(rng, 80)
+        r1 = frag[:60]
+        r2 = (rc(frag) + ADAPTER2)[:100]
+        free = find_overlap(r1, rc(r2), P)
+        assert (free.verdict, free.shift, free.overlap_len) == (V_MERGE, -20, 60)
+        declared = MergeParams(error_rate="0.01", adapter_trimmed=True)
+        assert find_overlap(r1, rc(r2), declared).verdict == V_NONE
+
+    @pytest.mark.parametrize("len1,len2", [(100, 60), (60, 100), (90, 90)])
+    def test_eligible_geometries_still_merge(self, len1, len2):
+        """Every L >= max(len1, len2) with enough overlap merges under the declaration,
+        at exactly the shift it merges at without it."""
+        rng = random.Random(33 + len1)
+        declared = MergeParams(error_rate="0.01", min_read_length=1,
+                               adapter_trimmed=True)
+        for L in range(max(len1, len2), len1 + len2 - 16):
+            frag = draw(rng, L)
+            r1, r2 = frag[:len1], rc(frag[L - len2:])
+            a, b = find_overlap(r1, rc(r2), P), find_overlap(r1, rc(r2), declared)
+            assert a == b and a.verdict == V_MERGE and a.fragment_length == L, (L, a, b)
+
+    def test_the_contract_is_the_argmax_over_eligible_shifts_not_a_veto(self):
+        """A read-through winner does not block a lower-scoring eligible alignment: the
+        declared scan is the argmax over the eligible set, which here is the true L."""
+        rng = random.Random(34)
+        frag = draw(rng, 250)
+        r1, r2 = bytearray(frag[:150]), bytearray(rc(frag[100:]))
+        # plant a strong read-through: R1's first 60 bases equal R2rc's last 60
+        r2rc = bytearray(rc(bytes(r2)))
+        r2rc[-60:] = r1[:60]
+        r2 = rc(bytes(r2rc))
+        free = find_overlap(bytes(r1), rc(r2), P)
+        declared = find_overlap(bytes(r1), rc(r2),
+                                MergeParams(error_rate="0.01", adapter_trimmed=True))
+        assert free.shift < 0 and free.verdict == V_MERGE
+        assert (declared.verdict, declared.fragment_length) == (V_MERGE, 250)
+
+
+# --------------------------------------------------------------------------- #
+# 8. the plausibility gate
+# --------------------------------------------------------------------------- #
+
+class TestPlausibilityGate:
+    """``d_inf > dfit[n]`` -> the pair has no overlap. Abstain; never re-place."""
+
+    @staticmethod
+    def _repeat_beats_truth(seed=41):
+        """The review's C01, rebuilt: a 262-base fragment read 2x150 (true overlap 38)
+        through a diverged tandem repeat of period 84, so R1[28:150] and revcomp(R2)'s
+        first 122 bases are two copies of it. Every 7th base differs between copies: 18
+        mismatches in 122, 94.4 bits at 1% -- beating the true, perfect 38-base overlap
+        (75.4 bits) -- and 18 > dfit[122] = 9."""
+        rng = random.Random(seed)
+        u = draw(rng, 84)
+        u1 = bytearray(u)
+        for i in range(0, 84, 7):
+            u1[i] = flip(u1[i])
+        u2 = bytearray(u1[:38])
+        for i in range(0, 38, 7):
+            u2[i] = flip(u2[i])
+        frag = draw(rng, 28) + u + bytes(u1) + bytes(u2) + draw(rng, 28)
+        assert len(frag) == 262
+        return frag
+
+    def test_a_divergent_repeat_is_refused_not_merged(self):
+        frag = self._repeat_beats_truth()
+        L = len(frag)
+        r1, r2 = frag[:150], rc(frag[L - 150:])
+        o = find_overlap(r1, rc(r2), P)
+        assert o.verdict == V_IMPLAUSIBLE and o.fragment_length != L
+        assert o.informative_mismatches > P.dfit(o.overlap_len)
+        # ...and nothing is searched for in its place: process_pair keeps both mates,
+        # untouched, and reports the refusal.
+        counters = [0, 0]
+        res = process_pair(b"c/1", r1, qual(r1), b"c/2", r2, qual(r2), P, counters)
+        assert res.outcome == PairOutcome.KEPT and res.implausible
+        assert [r[1] for r in res.records] == [r1, r2]
+        assert (res.olen, res.diff, res.score) == (0, 0, 0)
+        assert counters == [0, 1]
+
+    def test_the_gate_is_at_dfit_exactly(self):
+        """A 64-base full overlap with k scattered mismatches: dfit[64] = 7 at 1%."""
+        rng = random.Random(42)
+        frag = draw(rng, 64)
+        for k, want in ((7, V_MERGE), (8, V_IMPLAUSIBLE)):
+            r1 = bytearray(frag)
+            for i in range(k):
+                r1[3 + 8 * i] = flip(r1[3 + 8 * i])
+            o = find_overlap(bytes(r1), frag, P)
+            assert (o.overlap_len, o.mismatches, o.verdict) == (64, k, want), k
+
+    def test_an_n_run_is_not_evidence_of_disagreement(self):
+        """Ten N in a 100-base true overlap: raw d = 10 > dfit[100] = 8, informative
+        d = 0. Refusing it cost ~1,500 correct merges per 200k pairs on reads with N
+        runs (the robustness review's one correctness regression)."""
+        frag = rand_seq(200, 43)
+        r1 = bytearray(frag[:150])
+        r1[80:90] = b"N" * 10
+        r2 = rc(frag[50:])
+        o = find_overlap(bytes(r1), rc(r2), P)
+        assert (o.overlap_len, o.mismatches, o.informative_mismatches) == (100, 10, 0)
+        assert o.mismatches > P.dfit(100) and o.verdict == V_MERGE
+        res = process_pair(b"n/1", bytes(r1), qual(r1), b"n/2", r2, qual(r2), P)
+        assert res.outcome == PairOutcome.MERGED and res.records[0][1] == frag
+
+    def test_the_same_run_in_r2_is_discounted_too(self):
+        frag = rand_seq(200, 44)
+        r1 = frag[:150]
+        r2 = bytearray(rc(frag[50:]))
+        r2[70:80] = b"N" * 10                       # R2's own frame, inside the overlap
+        o = find_overlap(r1, rc(bytes(r2)), P)
+        assert (o.mismatches, o.informative_mismatches, o.verdict) == (10, 0, V_MERGE)
+
+    def test_n_against_n_is_a_match_and_not_discounted(self):
+        """Both mates N at the same positions: the scan scores N==N as agreement, so
+        there is nothing to discount; the count is of positions where EXACTLY one is N."""
+        frag = bytearray(rand_seq(200, 45))
+        frag[100:110] = b"N" * 10
+        frag = bytes(frag)
+        o = find_overlap(frag[:150], frag[50:], P)
+        assert (o.mismatches, o.informative_mismatches, o.verdict) == (0, 0, V_MERGE)
+
+    def test_n_is_discounted_only_where_it_meets_a_call(self):
+        rng = random.Random(46)
+        frag = draw(rng, 120)
+        s1 = bytearray(frag)
+        s1[10:14] = b"NNNN"                         # 4 one-sided N
+        for i in (40, 50, 60, 70, 80, 90, 100, 110, 115):
+            s1[i] = flip(s1[i])                     # 9 real mismatches > dfit[120] = 9?
+        o = find_overlap(bytes(s1), frag, P)
+        assert (o.mismatches, o.informative_mismatches) == (13, 9)
+        assert one_n(bytes(s1), frag, 0, 120) == 4
+        assert o.verdict == (V_MERGE if 9 <= P.dfit(120) else V_IMPLAUSIBLE)
+
+    def test_a_refused_pair_gets_no_consensus(self):
+        """Nothing is rewritten on a pair whose alignment was refused: its apparent
+        disagreements are the repeat's, not sequencing errors."""
+        frag = self._repeat_beats_truth(47)
+        L = len(frag)
+        r1, r2 = frag[:150], rc(frag[L - 150:])
+        q1, q2 = b"#" * 150, b"~" * 150              # R2 would win every contest
+        res = process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P)
+        assert res.implausible
+        assert res.records[0][1:] == (r1, q1) and res.records[1][1:] == (r2, q2)
+
+    def test_the_error_rate_moves_the_gate_and_the_argmax(self):
+        """The review's observation, in both directions: at the library's own
+        near-zero rate a mismatch costs ~12 bits, so the divergent repeat no longer
+        even outscores the true perfect overlap; at 1% it wins the argmax and the gate
+        refuses it."""
+        frag = self._repeat_beats_truth(48)
+        L = len(frag)
+        r1, r2 = frag[:150], rc(frag[L - 150:])
+        low = MergeParams(error_rate="0.00016", min_read_length=1)
+        o = find_overlap(r1, rc(r2), low)
+        assert o.verdict == V_MERGE and o.fragment_length == L and o.mismatches == 0
+        assert find_overlap(r1, rc(r2), P).verdict == V_IMPLAUSIBLE
 
 
 class TestDegenerateInputs:
@@ -1172,82 +1895,57 @@ class TestDegenerateInputs:
         (b"", b"ACGTACGTAC"), (b"ACGTACGTAC", b""), (b"", b""), (b"A", b"T"),
     ])
     def test_no_overlap_and_no_crash(self, s1, s2):
-        assert find_overlap(s1, rc(s2)) == (NO_OVERLAP, 0, 0, 0, 0)
+        assert find_overlap(s1, rc(s2), P) == (V_NONE, 0, 0, 0, 0, 0, 0)
 
     def test_empty_pair_is_kept_not_merged(self):
-        recs, outcome, _d, score, _olen, _diff = process_pair(
-            b"z/1", b"", b"", b"z/2", b"", b"", MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.KEPT and score == 0 and recs == []
+        res = process_pair(b"z/1", b"", b"", b"z/2", b"", b"",
+                           MergeParams(min_read_length=1))
+        assert res.outcome == PairOutcome.KEPT and res.score == 0 and res.records == []
 
     def test_n_is_scored_as_an_ordinary_base(self):
-        """N vs N counts as a 2-bit match — inherited from the old kernel and left
-        alone here, because `zna encode --npolicy drop` discards any fragment
-        containing an N before it can reach the corpus. If that ever changes, N
-        should stop earning evidence."""
-        _d, _s, olen, diff, score = find_overlap(b"N" * 20 + b"ACGT" * 20,
-                                                 rc(b"N" * 20 + b"ACGT" * 20))
-        assert diff == 0 and score == score_of(olen)
+        """N vs N counts as a 2-bit match in the SCORE -- inherited from the old kernel,
+        and left alone because the scan is byte comparison. Only the plausibility gate
+        and the detected-overlap rate discount a one-sided N."""
+        o = find_overlap(b"N" * 20 + b"ACGT" * 20, rc(b"N" * 20 + b"ACGT" * 20), P)
+        assert o.mismatches == 0 and o.score_q == score_of(o.overlap_len)
 
 
 # --------------------------------------------------------------------------- #
-# §8c.2 spurious detection on genuinely unrelated pairs
+# 9. detection, read-through, the boundary invariant
 # --------------------------------------------------------------------------- #
 
 class TestSpuriousDetection:
-    """The regression guard for the 5.17% false-positive rate of the old rule.
+    """alpha bounds chance merges of unrelated sequence: none may appear."""
 
-    2x150 unrelated reads. The old rule accepted a chance 4-mer (budget
-    floor(0.20*4) = 0) at any of ~146 offsets; the LR score prices that at 7.9 bits
-    and declines it.
-    """
-
-    def test_unrelated_pairs_rate(self):
+    def test_unrelated_pairs_do_not_merge(self):
         n = 20000 if _fast_backend() else 2000   # the reference kernel is ~50x slower
         rng = random.Random(20260811)
-        detected = merged = 0
-        for _ in range(n):
-            r1 = draw(rng, 150)
-            r2 = draw(rng, 150)
-            direction, _, _, _, score = find_overlap(r1, rc(r2))
-            if direction != NO_OVERLAP:
-                detected += 1
-                if score >= T_MERGE_Q:
-                    merged += 1
-        assert detected / n < 0.005, f"spurious detection {detected / n:.4%} (was 5.17%)"
-        # A spurious *merge* is the expensive error — a chimera — and 28 bits prices
-        # it at ~1e-6 per pair, so none may appear in 20k.
-        assert merged == 0, f"{merged} spurious merges at 28 bits"
+        merged = sum(find_overlap(draw(rng, 150), rc(draw(rng, 150)), P).verdict
+                     != V_NONE for _ in range(n))
+        # 1e-6 per pair: none in 20k. (0.5.3's trim band detected 0.2% of these.)
+        assert merged == 0, f"{merged} spurious alignments reached T"
 
     def test_polya_does_not_merge(self):
-        """Low-complexity tails must not produce a confident merge.
-
-        The score has no explicit low-complexity guard (redesign §7 adds one via a
-        composition-aware null), so this pins the current behaviour: a polyA run does
-        pass the trim threshold but must never reach the merge threshold on its own.
-        """
+        """Low-complexity tails must not produce a confident merge on their own: the
+        score has no low-complexity correction, and a 20-base polyA scores 39.7 bits
+        clean -- above T -- only where it is the whole overlap."""
         rng = random.Random(5150)
         merged = 0
         for _ in range(200):
             core1, core2 = draw(rng, 130), draw(rng, 130)
             r1 = core1 + b"A" * 20                    # polyA tail on both mates
             r2 = core2 + b"A" * 20
-            _d, _s, _o, _df, score = find_overlap(r1, rc(r2))
-            merged += score >= T_MERGE_Q
+            merged += find_overlap(r1, rc(r2), P).verdict == V_MERGE
         assert merged == 0
 
-
-# --------------------------------------------------------------------------- #
-# §8c.3 detection: the recovered shift must be the true one
-# --------------------------------------------------------------------------- #
 
 class TestDetection:
     def test_known_overlaps_recover_the_true_shift(self):
         """Overlaps 4..40 at 0.5% per-base error, 2x100.
 
-        Sensitivity is set by the arithmetic, not by tuning: an overlap of 8 or less
-        cannot afford a single mismatch (7*1.9855 - 6.2288 = 7.67 < 8), so detection
-        there is just P(no error in the overlap) ~ 95%. From 9 bases up one mismatch
-        fits inside the threshold and detection is essentially total.
+        Sensitivity is set by the arithmetic, not by tuning: at 2x100 the floor is
+        27.57 bits, so 14 clean bases (27.80) reach it and 13 (25.81) cannot; one
+        mismatch costs 8.2 bits, so it takes 19 bases (29.51) for an error to fit.
         """
         L = 100
         rng = random.Random(31337)
@@ -1261,300 +1959,97 @@ class TestDetection:
                 (_, r1, _), (_, r2, _) = make_pair(frag, L)
                 r1 = mutate(r1, rng, 0.005)
                 r2 = mutate(r2, rng, 0.005)
-                direction, shift, _o, _d, score = find_overlap(r1, rc(r2))
+                o = find_overlap(r1, rc(r2), P)
                 trials += 1
-                if direction == NO_OVERLAP:
+                if o.verdict != V_MERGE:
                     continue
-                if direction == FORWARD and shift == L - olen:
+                if o.shift == L - olen:
                     hits += 1
                 else:
                     wrong += 1                      # a chance shift outscored the truth
             detected_by_olen[olen] = hits / reps
-        # Chance wins are bounded by the same spurious rate as §8c.2.
-        assert wrong / trials < 0.01, f"{wrong}/{trials} pairs detected at a wrong shift"
-        assert detected_by_olen[4] == 0.0        # 4 perfect bases = 7.94 bits < 8
-        for olen in range(5, 9):                 # zero-mismatch band
-            assert detected_by_olen[olen] >= 0.85, (olen, detected_by_olen[olen])
-        for olen in range(9, 41):                # one mismatch now fits
+        assert wrong / trials < 0.002, f"{wrong}/{trials} pairs merged at a wrong shift"
+        assert min_matches(t_q(L, L), 0) == 14
+        for olen in range(4, 14):
+            assert detected_by_olen[olen] == 0.0, olen
+        assert min_matches(t_q(L, L), 1) == 18   # 18 matches + 1 mismatch = 19 bases
+        for olen in range(14, 19):               # zero-mismatch band: P(no error)
+            assert detected_by_olen[olen] >= 0.80, (olen, detected_by_olen[olen])
+        for olen in range(19, 41):               # one mismatch now fits
             assert detected_by_olen[olen] >= 0.95, (olen, detected_by_olen[olen])
 
-    def test_merge_band_is_reached_at_15_clean_bases(self):
-        rng = random.Random(6161)
-        for olen, want_merge in ((14, False), (15, True), (30, True)):
-            frag = draw(rng, 200 - olen)
-            (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 100)
-            recs, outcome, _dropped, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-            assert score == score_of(olen)
-            assert (outcome == PairOutcome.MERGED) is want_merge
-            if not want_merge:
-                assert outcome == PairOutcome.TRIMMED
+    @pytest.mark.parametrize("read_len,shortest", [(50, 14), (100, 14), (150, 15),
+                                                   (300, 15)])
+    def test_the_shortest_mergeable_clean_overlap(self, read_len, shortest):
+        """ceil(T(N) / match_bits): 14-15 bases from 2x50 to 2x300 (plan §2)."""
+        assert min_matches(t_q(read_len, read_len), 0) == shortest
+        rng = random.Random(6161 + read_len)
+        for olen, want in ((shortest - 1, False), (shortest, True), (30, True)):
+            frag = draw(rng, 2 * read_len - olen)
+            (h1, s1, q1), (h2, s2, q2) = make_pair(frag, read_len)
+            res = process_pair(h1, s1, q1, h2, s2, q2, P)
+            assert (res.outcome == PairOutcome.MERGED) is want, (olen, res)
+            if want:
+                assert res.score == score_of(olen)
 
-
-# --------------------------------------------------------------------------- #
-# §8c.4 read-through
-# --------------------------------------------------------------------------- #
 
 class TestReadThrough:
     @pytest.mark.parametrize("insert", list(range(40, 100, 7)))
     def test_insert_shorter_than_read_merges_to_the_fragment(self, insert):
+        """Without the declaration read-through IS adapter removal: the merged record
+        is [0, L) and excludes the adapter."""
         rng = random.Random(1000 + insert)
         frag = draw(rng, insert)
         (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 100, rng)
-        p = MergeParams(min_read_length=40)
-        recs, outcome, dropped, _score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, p)
-        assert outcome == PairOutcome.MERGED and dropped == 0
-        assert len(recs) == 1
-        assert recs[0][1] == frag                     # adapter and filler both gone
-        assert len(recs[0][2]) == len(frag)
+        p = MergeParams(error_rate="0.01", min_read_length=40)
+        res = process_pair(h1, s1, q1, h2, s2, q2, p)
+        assert res.outcome == PairOutcome.MERGED and res.n_dropped == 0
+        assert [r[1] for r in res.records] == [frag]      # adapter and filler both gone
+        assert len(res.records[0][2]) == len(frag)
 
+    @pytest.mark.parametrize("insert", list(range(40, 100, 13)))
+    def test_the_declaration_keeps_the_same_pair_whole(self, insert):
+        """Declared trimmed on reads that are NOT: the read-through is impossible, so the
+        pair is kept, adapter and all. This is why the declaration is checked."""
+        rng = random.Random(1000 + insert)
+        frag = draw(rng, insert)
+        (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 100, rng)
+        p = MergeParams(error_rate="0.01", min_read_length=40, adapter_trimmed=True)
+        res = process_pair(h1, s1, q1, h2, s2, q2, p)
+        assert res.outcome == PairOutcome.KEPT
+        assert [r[1] for r in res.records] == [s1, s2]
 
-# --------------------------------------------------------------------------- #
-# §8c.5 boundary invariant — what ZNA's fragment-end supervision depends on
-# --------------------------------------------------------------------------- #
 
 class TestBoundaryInvariant:
     @pytest.mark.parametrize("insert", list(range(45, 320, 9)))
     def test_base_zero_is_always_a_true_fragment_boundary(self, insert):
-        """Nothing is ever removed from a read's 5' end, and a merged read is the
-        fragment exactly (both of its edges are true boundaries)."""
+        """Nothing is ever removed from a read, and a merged read is the fragment
+        exactly (both of its edges are true boundaries). With the trim band gone an
+        unmerged mate is emitted whole."""
         rng = random.Random(2000 + insert)
         frag = draw(rng, insert)
         (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-        p = MergeParams(min_read_length=40)
-        recs, outcome, _dropped, _score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, p)
-        if outcome == PairOutcome.MERGED:
-            assert len(recs) == 1
-            assert recs[0][1] == frag                 # exactly the fragment
+        p = MergeParams(error_rate="0.01", min_read_length=40)
+        res = process_pair(h1, s1, q1, h2, s2, q2, p)
+        if res.outcome == PairOutcome.MERGED:
+            assert [r[1] for r in res.records] == [frag]
         else:
-            assert len(recs) == 2
-            # Only 3' bases may be removed, so each mate is a prefix of its read...
-            assert s1.startswith(recs[0][1]) and s2.startswith(recs[1][1])
-            # ...and base 0 of each mate is a true fragment end.
-            assert recs[0][1][0] == frag[0]
-            assert recs[1][1][0] == rc(frag)[0]
-
-    # 2x150 with insert 286..292 puts the overlap at 8..14 bases: real, scoring
-    # 15.9-27.8 bits, i.e. squarely inside the trim band and clear of chance.
-    @pytest.mark.parametrize("insert", list(range(286, 293)))
-    def test_trim_band_tiles_the_fragment_exactly_once(self, insert):
-        """A trimmed pair covers the fragment once — no duplicated span, nothing lost
-        from either 5' end."""
-        rng = random.Random(3000 + insert)
-        frag = draw(rng, insert)
-        (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-        recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2,
-                                                MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
-        assert recs[0][1] + rc(recs[1][1]) == frag
-        assert len(recs[1][1]) == len(recs[1][2])     # quality trimmed alongside
+            assert [r[1] for r in res.records] == [s1, s2]
+            assert s1[0] == frag[0] and s2[0] == rc(frag)[0]
 
     def test_merged_read_is_in_r1s_frame(self):
         """zna's single/merged normalization assumes merged reads are R1-framed."""
         rng = random.Random(808)
         frag = draw(rng, 160)
         (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 100, rng)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1].startswith(s1)              # starts with R1, not revcomp(R2)
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1].startswith(s1)          # R1 first, not revcomp(R2)
 
-
-# --------------------------------------------------------------------------- #
-# the trim is symmetric: the overlap is split between the two 3' ends
-# --------------------------------------------------------------------------- #
-
-class TestSymmetricTrim:
-    """The overlap sits at the 3' end of BOTH mates, so it is split between them.
-
-    Taking the whole overlap off R2 tiled the fragment correctly too, but it emitted one
-    full-length read beside one short one. Downstream tools align better on, and expect,
-    mates of equal length -- and splitting discards the *last* cycles of both reads (the
-    lowest-quality bases in the pair) rather than one read's entire copy of the overlap.
-    """
-
-    @pytest.mark.parametrize("insert", list(range(286, 296)))
-    def test_emitted_lengths_are_balanced_and_tile_the_fragment(self, insert):
-        rng = random.Random(4000 + insert)
-        frag = draw(rng, insert)
-        (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-        recs, outcome, _d, score, _olen, _diff = process_pair(
-            h1, s1, q1, h2, s2, q2, MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
-        n1, n2 = len(recs[0][1]), len(recs[1][1])
-        assert abs(n1 - n2) <= 1, (n1, n2)            # equal, or one apart if L is odd
-        assert n1 + n2 == insert                      # tiles the fragment exactly once
-        assert recs[0][1] + rc(recs[1][1]) == frag
-        for h, s, q in recs:
-            assert len(s) == len(q)                   # quality follows the sequence
-
-    def test_both_mates_are_cut_from_their_3_prime_ends_only(self):
-        """C1 is what makes the split legal: each read keeps its own 5' end."""
-        rng = random.Random(4242)
-        frag = draw(rng, 288)
-        (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(
-            h1, s1, q1, h2, s2, q2, MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED
-        assert s1.startswith(recs[0][1]) and s2.startswith(recs[1][1])
-        assert q1.startswith(recs[0][2]) and q2.startswith(recs[1][2])
-
-    def test_a_mate_too_short_to_supply_its_half_gives_the_cut_to_the_other(self):
-        """Balance the emitted LENGTHS, not the number of bases cut.
-
-        R2 covers only 60 of the fragment's 148 bases, so an even split is unreachable:
-        R2 keeps all of it and R1 gives up the whole overlap. 88/60 is as close to equal
-        as the geometry allows, and much closer than the old rule's 100/48.
-        """
-        rng = random.Random(515)
-        frag = draw(rng, 148)                         # s = 88, L = s + 60 = 148
-        r1, r2 = frag[:100], rc(frag[88:])
-        recs, outcome, _d, score, _olen, _diff = process_pair(
-            b"u/1", r1, qual(r1), b"u/2", r2, qual(r2), MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
-        assert len(recs[0][1]) == 88 and len(recs[1][1]) == 60
-        assert recs[0][1] + rc(recs[1][1]) == frag
-
-    def test_the_consensus_reaches_r2s_half_of_the_overlap(self):
-        """R2 keeps part of the overlap now, so the consensus has to be written into it.
-
-        Writing only R1 -- correct when R1 kept the whole overlap -- would emit R2's
-        uncorrected bases for its half, giving the correction back exactly where the two
-        mates disagreed. A high-quality R1 base against a low-quality R2 mismatch must
-        show up as R1's call in R2's own output, complemented.
-        """
-        rng = random.Random(77)
-        frag = draw(rng, 288)
-        (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-        # The overlap is fragment [138, 150), i.e. R2 read positions [138, 150).
-        # Corrupt one base R2 keeps after the split, at low quality.
-        bad = 141
-        s2b, q2b = bytearray(s2), bytearray(q2)
-        s2b[bad] = ord("A") if s2b[bad] != ord("A") else ord("C")
-        q2b[bad] = ord("#")                            # Q2: R1 must win this position
-        q1 = bytes([ord("I")] * len(s1))
-        recs, outcome, _d, _s, olen, diff = process_pair(
-            h1, s1, q1, h2, bytes(s2b), bytes(q2b), MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.TRIMMED and diff >= 1
-        n2 = len(recs[1][1])
-        assert bad < n2, "the fixture must corrupt a base R2 KEEPS"
-        assert recs[1][1][bad] == s2[bad], "R2's kept half was not consensus-corrected"
-        assert recs[0][1] + rc(recs[1][1]) == frag     # and the pair still tiles exactly
-
-    def test_the_merged_path_is_untouched_by_writing_consensus_into_r2(self):
-        """A merged record takes from R2 only OUTSIDE the overlap, so it cannot change.
-
-        `_build_merged` copies `s2rc[take1 - s :]`, which begins exactly where the
-        overlap ends, so the consensus edits now written into R2 land entirely in bases
-        the merge path never reads. Pin that, because it is what keeps this change
-        confined to the trim band.
-        """
-        rng = random.Random(1234)
-        for insert in range(160, 300, 7):
-            frag = draw(rng, insert)
-            (h1, s1, q1), (h2, s2, q2) = cycle_pair(frag, 150, rng)
-            s1m = mutate(s1, rng, 0.03)               # force disagreements
-            recs, outcome, _d, _s, _o, _f = process_pair(
-                h1, s1m, q1, h2, s2, q2, MergeParams(min_read_length=40))
-            if outcome != PairOutcome.MERGED:
-                continue
-            assert len(recs[0][1]) == insert          # still the fragment span exactly
-            assert recs[0][1].endswith(frag[len(s1m):]) or len(s1m) >= insert
-
-
-# --------------------------------------------------------------------------- #
-# §8c.6 trim guard
-# --------------------------------------------------------------------------- #
-
-class TestTrimGuard:
-    def _pair(self):
-        # 2x50, clean forward overlap 12 -> 23.8 bits (trim band). L = 88, so each mate
-        # reaches 38 bases past the other and the guard binds at any lr above 38.
-        rng = random.Random(515)
-        frag = draw(rng, 88)                  # s = 38, L = s + 50 = 88
-        return frag[:50], rc(frag[38:])
-
-    def test_trim_that_would_shorten_a_mate_below_min_keeps_both_untrimmed(self):
-        r1, r2 = self._pair()
-        counters = [0, 0]
-        # each mate reaches only 38 past the other, below min_read_length 50 -> guard.
-        p = MergeParams(min_read_length=50)
-        recs, outcome, dropped, score, _olen, _diff = process_pair(
-            b"g/1", r1, qual(r1), b"g/2", r2, qual(r2), p, counters)
-        assert T_TRIM_Q <= score < T_MERGE_Q
-        assert outcome == PairOutcome.KEPT
-        assert [r[1] for r in recs] == [r1, r2]       # both intact, fragment not lost
-        assert dropped == 0
-        assert counters[1] == 1                       # guard hit is counted
-
-    def test_below_the_guard_the_trim_happens_normally(self):
-        r1, r2 = self._pair()
-        counters = [0, 0]
-        p = MergeParams(min_read_length=38)           # 38 >= 38 -> trim as usual
-        recs, outcome, dropped, _score, _olen, _diff = process_pair(
-            b"g/1", r1, qual(r1), b"g/2", r2, qual(r2), p, counters)
-        assert outcome == PairOutcome.TRIMMED
-        assert len(recs[0][1]) == 44 and len(recs[1][1]) == 44
-        assert dropped == 0
-        assert counters[1] == 0
-
-    def test_the_guard_binds_at_each_mates_unique_contribution(self):
-        """The cliff is at `L - len`, what each mate reaches past the other's 3' end.
-
-        Not at `L / 2`, the emitted length. Both are 'the trim leaves a usable pair', but
-        only the first also refuses a trim whose *overlap* covers nearly the whole read —
-        see `test_a_near_total_overlap_in_the_trim_band_is_refused`.
-        """
-        rng = random.Random(99)
-        frag = draw(rng, 88)
-        r1, r2 = frag[:50], rc(frag[38:])
-        for lr, want in ((38, PairOutcome.TRIMMED), (39, PairOutcome.KEPT)):
-            _r, outcome, _d, _s, _o, _f = process_pair(
-                b"b/1", r1, qual(r1), b"b/2", r2, qual(r2),
-                MergeParams(min_read_length=lr))
-            assert outcome == want, (lr, outcome)
-
-    def test_a_near_total_overlap_in_the_trim_band_is_refused(self):
-        """A spurious alignment covering nearly the whole read must not trim.
-
-        145 clean bases score 288 bits and would merge outright, so an overlap that long
-        arriving in the 8–28 bit band is carrying a pile of mismatches and is almost
-        certainly not real. Trimming on it deletes most of both reads. Measured on 1M
-        simulated pairs, dropping this refusal cost 133 extra false trims, 17,214 deleted
-        bases and 9 corrupted 5' ends — every one on a pair with **no** true overlap.
-        """
-        rng = random.Random(4711)
-        # two unrelated reads that happen to align over ~145 bases at ~15 bits
-        a = draw(rng, 150)
-        b = bytearray(rc(a))
-        for i in range(0, 150, 6):                     # ~25 mismatches -> in the band
-            b[i] = ord("A") if b[i] != ord("A") else ord("C")
-        recs, outcome, _d, score, olen, _f = process_pair(
-            b"n/1", a, qual(a), b"n/2", bytes(b), qual(b),
-            MergeParams(min_read_length=40))
-        if T_TRIM_Q <= score < T_MERGE_Q and olen > 110:
-            assert outcome == PairOutcome.KEPT, (score / (1 << 24), olen)
-            assert [len(r[1]) for r in recs] == [150, 150]   # nothing removed
-
-    def test_a_pair_short_before_trimming_is_still_dropped_whole(self):
-        """The guard rescues a trim, not a genuinely short mate: all-or-nothing holds."""
-        s1 = rand_seq(100, 40)
-        s2 = rand_seq(45, 41)                         # disjoint, and below the floor
-        recs, outcome, dropped, _score, _olen, _diff = process_pair(
-            b"k/1", s1, qual(s1), b"k/2", s2, qual(s2), MergeParams(min_read_length=50))
-        assert outcome == PairOutcome.KEPT
-        assert recs == [] and dropped == 2            # no lone read emitted
-
-
-# --------------------------------------------------------------------------- #
-# §8c.7 parity with the old rule where parity is expected
-# --------------------------------------------------------------------------- #
 
 class TestParityWithLegacyRule:
     def test_clean_long_overlaps_merge_at_the_same_shift(self):
-        """Overlap >= 30 and clean: old and new must agree on the shift.
-
-        Divergence is expected only in the short/noisy band, which is exactly where
-        the old rule was measured to be wrong.
-        """
+        """Overlap >= 30 and clean: old and new must agree on the shift."""
         L = 100
         rng = random.Random(4711)
         for olen in range(30, 81, 5):
@@ -1564,12 +2059,12 @@ class TestParityWithLegacyRule:
                 r2rc = rc(r2)
                 old_dir, old_shift, _o, _d = legacy_scan(r1, r2rc, len(r1), len(r2rc),
                                                          3, 3, 0.20)
-                new_dir, new_shift, _ol, _df, score = find_overlap(r1, r2rc)
-                assert (old_dir, old_shift) == (new_dir, new_shift) == (FORWARD, L - olen)
-                assert score >= T_MERGE_Q
+                o = find_overlap(r1, r2rc, P)
+                assert (old_dir, old_shift) == (1, L - olen)
+                assert (o.verdict, o.shift) == (V_MERGE, L - olen)
 
     def test_legacy_rule_accepts_chance_four_mers_and_the_new_one_does_not(self):
-        """Pins WHY the rules differ: same 20k unrelated pairs, 5.17% vs ~0.2%."""
+        """Pins WHY the rules differ: same unrelated pairs, 5.17% vs none."""
         n = 5000 if _fast_backend() else 400
         rng = random.Random(2468)
         old_hits = new_hits = 0
@@ -1577,61 +2072,54 @@ class TestParityWithLegacyRule:
             r1 = draw(rng, 150)
             r2rc = rc(draw(rng, 150))
             old_hits += legacy_scan(r1, r2rc, 150, 150, 3, 3, 0.20)[0] != 0
-            new_hits += find_overlap(r1, r2rc)[0] != NO_OVERLAP
-        assert old_hits / n > 0.03            # the defect this redesign removes
-        assert new_hits / n < 0.005
+            new_hits += find_overlap(r1, r2rc, P).verdict != V_NONE
+        assert old_hits / n > 0.03            # the defect the LR redesign removed
+        assert new_hits == 0
 
 
 # --------------------------------------------------------------------------- #
-# process_pair
+# 10. process_pair
 # --------------------------------------------------------------------------- #
 
 class TestProcessPair:
     def test_full_overlap_merges_to_r1(self):
         frag = rand_seq(30, 10)
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
-        recs, outcome, dropped, _score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.MERGED and dropped == 0
-        assert len(recs) == 1
-        assert recs[0][1] == frag                       # merged == fragment
-        assert recs[0][0] == b"frag merged_30_0"        # /1 stripped + fastp merged token
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        assert res.outcome == PairOutcome.MERGED and res.n_dropped == 0
+        assert [r[1] for r in res.records] == [frag]        # merged == fragment
+        assert res.records[0][0] == b"frag merged_30_0"     # /1 stripped + fastp token
+        assert (res.shift, res.olen, res.implausible) == (0, 30, False)
 
     def test_partial_overlap_reconstructs_fragment(self):
         frag = rand_seq(40, 11)
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == frag
-        assert len(recs[0][2]) == len(frag)             # quality length matches
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag and len(res.records[0][2]) == len(frag)
+        assert res.shift + len(s2) == 40
 
     def test_r1_wins_keeps_r1_base_on_r2_error(self):
         frag = rand_seq(40, 12)
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
         s2 = bytearray(s2)
-        s2[-1] = ord("A") if s2[-1] != ord("A") else ord("C")  # error in R2's overlap end
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, bytes(s2), q2, P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == frag                       # R1's (correct) base wins
+        s2[-1] = flip(s2[-1])                           # error in R2's overlap end
+        res = process_pair(h1, s1, q1, h2, bytes(s2), q2, P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag                # R1's (correct) base wins
 
     def _mismatch_pair(self, seed, q_r1, q_r2, pos=15):
         """Insert 40, read 30 -> overlap R1[10:30]. R1 carries an error at `pos` called
         at `q_r1`; R2 has the correct base at `q_r2`. Returns (args, fragment)."""
         frag = rand_seq(40, seed)
         r1 = bytearray(frag[:30]); q1 = bytearray(bytes([q_r1 + 33]) * 30)
-        r1[pos] = ord("A") if r1[pos] != ord("A") else ord("C")
+        r1[pos] = flip(r1[pos])
         r2 = rc(frag[10:40]); q2 = bytes([q_r2 + 33]) * 30
         return (bytes(r1), bytes(q1), r2, q2), frag
 
     def test_an_n_is_rescued_regardless_of_its_quality(self):
         """An N carries no base information, so a real call beats it — whatever the
-        quality scores say.
-
-        This used to work only by luck: an instrument usually assigns an N a low
-        quality, so the ordinary posterior happened to pick the other mate. A
-        *high*-quality N beat a real base and survived into the corpus, where nothing
-        downstream can tell it from a genuine ambiguity. Sweep the N's quality across
-        the whole range against a fixed, moderate quality on the mate.
-        """
+        quality scores say. Sweep the N's quality across the whole range."""
         frag = rand_seq(200, 7)
         for qN in (0, 2, 20, 40, 60, 93):
             r1 = bytearray(frag[:150])
@@ -1640,13 +2128,14 @@ class TestProcessPair:
             q1 = bytearray(bytes([30 + 33]) * 150)
             q1[pos] = qN + 33
             r2 = rc(frag[50:200])
-            recs, outcome, *_ = process_pair(
-                b"n/1", bytes(r1), bytes(q1), b"n/2", r2, bytes([30 + 33]) * 150,
-                MergeParams(min_read_length=1))
-            assert outcome == PairOutcome.MERGED
-            assert recs[0][1][pos:pos + 1] == true_base, (
+            res = process_pair(b"n/1", bytes(r1), bytes(q1), b"n/2", r2,
+                               bytes([30 + 33]) * 150, P)
+            assert res.outcome == PairOutcome.MERGED
+            assert res.records[0][1][pos:pos + 1] == true_base, (
                 f"an N at Q{qN} was not rescued from the mate")
-            assert b"N" not in recs[0][1]
+            assert b"N" not in res.records[0][1]
+            # the merged record carries the rescue in its provenance
+            assert res.records[0][0] == b"n ZN:i:2 rescued_1 merged_150_50"
 
     def test_both_mates_are_n_so_there_is_nothing_to_rescue_from(self):
         """With no real call opposite it, an N cannot be rescued — so trim3 removes it."""
@@ -1656,97 +2145,95 @@ class TestProcessPair:
         r2[len(r2) - 1 - (120 - 50)] = ord("N")
         args = (b"n/1", bytes(r1), b"I" * 150, b"n/2", bytes(r2), b"I" * 150)
 
-        # trim_n off: the N survives, because rescue has nothing to draw on.
-        recs, *_ = process_pair(*args, MergeParams(min_read_length=1, npolicy="keep"))
-        assert recs[0][1][120:121] == b"N", "an N with no real call opposite must stay"
+        res = process_pair(*args, MergeParams(error_rate="0.01", min_read_length=1,
+                                              npolicy="keep"))
+        assert res.records[0][1][120:121] == b"N", "an N with no real call must stay"
 
-        # trim_n on (the default): it is cut away instead, and nothing emitted has an N.
-        recs, *_ = process_pair(*args, MergeParams(min_read_length=1))
-        assert all(b"N" not in r[1] for r in recs)
+        res = process_pair(*args, P)
+        assert all(b"N" not in r[1] for r in res.records)
 
     def test_trim3_cuts_at_the_first_surviving_n_and_keeps_the_5_anchor(self):
         """3' only. Base 0 is a fragment terminus and must survive any trim."""
         frag = rand_seq(400, 13)
         r1 = bytearray(frag[:150]); r1[37] = ord("N")
         r2 = rc(frag[250:400])                      # no overlap: the pair is kept
-        recs, outcome, *_ = process_pair(
-            b"t/1", bytes(r1), b"I" * 150, b"t/2", r2, b"I" * 150,
-            MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.KEPT
-        assert recs[0][1] == frag[:37], "trim3 must cut exactly at the first N"
-        assert recs[0][1][:1] == frag[:1], "the 5' anchor was disturbed"
-        assert recs[1][1] == r2, "the mate with no N must be untouched"
+        res = process_pair(b"t/1", bytes(r1), b"I" * 150, b"t/2", r2, b"I" * 150, P)
+        assert res.outcome == PairOutcome.KEPT
+        assert res.records[0][1] == frag[:37], "trim3 must cut exactly at the first N"
+        assert res.records[1][1] == r2, "the mate with no N must be untouched"
+        assert res.records[0][0] == b"t/1 ZN:i:4 trim3_113"
 
     @pytest.mark.parametrize("npos,merges", [(40, False), (80, True), (120, True)])
-    def test_a_trimmed_pair_can_still_merge_and_is_still_the_whole_fragment(self, npos, merges):
-        """After trimming, retry the merge on GEOMETRY, reusing the original evidence.
+    def test_a_trimmed_pair_can_still_merge_and_is_still_the_whole_fragment(
+            self, npos, merges):
+        """After trim3, merge on GEOMETRY, reusing the original evidence.
 
         trim3 removes interior bases and leaves both 5' anchors, so R1' covers [0, k1)
         and R2' covers [L-k2, L). The pair still tiles the fragment iff k1 + k2 >= L —
-        and when it does the reconstruction is the fragment exactly, N-free.
-
-        The retry must NOT re-scan: trim3 cuts 3' ends, which is where a normal overlap
-        lives, so the residual overlap here collapses from 80 bases to 10 at npos=80.
-        Ten clean bases score ~19.9 bits, under the 28-bit threshold — a re-scan would
-        refuse a merge there was 80 bases of evidence for a moment earlier.
+        and when it does the reconstruction is the fragment exactly, N-free. No re-scan:
+        trim3 cuts 3' ends, which is where a normal overlap lives.
         """
         L, RL = 220, 150
         frag = rand_seq(L, 17)
         r1 = bytearray((frag + ADAPTER1 + rand_seq(RL, 18))[:RL])
         r2 = (rc(frag) + ADAPTER2 + rand_seq(RL, 19))[:RL]
         r1[npos] = ord("N")
-        recs, outcome, *_ = process_pair(
-            b"m/1", bytes(r1), b"I" * RL, b"m/2", r2, b"I" * RL,
-            MergeParams(min_read_length=1))
-        assert all(b"N" not in r[1] for r in recs)
+        res = process_pair(b"m/1", bytes(r1), b"I" * RL, b"m/2", r2, b"I" * RL, P)
+        assert all(b"N" not in r[1] for r in res.records)
         if merges:
-            assert outcome == PairOutcome.MERGED
-            assert recs[0][1] == frag, "a post-trim merge must still be the whole fragment"
+            assert res.outcome == PairOutcome.MERGED
+            assert res.records[0][1] == frag
         else:
-            assert outcome == PairOutcome.KEPT, "coverage failed, so the pair must be kept"
-            assert len(recs[0][1]) == npos and recs[1][1] == r2
+            assert res.outcome == PairOutcome.KEPT, "coverage failed: keep the pair"
+            assert len(res.records[0][1]) == npos and res.records[1][1] == r2
 
-    def test_a_kept_pair_is_emitted_untouched(self):
-        """A kept pair gets no consensus at all — neither mate.
-
-        The consensus is written only into records whose *construction* depends on the
-        overlap being real: the merged record, and the two halves of a trim. A kept pair
-        emits both mates in full and nothing about them depends on the alignment.
-
-        This is measured, not aesthetic. A detection that lands in KEPT is spurious
-        almost by construction — at ``shift >= 0`` it is here only because the trim guard
-        refused it, which needs an inferred overlap over ~110 bases, and a genuine
-        overlap that long scores ~218 bits and would have merged at 28. Over 1M
-        ground-truth pairs, **0 of 3,068** kept-with-overlap pairs found the true shift
-        and 97.3% had no true overlap at all; the old R1-only write turned 1,379 correct
-        bases wrong to fix 78.
-
-        This fixture is a pair whose trim the guard blocks, so it is kept with a
-        detected overlap and a real disagreement inside it.
-        """
-        frag = rand_seq(48, 11)
-        r1 = bytearray(frag[:30]); r2 = rc(frag[18:48])
-        r1[25] = ord("A") if r1[25] != ord("A") else ord("C")
-        r1, q1, q2 = bytes(r1), b"~" * 30, b"!" * 30
+    @staticmethod
+    def _merge_verdict_then_trim3_breaks_tiling(r1_edit):
+        """2x150, fragment 200 (overlap R1[50:150]). R2 has an N at its own index 45 --
+        fragment position 154, outside the overlap -- so trim3 leaves it 45 bases and
+        150 + 45 < 200: the verdict is MERGE but the mates no longer tile."""
+        frag = rand_seq(200, 44)
+        r1, q1 = bytearray(frag[:150]), bytearray(b"I" * 150)
+        r1_edit(r1, q1, frag)
+        r2 = bytearray(rc(frag[50:]))
+        r2[45] = ord("N")
+        r1, q1, r2 = bytes(r1), bytes(q1), bytes(r2)
+        assert find_overlap(r1, rc(r2), _P).verdict == V_MERGE
         counters = [0, 0]
-        recs, outcome, _nd, _sc, olen, diff = process_pair(
-            b"k/1", r1, q1, b"k/2", r2, q2,
-            MergeParams(min_read_length=28), counters)
-        assert outcome == PairOutcome.KEPT and olen > 0 and diff > 0
-        assert counters[1] == 1, "fixture did not hit the trim guard"
-        assert recs[0][1] == r1 and recs[0][2] == q1, "R1 was modified on a kept pair"
-        assert recs[1][1] == r2 and recs[1][2] == q2, "R2 was modified on a kept pair"
-        assert counters[0] == 0, "the consensus ran on a kept pair"
+        res = process_pair(b"p/1", r1, q1, b"p/2", r2, b"I" * 150, _P, counters)
+        assert res.outcome == PairOutcome.KEPT and len(res.records) == 2
+        assert res.records[1] == (b"p/2 ZN:i:4 trim3_105", r2[:45], b"I" * 45)
+        return frag, r1, q1, res, counters
 
-    def test_the_n_policy_counters_are_reported_and_agree_across_backends(self):
+    def test_a_merge_verdict_kept_by_trim3_emits_r1_as_it_was_read(self):
+        """A kept mate is the input with the N policy applied and nothing else (plan §8:
+        kept-mate substitutions are zero by construction). The consensus had already
+        rewritten R1's low-quality error from R2 -- correctly here, but only because
+        the alignment is right, and a kept pair is not one the merger vouches for.
+        0.5.x emitted the rewritten R1."""
+        def error_at_120(r1, q1, frag):
+            r1[120] = flip(r1[120])
+            q1[120] = ord("&")                      # Q5: R2's Q40 call would win
+        _frag, r1, q1, res, counters = self._merge_verdict_then_trim3_breaks_tiling(
+            error_at_120)
+        assert res.records[0] == (b"p/1", r1, q1)
+        assert counters == [0, 0], "no consensus reached an emitted base"
+
+    def test_a_merge_verdict_kept_by_trim3_does_not_keep_a_rescue(self):
+        """The same for an N rescued from the mate: the kept R1 has its N back, so trim3
+        cuts it there, and the record carries no rescue."""
+        def n_at_120(r1, q1, frag):
+            r1[120] = ord("N")
+        frag, _r1, _q1, res, _c = self._merge_verdict_then_trim3_breaks_tiling(n_at_120)
+        assert res.records[0] == (b"p/1 ZN:i:4 trim3_30", frag[:120], b"I" * 120)
+
+    def test_the_n_policy_counters_are_reported(self):
         """A policy that quietly eats a library is the failure mode being guarded.
 
         `_fold` sums a fixed prefix of the counter tuple and special-cases the maximum;
-        a counter added past that point reports zero on every input. The first version
-        of these two did exactly that — the summary said "removed 0 bases" on a library
-        that was visibly being trimmed. Assert they move.
-        """
-        py, cc = _chunk_backends()
+        a counter added past that point reports zero on every input. Assert they move."""
+        from zna.merge.backend import get_merge_backend
+        be = get_merge_backend("python")
         rng = random.Random(5)
         r1s, r2s = [], []
         for i in range(200):
@@ -1758,277 +2245,175 @@ class TestProcessPair:
             r1s.append(b"@f%d/1\n%b\n+\n%b\n" % (i, bytes(a), b"I" * 150))
             r2s.append(b"@f%d/2\n%b\n+\n%b\n" % (i, bytes(b), b"I" * 150))
         buf1, buf2 = b"".join(r1s), b"".join(r2s)
-        base = (_P.match_q, _P.step_q, _P.t_merge_q, _P.t_trim_q, 40, DISAGREE_Q, True, 0)
-
         seen = {}
         for policy in (1, 2):                       # trim3, random
-            a = py(buf1, 0, len(buf1), buf2, 0, len(buf2), *base, policy, 42)
-            b = cc(buf1, 0, len(buf1), buf2, 0, len(buf2), *base, policy, 42)
-            assert a[3] == b[3], f"counters differ across backends: {a[3]} vs {b[3]}"
-            npolicy_bases, n_rescued = a[3][13], a[3][14]
-            assert npolicy_bases > 0, "the N-policy counter never moved"
-            seen[policy] = npolicy_bases
-            assert n_rescued >= 0
-        # trim3 discards everything after each surviving N; random replaces only the N
-        # itself, so trim3 must account for strictly more bases.
+            a = be.merge_chunk(buf1, 0, len(buf1), buf2, 0, len(buf2), *_chunk_args(),
+                               policy, 42)
+            assert a[3][NPOLICY_BASES] > 0, "the N-policy counter never moved"
+            assert a[3][N_RESCUED] > 0, "no rescue: the fixture is not exercising it"
+            seen[policy] = a[3][NPOLICY_BASES]
         assert seen[1] > seen[2], (seen, "trim3 should cost more bases than random")
 
     def test_a_read_through_kept_pair_is_emitted_untouched(self):
-        """The one case that corrects neither mate.
-
-        On a read-through the overlap sits at R2's true 5' fragment boundary, and a kept
-        pair means the evidence fell below the merge threshold. Writing R2 there
-        corrupted 237 5' ends per million pairs; writing R1 alone would be exactly the
-        asymmetry the rule above removes. So: neither.
-
-        Constructed rather than sampled — this is ~2,700 pairs per million on real data.
-        A 20-base fragment inside 150 bp reads is read-through by construction
-        (``shift = L - len2 < 0``), and the overlap scores ``20 * 1.9855 = 39.7`` bits
-        clean, so two mismatches (``-8.2143`` each) put it at 23.3 — inside the
-        [8, 28) band, which is a detected overlap the tool declines to merge.
-        """
+        """A 20-base fragment inside 150 bp reads with two mismatches scores 23.3 bits,
+        under the 2x150 floor of 28.2: no overlap, so neither mate is rewritten."""
         rng = random.Random(31)
         frag = draw(rng, 20)
         r1 = bytearray((frag + ADAPTER1 + draw(rng, 150))[:150])
         r2 = bytearray((rc(frag) + ADAPTER2 + draw(rng, 150))[:150])
-        for i in (5, 12):                       # two mismatches inside the overlap
-            r1[i] = ord("A") if r1[i] != ord("A") else ord("C")
+        for i in (5, 12):
+            r1[i] = flip(r1[i])
         r1, r2 = bytes(r1), bytes(r2)
         q1, q2 = b"!" * 150, b"~" * 150         # R2 far higher quality: it would win
-
-        recs, outcome, _nd, _sc, olen, diff = process_pair(
-            b"r/1", r1, q1, b"r/2", r2, q2, MergeParams(min_read_length=40))
-        assert outcome == PairOutcome.KEPT, "fixture did not land in the kept branch"
-        assert olen > 0 and diff > 0, "fixture has no detected overlap to correct"
-        assert recs[0][1] == r1 and recs[0][2] == q1, "R1 was modified on a read-through"
-        assert recs[1][1] == r2 and recs[1][2] == q2, "R2 was modified on a read-through"
+        res = process_pair(b"r/1", r1, q1, b"r/2", r2, q2,
+                           MergeParams(error_rate="0.01", min_read_length=40))
+        assert res.outcome == PairOutcome.KEPT and res.olen == 0
+        assert res.records[0][1:] == (r1, q1) and res.records[1][1:] == (r2, q2)
 
     def test_consensus_takes_the_higher_quality_call(self):
-        """The whole point: the better-supported base wins, wherever it sits in the
-        (Q1,Q2) plane."""
+        """The better-supported base wins, wherever it sits in the (Q1,Q2) plane."""
         (r1, q1, r2, q2), frag = self._mismatch_pair(90, q_r1=10, q_r2=40)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                             MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == frag                        # R1's error resolved from R2
+        res = process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag                 # R1's error resolved from R2
 
     def test_consensus_acts_in_the_band_fastps_cutoffs_never_touched(self):
         """Q11 vs Q25: R2 is ~25x better supported, but fastp's gate (R1<=Q14 AND
-        R2>=Q30) does not fire, so the old rule silently kept R1's error. This band is
-        ~5% of real overlap mismatches and R1-wins is ~95% wrong on it."""
+        R2>=Q30) does not fire, so the old rule silently kept R1's error."""
         (r1, q1, r2, q2), frag = self._mismatch_pair(93, q_r1=11, q_r2=25)
-        recs, _o, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                        MergeParams(min_read_length=1))
-        assert recs[0][1] == frag
-        # ...and the reverse band: R1 better than R2 -> R1 stands.
+        assert process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P).records[0][1] == frag
         (r1, q1, r2, q2), frag = self._mismatch_pair(94, q_r1=37, q_r2=25)
-        recs, _o, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                        MergeParams(min_read_length=1))
-        assert recs[0][1] != frag and recs[0][1][15] == r1[15]
+        out = process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P).records[0][1]
+        assert out != frag and out[15] == r1[15]
 
     def test_equal_quality_disagreement_keeps_r1(self):
         """A tie carries no information, so nothing is rewritten (R1 is the frame)."""
-        (r1, q1, r2, q2), frag = self._mismatch_pair(91, q_r1=40, q_r2=40)
-        recs, _o, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                        MergeParams(min_read_length=1))
-        assert recs[0][1][15] == r1[15]
+        (r1, q1, r2, q2), _frag = self._mismatch_pair(91, q_r1=40, q_r2=40)
+        assert process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P).records[0][1][15] == r1[15]
 
     def test_a_contested_base_is_derated_either_way(self):
         """The output quality is the POSTERIOR of the winning call, which is always
-        worse than the winner's own Q — a disputed base is less certain than an
-        uncontested one. This is what fastp's copy-the-mate's-Q rule got wrong."""
-        # R2 wins (Q40 vs Q10): posterior error ~1e-4/(1e-4+0.1) -> ~Q30, not Q40.
+        worse than the winner's own Q — a disputed base is less certain."""
         (r1, q1, r2, q2), _frag = self._mismatch_pair(95, q_r1=10, q_r2=40)
-        recs, _o, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                        MergeParams(min_read_length=1))
-        assert 33 < recs[0][2][15] < 40 + 33
-        # R1 wins (Q37 vs Q30) but is still contested, so its Q comes down too.
+        rec = process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P).records[0]
+        assert 33 < rec[2][15] < 40 + 33
         (r1, q1, r2, q2), _frag = self._mismatch_pair(96, q_r1=37, q_r2=30)
-        recs, _o, _d, _s, _olen, _diff = process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                                        MergeParams(min_read_length=1))
-        assert recs[0][2][15] < 37 + 33
-        # An uncontested position keeps its original quality untouched.
-        assert recs[0][2][0] == 37 + 33
+        rec = process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P).records[0]
+        assert rec[2][15] < 37 + 33
+        assert rec[2][0] == 37 + 33                      # uncontested: untouched
 
     def test_consensus_counts_via_out_param(self):
-        """The counter accumulates bases the consensus actually changed."""
         (r1, q1, r2, q2), _frag = self._mismatch_pair(92, q_r1=10, q_r2=40)
         counters = [0, 0]
-        process_pair(b"c/1", r1, q1, b"c/2", r2, q2,
-                     MergeParams(min_read_length=1), counters)
-        assert counters[0] == 1
+        process_pair(b"c/1", r1, q1, b"c/2", r2, q2, P, counters)
+        assert counters == [1, 0]
 
     def test_consensus_posterior_table_is_symmetric_and_monotone(self):
-        """Pin the table itself: a bigger quality gap means more confidence in the
-        winner, and the roles are symmetric."""
-        from zna.merge.params import DISAGREE_Q as T
-        q = lambda w, l: T[(w + 33) * 256 + (l + 33)] - 33
+        q = lambda w, l: DISAGREE_Q[(w + 33) * 256 + (l + 33)] - 33
         assert q(40, 10) > q(40, 30) > q(40, 39)         # wider gap -> higher confidence
-        assert q(30, 10) == q(30, 10)
         assert q(20, 20) <= 4                            # a tie is ~50/50, i.e. ~Q3
         for w in (20, 30, 40):
             for l in (5, 15, 25):
                 assert q(w, l) <= w                      # never more certain than the call
 
-    def test_short_overlap_trims_both_mates_symmetrically(self):
-        # insert 48, read 30 -> overlap 12 -> 23.8 bits: real, but under 28 -> trim.
+    def test_disjoint_keeps_both(self):
+        s1, s2 = rand_seq(50, 14), rand_seq(50, 15)
+        res = process_pair(b"x/1", s1, qual(s1), b"x/2", s2, qual(s2), P)
+        assert res.outcome == PairOutcome.KEPT and res.score == 0
+        assert [r[1] for r in res.records] == [s1, s2]
+        assert [r[0] for r in res.records] == [b"x/1", b"x/2"]      # /1,/2 preserved
+
+    def test_a_short_overlap_is_kept_whole_not_trimmed(self):
+        """0.5.3 trimmed a 12-base overlap (23.8 bits) off both mates. 0.6 keeps both
+        whole: khorana trains on one mate of an unmerged pair and wants it entire, and
+        every wrong trim came from that band."""
         frag = rand_seq(48, 13)
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30)
-        recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.TRIMMED and T_TRIM_Q <= score < T_MERGE_Q
-        assert len(recs) == 2
-        r1_out, r2_out = recs[0], recs[1]
-        # /1,/2 kept, the header passed through verbatim, and the trim recorded: a
-        # trimmed pair is emitted as an ordinary pair, so PROV_TRIMMED is the only place
-        # the split is written down.
-        assert r1_out[0] == h1 + b" ZN:i:1" and r2_out[0] == h2 + b" ZN:i:1"
-        assert base_name(r1_out[0]) == base_name(h1)               # pairing unaffected
-        # The overlap is split between the two 3' ends, not taken entirely off R2, so
-        # the emitted reads come out the same length: 12 redundant bases, 6 off each.
-        assert len(r1_out[1]) == len(r2_out[1]) == 24
-        assert r1_out[1] == s1[:24] and r2_out[1] == s2[:24]       # cut from 3' ends only
-        # R1 + trimmed-R2 tile the fragment exactly once, no duplicated span:
-        assert r1_out[1] + rc(r2_out[1]) == frag
-        assert len(r1_out[1]) == len(r1_out[2])                    # qual trimmed too
-        assert len(r2_out[1]) == len(r2_out[2])
-
-    def test_trim_removes_the_full_overlap_including_mismatches(self):
-        """Trimming removes the FULL detected overlap, not up to the first mismatch.
-        19 bp overlap with 2 mismatches scores 21.3 bits: real, but below 28."""
-        L = 100
-        frag = rand_seq(181, 77)                # insert 181, L 100 -> 19 bp overlap
-        r1 = frag[:L]
-        r2 = bytearray(rc(frag[-L:]))           # s2rc[:19] == frag[81:100] (the overlap)
-        # inject 2 mismatches into the overlap: s2rc[0],s2rc[1] map to r2[-1],r2[-2]
-        r2[-1] = ord("A") if r2[-1] != ord("A") else ord("C")
-        r2[-2] = ord("A") if r2[-2] != ord("A") else ord("C")
-        r2 = bytes(r2)
-        recs, outcome, _d, score, _olen, _diff = process_pair(b"m/1", r1, qual(r1), b"m/2", r2, qual(r2),
-                                                MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.TRIMMED
-        assert score == score_of(17, 2)
-        # all 19 redundant bases go, 10 off R1 and 9 off R2 (odd overlap: the extra base
-        # stays on R1, so R1 is the longer of the two by one)
-        assert len(recs[0][1]) == 91 and len(recs[1][1]) == 90
-        assert len(recs[0][1]) + len(recs[1][1]) == 181            # tiles the fragment
-        # The mismatched bases sat in R2's 3' end and were cut; what remains of R1's
-        # overlap share is consensus-resolved, so the pair still tiles the true fragment.
-        assert recs[0][1] + rc(recs[1][1]) == frag
-
-    def test_overlap_below_the_trim_threshold_is_not_trimmed(self):
-        """An overlap whose evidence is under T_trim leaves both reads untouched."""
-        L = 100
-        frag = rand_seq(181, 78)
-        r1 = frag[:L]
-        r2 = bytearray(rc(frag[-L:]))
-        for i in range(1, 6):                   # 5 mismatches in 19 bp: 27.8 - 31.1 < 0
-            r2[-i] = ord("A") if r2[-i] != ord("A") else ord("C")
-        r2 = bytes(r2)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"n/1", r1, qual(r1), b"n/2", r2, qual(r2),
-                                             MergeParams(min_read_length=1))
-        assert outcome == PairOutcome.KEPT                  # overlap not accepted
-        assert [r[1] for r in recs] == [r1, r2]             # both kept full, untrimmed
-
-    def test_disjoint_keeps_both(self):
-        s1 = rand_seq(50, 14)
-        s2 = rand_seq(50, 15)
-        h1, h2 = b"x/1", b"x/2"
-        recs, outcome, _d, score, _olen, _diff = process_pair(h1, s1, qual(s1), h2, s2, qual(s2), P)
-        assert outcome == PairOutcome.KEPT and score == 0
-        assert [r[1] for r in recs] == [s1, s2]
-        assert [r[0] for r in recs] == [h1, h2]                    # /1,/2 preserved
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        assert res.outcome == PairOutcome.KEPT
+        assert [r[:2] for r in res.records] == [(h1, s1), (h2, s2)]
 
     def test_read_through_collapses_to_insert(self):
         insert = rand_seq(20, 16)
         s1 = (insert + ADAPTER1)[:30]
         s2 = (rc(insert) + ADAPTER2)[:30]
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"rt/1", s1, qual(s1), b"rt/2", s2, qual(s2), P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == insert                                # adapter gone
+        res = process_pair(b"rt/1", s1, qual(s1), b"rt/2", s2, qual(s2), P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == insert                         # adapter gone
 
     def test_length_filter_drops_short_merged(self):
         insert = rand_seq(20, 17)
         s1 = (insert + ADAPTER1)[:30]
         s2 = (rc(insert) + ADAPTER2)[:30]
-        p = MergeParams(min_read_length=40)
-        recs, outcome, dropped, _s, _olen, _diff = process_pair(b"rt/1", s1, qual(s1), b"rt/2", s2, qual(s2), p)
-        assert outcome == PairOutcome.MERGED and recs == [] and dropped == 1
+        p = MergeParams(error_rate="0.01", min_read_length=40)
+        res = process_pair(b"rt/1", s1, qual(s1), b"rt/2", s2, qual(s2), p)
+        assert res.outcome == PairOutcome.MERGED and res.records == []
+        assert res.n_dropped == 1
 
-    def test_min_read_length_default_is_40(self):
+    def test_a_pair_with_a_short_mate_is_dropped_whole(self):
+        """All-or-nothing: no lone mate is ever emitted as a spurious single."""
+        s1, s2 = rand_seq(100, 40), rand_seq(45, 41)
+        res = process_pair(b"k/1", s1, qual(s1), b"k/2", s2, qual(s2),
+                           MergeParams(error_rate="0.01", min_read_length=50))
+        assert res.outcome == PairOutcome.KEPT
+        assert res.records == [] and res.n_dropped == 2
+
+    def test_cli_defaults(self):
         # 40 = the pipeline-wide floor (must match the initial fastp run).
-        from zna.merge.cli import build_parser
-        args = build_parser().parse_args(["--in1", "a", "--in2", "b", "--out", "c"])
+        args = cli.build_parser().parse_args(["--in1", "a", "--in2", "b", "--out", "c"])
         assert args.min_read_length == 40
-        assert (args.t_merge, args.t_trim) == (28.0, 8.0)
+        assert (args.alpha, args.error_rate, args.adapter_trimmed) == \
+            ("1e-6", "0.01", False)
+        assert not hasattr(args, "t_merge") and not hasattr(args, "t_trim")
 
     def test_fully_redundant_r2_collapses_to_merged_insert(self):
-        # R2 (15 bp) fully inside the overlap -> R1 spans the short insert -> merged single.
-        # The old `keep2 <= 0` special case, now reached through `score >= t_merge`.
+        # R2 (15 bp) fully inside R1 -> R1 spans the short insert -> merged single.
         frag = rand_seq(40, 18)
         r1 = frag[:35]
         r2 = rc(frag[5:20])          # s2rc == frag[5:20] aligns at R1 offset 5, olen 15
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"e/1", r1, qual(r1), b"e/2", r2, qual(r2), P)
-        assert outcome == PairOutcome.MERGED
-        assert len(recs) == 1
-        assert recs[0][1] == frag[:20]                 # clean insert (shift 5 + len2 15)
-        assert base_name(recs[0][0]) == b"e"           # single; merged name
+        res = process_pair(b"e/1", r1, qual(r1), b"e/2", r2, qual(r2), P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag[:20]          # clean insert (5 + 15)
+        assert base_name(res.records[0][0]) == b"e"
 
-
-# --------------------------------------------------------------------------- #
-# unequal read lengths: the regime every equal-length fixture is blind to
-# --------------------------------------------------------------------------- #
 
 class TestUnequalReadLengths:
-    """Truncation requires ``len1 < len2`` strictly, so `make_pair`/`cycle_pair` — which
-    build both mates at one length — structurally cannot express it. That is why 135
-    tests were green over a defect affecting 0.271% of merged records in production.
-    Both mechanisms are pinned here.
-    """
+    """Truncation requires ``len1 < len2`` strictly, so equal-length fixtures
+    structurally cannot express it. Both mechanisms are pinned here."""
 
     def test_forward_shift_zero_with_r2_longer(self):
-        """R1 quality-trimmed; R2 spans the whole fragment (s == 0, len2 > len1)."""
         rng = random.Random(1234)
         frag = draw(rng, 150)
-        r1 = frag[:100]
-        r2 = rc(frag)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"u/1", r1, qual(r1), b"u/2", r2, qual(r2), P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == frag                       # not truncated to R1
-        assert recs[0][0].endswith(b"merged_100_50")    # 100 from R1, 50 from R2
+        r1, r2 = frag[:100], rc(frag)
+        res = process_pair(b"u/1", r1, qual(r1), b"u/2", r2, qual(r2), P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag                   # not truncated to R1
+        assert res.records[0][0].endswith(b"merged_100_50")
 
     def test_read_through_with_r1_shorter_than_the_fragment(self):
-        """The majority mechanism: read-through (s < 0) where R1 does not reach L."""
         rng = random.Random(5678)
         frag = draw(rng, 120)
-        r1 = frag[:100]                                  # R1 stops 20 bases short of L
+        r1 = frag[:100]                                     # R1 stops 20 bases short
         r2 = (rc(frag) + ADAPTER2 + draw(rng, 150))[:150]
-        recs, outcome, _d, _s, _olen, _diff = process_pair(b"v/1", r1, qual(r1), b"v/2", r2, qual(r2), P)
-        assert outcome == PairOutcome.MERGED
-        assert recs[0][1] == frag                        # R2 supplies frag[100:120]
+        res = process_pair(b"v/1", r1, qual(r1), b"v/2", r2, qual(r2), P)
+        assert res.outcome == PairOutcome.MERGED
+        assert res.records[0][1] == frag                    # R2 supplies frag[100:120]
 
     @pytest.mark.parametrize("insert", list(range(60, 300, 11)))
     def test_span_invariant_over_independent_read_lengths(self, insert):
-        """For every merged record, len(seq) == the fragment span the scan inferred,
-        and the record equals the fragment exactly."""
         rng = random.Random(9000 + insert)
         frag = draw(rng, insert)
         for l1, l2 in ((150, 150), (100, 150), (150, 100), (90, 140), (140, 90)):
             r1 = (frag + ADAPTER1 + draw(rng, 200))[:l1]
             r2 = (rc(frag) + ADAPTER2 + draw(rng, 200))[:l2]
-            direction, shift, _olen, _diff, score = find_overlap(r1, rc(r2))
-            recs, outcome, _d, _s, _olen, _diff = process_pair(
-                b"w/1", r1, qual(r1), b"w/2", r2, qual(r2), MergeParams(min_read_length=40))
-            if outcome != PairOutcome.MERGED or not recs:
+            res = process_pair(b"w/1", r1, qual(r1), b"w/2", r2, qual(r2),
+                               MergeParams(error_rate="0.01", min_read_length=40))
+            if res.outcome != PairOutcome.MERGED or not res.records:
                 continue
-            span = (shift if direction == FORWARD else -shift) + len(r2)
-            assert len(recs[0][1]) == span, (insert, l1, l2)
-            assert len(recs[0][2]) == span                       # quality tracks sequence
-            assert recs[0][1] == frag[:span] and span == insert  # exactly the fragment
+            span = res.shift + len(r2)
+            assert len(res.records[0][1]) == len(res.records[0][2]) == span
+            assert res.records[0][1] == frag and span == insert
 
-
-# --------------------------------------------------------------------------- #
-# name helpers
-# --------------------------------------------------------------------------- #
 
 class TestNames:
     def test_base_name(self):
@@ -2039,55 +2424,42 @@ class TestNames:
         assert base_name(b"SRR123.5 merged_150_87") == b"SRR123.5"
 
     def test_merged_name_is_fastp_style(self):
-        """Merged read carries fastp's `<id> merged_<n1>_<n2>` token; ZNA base name intact."""
         frag = rand_seq(40, 22)                       # insert 40, L 30 -> n1=30, n2=10
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, 30, name=b"R.7")
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        assert outcome == PairOutcome.MERGED
-        name = recs[0][0]
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        name = res.records[0][0]
         assert name == b"R.7 merged_30_10"
         # khorana seq.py parse_merged_fastq requires the last token to start with 'merged'
         assert name.rsplit(None, 1)[-1].startswith(b"merged")
-        assert base_name(name) == b"R.7"              # ZNA pairing still sees "R.7"
+        assert base_name(name) == b"R.7"
 
     def test_merged_strips_suffix_preserves_tags(self):
         frag = rand_seq(30, 20)
-        h1 = b"SRR.1/1\tRX:Z:ACGT"
-        recs, outcome, _d, _s, _olen, _diff = process_pair(
-            h1, frag, qual(frag), b"SRR.1/2\tRX:Z:ACGT", rc(frag), qual(frag), P
-        )
-        assert outcome == PairOutcome.MERGED
-        # /1 gone, tag preserved, fastp merged token appended (base name still SRR.1 for ZNA)
-        assert recs[0][0] == b"SRR.1\tRX:Z:ACGT merged_30_0"
-        assert base_name(recs[0][0]) == b"SRR.1"
+        res = process_pair(b"SRR.1/1\tRX:Z:ACGT", frag, qual(frag),
+                           b"SRR.1/2\tRX:Z:ACGT", rc(frag), qual(frag), P)
+        assert res.records[0][0] == b"SRR.1\tRX:Z:ACGT merged_30_0"
 
-
-# --------------------------------------------------------------------------- #
-# property test: tile-or-merge over the whole insert-size range
-# --------------------------------------------------------------------------- #
 
 class TestProperty:
     @pytest.mark.parametrize("insert", list(range(30, 61)))
-    def test_merge_or_trim_never_double_counts(self, insert):
+    def test_merge_or_keep_never_double_counts(self, insert):
+        """2x30 over every insert: merged exactly when the clean overlap reaches the
+        floor (T(59) = 25.814 bits -> 14 bases; 13 fall 0.003 bits short), otherwise
+        both reads verbatim."""
         L = 30
         frag = rand_seq(60, 999)[:insert]
         (h1, s1, q1), (h2, s2, q2) = make_pair(frag, L)
-        recs, outcome, _d, _s, _olen, _diff = process_pair(h1, s1, q1, h2, s2, q2, P)
-        overlap = 2 * L - insert
-        if overlap >= min_matches(T_MERGE_Q, 0):  # 15 clean bases reach the merge threshold
-            assert outcome == PairOutcome.MERGED
-            assert recs[0][1] == frag           # reconstructs the molecule
-        elif overlap >= min_matches(T_TRIM_Q, 0):  # 5..14 -> trim band
-            assert outcome == PairOutcome.TRIMMED
-            r1_out, r2_out = recs[0], recs[1]
-            assert r1_out[1] + rc(r2_out[1]) == frag       # tile exactly once
-        else:                                   # <= 4 bases: not enough evidence
-            assert outcome == PairOutcome.KEPT
-            assert [r[1] for r in recs] == [s1, s2]
+        res = process_pair(h1, s1, q1, h2, s2, q2, P)
+        if 2 * L - insert >= min_matches(t_q(L, L), 0):
+            assert res.outcome == PairOutcome.MERGED
+            assert res.records[0][1] == frag
+        else:
+            assert res.outcome == PairOutcome.KEPT
+            assert [r[1] for r in res.records] == [s1, s2]
 
 
 # --------------------------------------------------------------------------- #
-# end-to-end CLI (mixed interleaved output + stats JSON)
+# 11. end-to-end CLI: the stats, the warnings, table growth
 # --------------------------------------------------------------------------- #
 
 def _write_fastq_gz(path, records):
@@ -2096,255 +2468,438 @@ def _write_fastq_gz(path, records):
             fh.write(b"@%b\n%b\n+\n%b\n" % (name, seq, b"I" * len(seq)))
 
 
+def _run(tmp_path, in1, in2, *flags, out="o.fastq"):
+    args = cli.build_parser().parse_args([
+        "--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / out), "-q",
+        *flags])
+    return cli.run(args)
+
+
+def _library_files(tmp_path, n, seed, read_len=100, with_n=False, name="lib"):
+    rng = random.Random(seed)
+    r1s, r2s = [], []
+    for i in range(n):
+        frag = draw(rng, rng.randrange(60, 2 * read_len + 40))
+        (h1, s1, _), (h2, s2, _) = cycle_pair(frag, read_len, rng,
+                                              name=b"P%d" % i)
+        s1 = mutate(s1, rng, 0.005)
+        if with_n and rng.random() < 0.3:
+            s1 = s1[:70] + b"N" + s1[71:]
+        r1s.append((h1, s1)); r2s.append((h2, s2))
+    in1, in2 = tmp_path / f"{name}_1.fastq.gz", tmp_path / f"{name}_2.fastq.gz"
+    _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+    return in1, in2
+
+
 class TestCLI:
     def test_end_to_end_mixed_stream(self, tmp_path):
         merge_frag = rand_seq(40, 30)                    # overlap 20 -> merge
-        trim_frag = rand_seq(48, 31)                     # overlap 12 -> trim
+        short_frag = rand_seq(48, 31)                    # overlap 12 -> keep (< 14)
         disj1, disj2 = rand_seq(50, 32), rand_seq(50, 33)  # -> keep both
 
         r1s, r2s = [], []
         (h1, s1, _), (h2, s2, _) = make_pair(merge_frag, 30, name=b"M")
         r1s.append((h1, s1)); r2s.append((h2, s2))
-        (h1, s1, _), (h2, s2, _) = make_pair(trim_frag, 30, name=b"T")
+        (h1, s1, _), (h2, s2, _) = make_pair(short_frag, 30, name=b"T")
         r1s.append((h1, s1)); r2s.append((h2, s2))
         r1s.append((b"D/1", disj1)); r2s.append((b"D/2", disj2))
-
-        in1 = tmp_path / "r1.fastq.gz"
-        in2 = tmp_path / "r2.fastq.gz"
-        out = tmp_path / "merged.fastq"       # plain (no pigz dependency in test)
+        in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
+        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
         js = tmp_path / "stats.json"
-        _write_fastq_gz(in1, r1s)
-        _write_fastq_gz(in2, r2s)
 
-        args = cli.build_parser().parse_args([
-            "--in1", str(in1), "--in2", str(in2), "--out", str(out),
-            "--json", str(js), "--threads", "1", "--min-read-length", "10", "-q",
-        ])
-        stats = cli.run(args)
-
+        stats = _run(tmp_path, in1, in2, "--json", str(js), "--threads", "1",
+                     "--min-read-length", "10", "--error-rate", "0.01")
         assert stats["input_pairs"] == 3
-        assert stats["merged"] == 1
-        assert stats["trimmed_pairs"] == 1
-        assert stats["kept_pairs"] == 1
-        assert stats["emitted_records"] == 1 + 2 + 2      # merged(1) + trim(2) + keep(2)
-        assert stats["params"]["threshold_merge_bits"] == 28.0
-        assert stats["params"]["threshold_trim_bits"] == 8.0
-
-        # the overlap-length histogram counts only pairs where an overlap was found,
-        # in the natural quantum (bases), and the merged record's length is the insert
-        ohist = stats["overlap_length_histogram"]
-        assert ohist == {"20": 1, "12": 1}                # the disjoint pair is absent
+        assert stats["merged"] == 1 and stats["kept_pairs"] == 2
+        assert stats["emitted_records"] == 1 + 2 + 2      # merged(1) + kept(2) + kept(2)
+        assert stats["error_rate"] == 0.01
+        assert stats["params"]["alpha"] == 1e-6
+        assert stats["policy"] == "zna-merge-0.6"
+        # only the admitted overlap is binned; the merged record's length is the insert
+        assert stats["overlap_length_histogram"] == {"20": 1}
         assert stats["insert_size_histogram"] == {"40": 1}
         assert stats["overlap_mismatch_rate"] == 0.0      # clean synthetic overlaps
 
-        # Parse the output stream and check names/pairing structure.
-        lines = out.read_bytes().splitlines()
+        lines = (tmp_path / "o.fastq").read_bytes().splitlines()
         headers = [lines[i][1:] for i in range(0, len(lines), 4)]
-        ids = [h.split()[0] for h in headers]             # base id (drop " merged_.." token)
+        ids = [h.split()[0] for h in headers]
         assert b"M" in ids                                # merged single, suffix stripped
-        assert b"T/1" in ids and b"T/2" in ids            # trimmed pair, adjacent
-        assert b"D/1" in ids and b"D/2" in ids            # kept pair
-        # the merged read carries fastp's "merged_<n1>_<n2>" name token
-        m_hdr = next(h for h in headers if h.split()[0] == b"M")
-        assert m_hdr.split(b" ", 1)[1].startswith(b"merged_")
-        # merged read reconstructs the molecule
+        assert {b"T/1", b"T/2", b"D/1", b"D/2"} <= set(ids)
         seqs = {ids[k]: lines[k * 4 + 1] for k in range(len(ids))}
         assert seqs[b"M"] == merge_frag
-
-        # stats JSON round-trips
+        assert seqs[b"T/1"] == make_pair(short_frag, 30)[0][1]     # whole, not trimmed
         assert json.loads(js.read_text())["merged"] == 1
 
-    def test_thresholds_are_settable(self, tmp_path):
-        """Raising --threshold-merge turns a merge into a trim; the bands are live."""
-        frag = rand_seq(40, 34)                           # overlap 20 -> 39.7 bits
+    def test_the_stats_are_finite_and_type_stable(self, tmp_path):
+        """hulkrna's cohort gather rejects Infinity/NaN and type changes, so the stats
+        of an empty input and of a real one have the same keys and value types."""
+        in1, in2 = _library_files(tmp_path, 30, 1)
+        full = _run(tmp_path, in1, in2)
+        e1, e2 = tmp_path / "e1.fastq.gz", tmp_path / "e2.fastq.gz"
+        _write_fastq_gz(e1, []); _write_fastq_gz(e2, [])
+        empty = _run(tmp_path, e1, e2, "--allow-empty", out="e.fastq")
+        json.dumps(full, allow_nan=False)
+        json.dumps(empty, allow_nan=False)
+
+        def types(d):
+            return {k: (types(v) if isinstance(v, dict) and not k.endswith("histogram")
+                        else type(v).__name__) for k, v in d.items()}
+        assert types(full) == types(empty)
+        for k in ("error_rate", "detected_overlap_mismatch_rate",
+                  "expected_refused_true_overlap_fraction",
+                  "readthrough_check_strong_fraction", "overlap_mismatch_rate",
+                  "merged_pct"):
+            assert isinstance(full[k], float) and isinstance(empty[k], float), k
+        for gone in ("trimmed_pairs", "trimmed_pct", "bases_trimmed",
+                     "trim_guard_kept_untrimmed", "error_rate_source",
+                     "error_sample_pairs", "error_prior_share"):
+            assert gone not in full
+        assert empty["error_rate"] == 0.01
+        assert (empty["detected_overlap_bases"], empty["readthrough_check_pairs"],
+                empty["detected_overlap_mismatch_rate"],
+                empty["expected_refused_true_overlap_fraction"],
+                empty["detected_overlap_length_histogram"]) == (0, 0, 0.0, 0.0, {})
+        assert full["readthrough_check_pairs"] == 30 and full["detected_overlap_bases"]
+
+    def test_the_detected_rate_is_every_detected_overlap_before_the_gate(self,
+                                                                          tmp_path):
+        """``detected_overlap_mismatch_rate`` over the whole run equals the sum, pair by
+        pair, of what ``find_overlap`` detects -- merged or refused -- at the run's own
+        parameters, informative positions only."""
+        in1, in2 = _library_files(tmp_path, 60, 2, with_n=True)
+        stats = _run(tmp_path, in1, in2)
+        assert stats["error_rate"] == 0.01                 # the default reached the run
+        d = n = 0
+        with gzip.open(in1) as f1, gzip.open(in2) as f2:
+            l1, l2 = f1.read().splitlines(), f2.read().splitlines()
+        for s1, s2 in zip(l1[1::4], l2[1::4]):
+            o = find_overlap(s1, rc(s2), _P)
+            if o.verdict != V_NONE:
+                d += o.informative_mismatches
+                n += o.overlap_len - (o.mismatches - o.informative_mismatches)
+        assert d > 0 and stats["detected_overlap_bases"] == n
+        assert stats["detected_overlap_mismatch_rate"] == round(d / n, 6)
+
+    def test_the_expected_refusals_are_every_detected_overlap_by_brute_force(
+            self, tmp_path):
+        """``expected_refused_true_overlap_fraction`` over a whole run equals, by exact
+        enumeration, the mean over every pair ``find_overlap`` detects of ``P(Binom(n,
+        rate) > dfit[n])`` at the run's detected rate -- and the histogram it is summed
+        over is those pairs' overlap lengths, merged or refused. Noisy enough (4%, a
+        3'-degraded library) that the value is not a rounding-level zero."""
+        rng = random.Random(41)
+        r1s, r2s = [], []
+        for i in range(80):
+            frag = draw(rng, rng.randrange(110, 190))
+            (h1, s1, _), (h2, s2, _) = make_pair(frag, 100, name=b"B%d" % i)
+            r1s.append((h1, mutate(s1, rng, 0.04))); r2s.append((h2, s2))
+        r1s.append((b"R/1", TestPlausibilityGate._repeat_beats_truth()[:150]))
+        r2s.append((b"R/2", rc(TestPlausibilityGate._repeat_beats_truth()[-150:])))
+        in1, in2 = tmp_path / "b1.fastq.gz", tmp_path / "b2.fastq.gz"
+        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+        stats = _run(tmp_path, in1, in2)
+        det_d = det_n = 0
+        lengths = []
+        for (_h1, s1), (_h2, s2) in zip(r1s, r2s):
+            o = find_overlap(s1, rc(s2), _P)
+            if o.verdict != V_NONE:
+                det_d += o.informative_mismatches
+                det_n += o.overlap_len - (o.mismatches - o.informative_mismatches)
+                lengths.append(o.overlap_len)
+        assert stats["implausible_refused"] >= 1          # the repeat is in there
+        assert stats["detected_overlap_length_histogram"] == {
+            str(n): lengths.count(n) for n in sorted(set(lengths))}
+        rate = Fraction(det_d, det_n)
+        want = sum(_brute_refusal(n, _P.dfit(n), rate) for n in lengths) / len(lengths)
+        assert 1e-4 < float(want) < 1e-1
+        assert stats["expected_refused_true_overlap_fraction"] == \
+            float(format(float(want), ".4g"))
+
+    def test_the_error_rate_reaches_the_kernel_exactly(self, tmp_path):
+        in1, in2 = _library_files(tmp_path, 60, 2)
+        base = _run(tmp_path, in1, in2)
+        user = _run(tmp_path, in1, in2, "--error-rate", "0.0123")
+        assert user["error_rate"] == 0.0123
+        assert (user["params"]["match_q"], user["params"]["step_q"]) == \
+            weights_q(Fraction("0.0123"))
+        assert (base["params"]["match_q"], base["params"]["step_q"]) == \
+            weights_q(Fraction("0.01"))
+
+    @pytest.mark.parametrize("threads,chunk", [(1, 7), (3, 7), (4, 13), (2, 1000),
+                                               (3, 1)])
+    @pytest.mark.parametrize("declared", [False, True])
+    def test_the_output_and_the_diagnostics_ignore_threads_and_chunking(
+            self, tmp_path, monkeypatch, threads, chunk, declared):
+        """The read-through check covers the input's first READTHROUGH_CHECK_PAIRS
+        pairs -- here 17 of 60, so the window ends inside a chunk at most chunk sizes --
+        and the detected-overlap counters are plain sums, so neither can move with the
+        chunking or the thread count. Neither can the output."""
+        monkeypatch.setattr(zparams, "READTHROUGH_CHECK_PAIRS", 17)
+        in1, in2 = _library_files(tmp_path, 60, 5, with_n=True)
+        flags = ("--adapter-trimmed",) if declared else ()
+        base = _run(tmp_path, in1, in2, "--threads", "1", "--chunk-size", "50000",
+                    *flags, out="base.fastq")
+        other = _run(tmp_path, in1, in2, "--threads", str(threads), "--chunk-size",
+                     str(chunk), *flags, out="other.fastq")
+        for s in (base, other):
+            for wallclock in ("elapsed_s", "pairs_per_second"):
+                s.pop(wallclock, None)
+        assert other == base
+        assert (tmp_path / "other.fastq").read_bytes() == \
+            (tmp_path / "base.fastq").read_bytes()
+        # ...and the check counted exactly the first 17, by brute force
+        assert base["readthrough_check_pairs"] == 17
+        with gzip.open(in1) as f1, gzip.open(in2) as f2:
+            l1, l2 = f1.read().splitlines(), f2.read().splitlines()
+        strong = 0
+        for s1, s2 in list(zip(l1[1::4], l2[1::4]))[:17]:
+            a = scan_unrestricted(s1, rc(s2), _P)
+            strong += bool(a.overlap_len) and a.shift + len(s2) < max(len(s1), len(s2))
+        assert 0 < strong < 17
+        assert base["readthrough_check_strong_fraction"] == round(strong / 17, 6)
+
+    def test_alpha_reaches_the_kernel(self, tmp_path):
+        """A 20-base clean overlap (39.7 bits) merges at the default alpha and not at
+        alpha = 1e-12 (T = 45.7 bits at 2x30)."""
+        frag = rand_seq(40, 34)
         (h1, s1, _), (h2, s2, _) = make_pair(frag, 30, name=b"M")
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, [(h1, s1)]); _write_fastq_gz(in2, [(h2, s2)])
+        common = ("--min-read-length", "10", "--error-rate", "0.01")
+        assert _run(tmp_path, in1, in2, *common)["merged"] == 1
+        tight = _run(tmp_path, in1, in2, *common, "--alpha", "1e-12")
+        assert tight["merged"] == 0 and tight["params"]["alpha"] == 1e-12
 
-        def run(t_merge):
-            args = cli.build_parser().parse_args([
-                "--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fastq"),
-                "--threshold-merge", str(t_merge), "--min-read-length", "10", "-q",
-            ])
-            return cli.run(args)
-
-        assert run(28.0)["merged"] == 1
-        assert run(50.0)["trimmed_pairs"] == 1            # 39.7 bits now below merge
-
-    def test_trim_threshold_above_merge_is_rejected(self, tmp_path):
-        args = cli.build_parser().parse_args([
-            "--in1", "a", "--in2", "b", "--out", "c",
-            "--threshold-merge", "10", "--threshold-trim", "20", "-q",
-        ])
-        with pytest.raises(SystemExit):
-            cli.run(args)
-
-    def test_threads_match_single(self, tmp_path):
-        """--threads N must emit the same records as one thread -- in fact the same
-        BYTES, because chunks are written in submission order."""
+    def test_the_adapter_trimmed_declaration_reaches_the_kernel_and_is_checked(
+            self, tmp_path, caplog):
+        """Declared on raw reads full of read-through: those pairs stop merging, and
+        the sample check says why, loudly."""
+        rng = random.Random(6)
         r1s, r2s = [], []
         for i in range(40):
-            insert = 30 + (i % 31)            # spans merge / trim / keep bands (L=100)
-            frag = rand_seq(260, 500 + i)[:100 + insert]   # varied inserts, read len 100
-            (h1, s1, _), (h2, s2, _) = make_pair(frag, 100, name=f"F{i}".encode())
+            frag = draw(rng, rng.randrange(50, 90))          # all read-through at 100
+            (h1, s1, _), (h2, s2, _) = cycle_pair(frag, 100, rng, name=b"R%d" % i)
             r1s.append((h1, s1)); r2s.append((h2, s2))
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+        free = _run(tmp_path, in1, in2, "--error-rate", "0.01")
+        assert free["merged"] == 40 and not free["adapter_trimmed"]
+        assert free["readthrough_check_strong_fraction"] == 1.0
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        with caplog.at_level("WARNING", logger="zna.merge"):
+            declared = _run(tmp_path, in1, in2, "--error-rate", "0.01",
+                            "--adapter-trimmed")
+        assert declared["merged"] == 0 and declared["adapter_trimmed"]
+        assert any("--adapter-trimmed was declared" in r.getMessage()
+                   for r in caplog.records)
 
-        def record_set(procs):
-            out = tmp_path / f"o{procs}.fastq"
-            args = cli.build_parser().parse_args([
-                "--in1", str(in1), "--in2", str(in2), "--out", str(out),
-                "--threads", str(procs), "--chunk-size", "7", "-q",
-            ])
-            stats = cli.run(args)
-            lines = out.read_bytes().splitlines()
-            recs = frozenset(
-                (lines[i], lines[i + 1], lines[i + 3]) for i in range(0, len(lines), 4)
-            )
-            return recs, stats
+    @staticmethod
+    def _noisy_files(tmp_path, n=60, seed=7):
+        """2x100 pairs with a 50-base true overlap carrying 4 disagreements: 8%."""
+        rng = random.Random(seed)
+        r1s, r2s = [], []
+        for i in range(n):
+            frag = draw(rng, 150)
+            s1 = bytearray(frag[:100])
+            for k in range(50, 100, 16):
+                s1[k] = flip(s1[k])
+            r1s.append((b"N%d/1" % i, bytes(s1)))
+            r2s.append((b"N%d/2" % i, rc(frag[50:])))
+        in1, in2 = tmp_path / "n1.fastq.gz", tmp_path / "n2.fastq.gz"
+        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+        return in1, in2
 
-        single, s_stats = record_set(1)
-        par3, p_stats = record_set(3)
-        assert single == par3                       # identical record set
-        assert s_stats["input_pairs"] == p_stats["input_pairs"] == 40
-        for k in ("merged", "trimmed_pairs", "kept_pairs", "emitted_records",
-                  "bases_trimmed", "dropped_below_min_length",
-                  "fragments_dropped_short_mate", "trim_guard_kept_untrimmed"):
-            assert s_stats[k] == p_stats[k], k       # identical aggregate stats
-        assert s_stats["overlap_length_histogram"] == p_stats["overlap_length_histogram"]
+    def test_a_library_noisier_than_the_error_rate_is_warned_about(self, tmp_path,
+                                                                    caplog):
+        """8% disagreement against the default 1%: every detected overlap is 50 bases,
+        so the gate is expected to refuse P(Binom(50, 0.08) > dfit[50] = 6) = 10% of
+        true overlaps. The run says so, names the rate it saw, and suggests a value --
+        and at that value it is quiet."""
+        in1, in2 = self._noisy_files(tmp_path)
+        with caplog.at_level("WARNING", logger="zna.merge"):
+            stats = _run(tmp_path, in1, in2)
+        assert stats["detected_overlap_mismatch_rate"] == 0.08
+        assert stats["detected_overlap_bases"] == 60 * 50
+        assert stats["detected_overlap_length_histogram"] == {"50": 60}
+        expected = cli.refusal_probability(50, 6, Fraction(8, 100))
+        assert stats["expected_refused_true_overlap_fraction"] == \
+            float(format(expected, ".4g")) == 0.1019
+        msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(msgs) == 1
+        assert "at --error-rate 0.01 the test is expected to refuse 10% of true " \
+            "overlaps (warned above 0.1%)" in msgs[0]
+        assert "Rerun with --error-rate 0.08 " in msgs[0]
+        # ...with what the gate refused, and the price of following the advice
+        assert f"this run refused {stats['implausible_refused']} as implausible" in msgs[0]
+        assert "false ones included" in msgs[0] and "745 at 0.036" in msgs[0]
+
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="zna.merge"):
+            again = _run(tmp_path, in1, in2, "--error-rate", "0.08")
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        # A diagnostic, not a decision: every pair here is 4 in 50 and dfit[50] is 6
+        # at 1%, so both runs merged every pair -- the warning fires on the rate alone.
+        assert stats["merged"] == again["merged"] == 60
+
+    def test_a_rate_above_the_setting_is_not_by_itself_a_warning(self, tmp_path,
+                                                                  caplog):
+        """The warning is about what the rate COSTS, not whether it is above the
+        setting. 1.2% against the default 1% (36 of 60 overlaps with one mismatch in 50)
+        is above it, and the gate is expected to refuse 2e-6 of true overlaps: silent.
+        So is a clean library, and 8% against a setting of 8.01%."""
+        rng = random.Random(7)
+        r1s, r2s = [], []
+        for i in range(60):
+            frag = draw(rng, 150)
+            s1 = bytearray(frag[:100])
+            if i < 36:
+                s1[70] = flip(s1[70])
+            r1s.append((b"S%d/1" % i, bytes(s1)))
+            r2s.append((b"S%d/2" % i, rc(frag[50:])))
+        in1, in2 = tmp_path / "s1.fastq.gz", tmp_path / "s2.fastq.gz"
+        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+        noisy1, noisy2 = self._noisy_files(tmp_path)
+        clean1, clean2 = _library_files(tmp_path, 40, 11, name="clean")
+        with caplog.at_level("WARNING", logger="zna.merge"):
+            slight = _run(tmp_path, in1, in2)
+            _run(tmp_path, noisy1, noisy2, "--error-rate", "0.0801", out="n.fastq")
+            clean = _run(tmp_path, clean1, clean2, out="c.fastq")
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert slight["detected_overlap_mismatch_rate"] == 0.012
+        assert slight["expected_refused_true_overlap_fraction"] == float(format(
+            cli.refusal_probability(50, 6, Fraction(12, 1000)), ".4g")) == 2.277e-06
+        assert 0 < clean["detected_overlap_mismatch_rate"] < 0.01
+
+    def test_the_threshold_is_strict_and_exact(self, monkeypatch):
+        """Warned ABOVE one in a thousand: a run whose fraction equals the threshold is
+        silent, and one a hair over it is not. Compared as exact rationals."""
+        acc = cli._new_acc()
+        acc[0][DET_BASES], acc[0][DET_MISMATCHES], acc[0][MAX_READ_LEN] = 3000, 240, 100
+        acc[4].extend([0] * 50 + [60])
+        at = Fraction(cli.run_refused_fraction(acc, _P))
+        monkeypatch.setattr(cli, "_WARN_REFUSED", at)
+        assert cli.run_warnings(acc, _P) == []
+        monkeypatch.setattr(cli, "_WARN_REFUSED", at - Fraction(1, 10 ** 60))
+        (msg,) = cli.run_warnings(acc, _P)
+        assert "expected to refuse" in msg
+
+    def test_a_large_alpha_is_named_rather_than_the_error_rate(self):
+        """At a rate within the setting the gate refuses a true overlap with
+        probability below alpha, by construction -- so only an --alpha above 1e-3 can
+        warn there, and raising --error-rate is not the advice. At --alpha 0.01 and a
+        detected 1% on 100-base overlaps it is 0.34%."""
+        acc = cli._new_acc()
+        acc[0][DET_BASES], acc[0][DET_MISMATCHES], acc[0][MAX_READ_LEN] = 10_000, 100, 150
+        acc[4].extend([0] * 100 + [100])
+        loose = MergeParams(alpha="0.01")
+        assert round(float(cli.run_refused_fraction(acc, loose)), 4) == 0.0034
+        (msg,) = cli.run_warnings(acc, loose)
+        assert "this is --alpha 0.01 itself" in msg and "Rerun" not in msg
+        assert cli.run_warnings(acc, _P) == []
+        # ...and the rate is what decides it, not its rounded suggestion: 0.0122 under a
+        # setting of 0.0123 rounds UP to 0.013, above the setting, and is still not a
+        # reason to raise it.
+        acc[0][DET_MISMATCHES] = 122
+        (msg,) = cli.run_warnings(acc, MergeParams(alpha="0.01", error_rate="0.0123"))
+        assert "itself" in msg and "Rerun" not in msg
+
+    def test_a_suggestion_is_only_ever_a_value_the_flag_accepts(self):
+        assert cli._suggest_error_rate(Fraction(137, 10000)) == "0.014"
+        assert cli._suggest_error_rate(Fraction(7, 10)) == "0.7"
+        assert cli._suggest_error_rate(Fraction(746, 1000)) is None   # would be 0.75
+        acc = cli._new_acc()
+        acc[0][DET_BASES], acc[0][DET_MISMATCHES], acc[0][MAX_READ_LEN] = 100, 76, 150
+        acc[4].extend([0] * 100 + [1])
+        (msg,) = cli.run_warnings(acc, _P)
+        assert "No --error-rate describes" in msg and "Rerun" not in msg
+
+    def test_a_policy_under_which_nothing_can_merge_says_so(self):
+        """Not a failure -- every pair is kept whole, correctly -- but almost certainly
+        not what was meant, and otherwise silent."""
+        acc = cli._new_acc()
+        acc[0][N_PAIRS], acc[0][MAX_READ_LEN] = 10, 150
+        assert cli.run_warnings(acc, _P) == []
+        (msg,) = cli.run_warnings(acc, MergeParams(alpha="1e-300"))
+        assert "no pair in this run could merge" in msg and "longest read is 150" in msg
+        assert cli.run_warnings(cli._new_acc(), MergeParams(alpha="1e-300")) == []
+
+    def test_the_warnings_survive_quiet(self, tmp_path, capsys):
+        """A warning means a parameter may be wrong for this library, so -q does not
+        silence it -- through the real entry point, whose logging -q configures."""
+        in1, in2 = self._noisy_files(tmp_path)
+        backend = "accel" if _fast_backend() else "python"
+        argv = ["--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fq"),
+                "-q", "--backend", backend]
+        import logging
+        root = logging.getLogger()
+        saved_handlers, saved_level = root.handlers[:], root.level
+        root.handlers[:] = []                  # so run_command's basicConfig applies
+        try:
+            assert cli.main(argv) == 0
+        finally:
+            root.handlers[:] = saved_handlers
+            root.setLevel(saved_level)
+        assert "at --error-rate 0.01 the test is expected to refuse" in \
+            capsys.readouterr().err
 
     def test_histograms_are_not_capped_at_1024(self, tmp_path):
-        """Every histogram bins the real value, however long the reads are.
-
-        All three were fixed `uint32_t[1025]` arrays with the index clamped to the last
-        bin, so past 1024 bp the length and insert distributions silently aggregated:
-        four distinct fragment lengths came out as `{"1024": 3, ...}` with nothing in the
-        JSON to say the number was a pile-up rather than a measurement. Read length is
-        uncapped, so the bins have to be too.
-
-        Chunked at one pair each so the accumulator has to grow mid-run as well.
-        """
+        """Every histogram bins the real value, however long the reads are -- and the
+        policy tables grow to match (700 bp reads need capacity 1,024)."""
         readlen = 700
         fragments = [rand_seq(L, 900 + L) for L in (900, 1050, 1200, 1350)]
         r1s, r2s = [], []
-        for i, frag in enumerate(fragments):
+        for frag in fragments:
             (h1, s1, _), (h2, s2, _) = make_pair(frag, readlen, name=b"L%d" % len(frag))
             r1s.append((h1, s1)); r2s.append((h2, s2))
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
-        args = cli.build_parser().parse_args([
-            "--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fastq"),
-            "--threads", "2", "--chunk-size", "1", "-q"])
-        stats = cli.run(args)
-
+        stats = _run(tmp_path, in1, in2, "--threads", "2", "--chunk-size", "1")
         assert stats["merged"] == 4, stats
         lengths = {str(len(f)): 1 for f in fragments}
-        assert stats["length_histogram"] == lengths          # a merged record IS the
-        assert stats["insert_size_histogram"] == lengths     # fragment, at its true length
+        assert stats["length_histogram"] == lengths
+        assert stats["insert_size_histogram"] == lengths
         assert stats["overlap_length_histogram"] == \
             {str(2 * readlen - len(f)): 1 for f in fragments}
         assert stats["max_read_length"] == readlen
-        # the mean is computed off the length histogram, so a clamp would show here too
-        assert stats["mean_emitted_length"] == round(
-            sum(len(f) for f in fragments) / 4, 1)
+        assert stats["insert_size_censoring"]["at_read_length"] == readlen
 
-    def test_insert_size_censoring_reports_only_the_upper_bound(self, tmp_path):
-        """`floor` was a second copy of `params.min_read_length`; only the cap is news."""
+    def test_insert_size_censoring_reports_the_cap_at_the_longest_reads(self, tmp_path):
         frag = rand_seq(40, 30)
         (h1, s1, _), (h2, s2, _) = make_pair(frag, 30)
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, [(h1, s1)]); _write_fastq_gz(in2, [(h2, s2)])
-        stats = cli.run(cli.build_parser().parse_args([
-            "--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fastq"),
-            "--min-read-length", "25", "-q"]))
-        assert stats["insert_size_censoring"] == {"min_mergeable_overlap": 15}
-        assert stats["params"]["min_read_length"] == 25      # where the floor lives now
+        stats = _run(tmp_path, in1, in2, "--min-read-length", "25", "--error-rate",
+                     "0.01")
+        assert stats["insert_size_censoring"] == {
+            "min_mergeable_overlap": min_matches(t_q(30, 30), 0), "at_read_length": 30}
+        assert stats["params"]["min_read_length"] == 25
 
     def test_short_mate_fragment_dropped_and_logged(self, tmp_path):
-        """A pair with one below-min mate is dropped whole, logged, and emits no lone read."""
-        good1, good2 = rand_seq(100, 60), rand_seq(100, 61)    # disjoint pair, both long
-        smate1, smate2 = rand_seq(100, 62), rand_seq(30, 63)   # R2 30 bp (< 50): drop frag
+        good1, good2 = rand_seq(100, 60), rand_seq(100, 61)
+        smate1, smate2 = rand_seq(100, 62), rand_seq(30, 63)   # R2 30 bp (< 50)
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
-        out, js = tmp_path / "o.fastq", tmp_path / "s.json"
         _write_fastq_gz(in1, [(b"G/1", good1), (b"S/1", smate1)])
         _write_fastq_gz(in2, [(b"G/2", good2), (b"S/2", smate2)])
-        args = cli.build_parser().parse_args([
-            "--in1", str(in1), "--in2", str(in2), "--out", str(out),
-            "--json", str(js), "--min-read-length", "50", "-q",
-        ])
-        stats = cli.run(args)
+        stats = _run(tmp_path, in1, in2, "--min-read-length", "50")
         assert stats["fragments_dropped_short_mate"] == 1
-        assert stats["dropped_below_min_length"] == 2          # both mates of that pair
-        assert stats["emitted_records"] == 2                   # only the good pair survives
-        ids = [l[1:].split()[0] for l in out.read_bytes().splitlines()[0::4]]
-        assert set(ids) == {b"G/1", b"G/2"}                    # no lone S read emitted
-
-    def test_stats_are_identical_across_thread_counts(self, tmp_path):
-        """TOTAL equality, not a hardcoded key list.
-
-        All counting happens in one place (the backend's merge_chunk), so this is what
-        pins it. An older version enumerated 8 keys and silently stopped covering a
-        histogram the moment it was added.
-        """
-        r1s, r2s = [], []
-        for i in range(60):
-            frag = rand_seq(300, 700 + i)[:120 + (i % 40)]
-            (h1, s1, _), (h2, s2, _) = make_pair(frag, 100, name=f"P{i}".encode())
-            r1s.append((h1, s1)); r2s.append((h2, s2))
-        in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
-        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
-
-        def run(procs, chunk):
-            args = cli.build_parser().parse_args([
-                "--in1", str(in1), "--in2", str(in2),
-                "--out", str(tmp_path / f"o{procs}_{chunk}.fastq"),
-                "--threads", str(procs), "--chunk-size", str(chunk),
-                "-q"])
-            stats = cli.run(args)
-            for wallclock in ("elapsed_s", "pairs_per_second"):
-                stats.pop(wallclock, None)          # timing, not a merge result
-            return stats
-
-        base = run(1, 50000)
-        for procs, chunk in ((1, 7), (3, 7), (4, 13), (2, 1000)):
-            assert run(procs, chunk) == base, (procs, chunk)
-
-    def test_bases_trimmed_is_right_when_both_mates_share_a_header(self, tmp_path):
-        """Without `samtools fastq -N` the two mates carry identical headers. The old
-        `next(r for r in records if r[0] != h1)` then returned None and charged the
-        whole of R2 as trimmed."""
-        frag = rand_seq(48, 4242)                     # overlap 12 -> trim band
-        (_, s1, _), (_, s2, _) = make_pair(frag, 30)
-        in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
-        _write_fastq_gz(in1, [(b"SAME", s1)])         # no /1,/2 suffix: identical names
-        _write_fastq_gz(in2, [(b"SAME", s2)])
-        args = cli.build_parser().parse_args([
-            "--in1", str(in1), "--in2", str(in2), "--out", str(tmp_path / "o.fastq"),
-            "--min-read-length", "10", "-q"])
-        stats = cli.run(args)
-        assert stats["trimmed_pairs"] == 1
-        assert stats["bases_trimmed"] == 12           # the overlap, not all 30 of R2
+        assert stats["dropped_below_min_length"] == 2
+        assert stats["emitted_records"] == 2
+        ids = [l[1:].split()[0] for l in (tmp_path / "o.fastq").read_bytes()
+               .splitlines()[0::4]]
+        assert set(ids) == {b"G/1", b"G/2"}
 
     def test_empty_input_fails_loudly(self, tmp_path):
-        """An empty library must not sail through to a 0-record .zna."""
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, []); _write_fastq_gz(in2, [])
-        argv = ["--in1", str(in1), "--in2", str(in2),
-                "--out", str(tmp_path / "o.fastq"), "-q"]
         with pytest.raises(SystemExit):
-            cli.run(cli.build_parser().parse_args(argv))
-        # ...unless it is expected.
-        stats = cli.run(cli.build_parser().parse_args(argv + ["--allow-empty"]))
-        assert stats["input_pairs"] == 0
+            _run(tmp_path, in1, in2)
+        assert _run(tmp_path, in1, in2, "--allow-empty")["input_pairs"] == 0
 
     def _run_on(self, tmp_path, r1_bytes, r2_bytes):
         in1, in2 = tmp_path / "r1.fastq", tmp_path / "r2.fastq"
         in1.write_bytes(r1_bytes)
         in2.write_bytes(r2_bytes)
-        return cli.run(cli.build_parser().parse_args(
-            ["--in1", str(in1), "--in2", str(in2),
-             "--out", str(tmp_path / "o.fastq"), "-q"]))
+        return _run(tmp_path, in1, in2)
 
     @staticmethod
     def _records(n, suffix, seed0):
@@ -2352,57 +2907,103 @@ class TestCLI:
                                                     b"I" * 40) for i in range(n))
 
     def test_a_short_final_quality_line_is_rejected(self, tmp_path):
-        """The truncation the old reader accepted: a short-but-nonempty quality line
-        satisfied `if not q`, so the record was emitted malformed with rc=0."""
         good = self._records(3, b"1", 0)
-        # drop 12 bases from the last quality line but KEEP its newline, so the record
-        # still looks complete and only the length check can catch it
         broken = good[:-13] + b"\n"
         with pytest.raises(SystemExit, match="quality"):
             self._run_on(tmp_path, broken, self._records(3, b"2", 100))
 
     def test_a_truncated_final_record_is_rejected(self, tmp_path):
-        """Cut so the last record loses its final newline: it is no longer a complete
-        record, and must be reported as truncation rather than as a count mismatch."""
         good = self._records(3, b"1", 0)
         with pytest.raises(SystemExit, match="truncated"):
             self._run_on(tmp_path, good[:-12], self._records(3, b"2", 100))
 
     def test_unequal_read_counts_are_rejected(self, tmp_path):
-        """Whole extra records on one side -- a different fault, and it must say so.
-        This is the one the audit's raw-blob prototype returned success for."""
         with pytest.raises(SystemExit, match="unequal read counts"):
             self._run_on(tmp_path, self._records(4, b"1", 0), self._records(3, b"2", 100))
         with pytest.raises(SystemExit, match="unequal read counts"):
             self._run_on(tmp_path, self._records(3, b"1", 0), self._records(4, b"2", 100))
 
     @pytest.mark.parametrize("flags", [
-        ["--threshold-merge", "0.5", "--threshold-trim", "0.5"],   # merges 94% silently
+        ["--alpha", "0"], ["--alpha", "1"], ["--alpha", "lots"],
+        ["--error-rate", "0"], ["--error-rate", "0.8"], ["--error-rate", "-0.01"],
+        ["--error-rate", "one percent"],
         ["--min-read-length", "-5"],
         ["--threads", "0"],
         ["--chunk-size", "0"],
-        ["--threshold-trim", "40"],                                # trim > merge
     ])
     def test_nonsense_arguments_are_rejected(self, tmp_path, flags):
         in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, [(b"A/1", rand_seq(40, 1))])
         _write_fastq_gz(in2, [(b"A/2", rand_seq(40, 2))])
         with pytest.raises(SystemExit):
-            cli.run(cli.build_parser().parse_args(
-                ["--in1", str(in1), "--in2", str(in2),
-                 "--out", str(tmp_path / "o.fastq"), "-q"] + flags))
+            _run(tmp_path, in1, in2, *flags)
+
+    @pytest.mark.parametrize("flag", ["--threshold-merge", "--threshold-trim"])
+    def test_the_0_5_thresholds_are_gone(self, flag):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(["--in1", "a", "--in2", "b", "--out", "c",
+                                           flag, "28"])
 
     def test_sync_check_raises_on_desync(self, tmp_path):
-        in1 = tmp_path / "r1.fastq.gz"
-        in2 = tmp_path / "r2.fastq.gz"
-        out = tmp_path / "o.fastq"
+        in1, in2 = tmp_path / "r1.fastq.gz", tmp_path / "r2.fastq.gz"
         _write_fastq_gz(in1, [(b"A/1", rand_seq(40, 1))])
-        _write_fastq_gz(in2, [(b"B/2", rand_seq(40, 2))])   # mismatched base name
-        args = cli.build_parser().parse_args(
-            ["--in1", str(in1), "--in2", str(in2), "--out", str(out), "-q"]
-        )
-        with pytest.raises(SystemExit):
-            cli.run(args)
+        _write_fastq_gz(in2, [(b"B/2", rand_seq(40, 2))])
+        with pytest.raises(SystemExit, match="out of sync"):
+            _run(tmp_path, in1, in2)
+
+
+class TestTableGrowth:
+    """The policy tables cover a capacity and grow by doubling; a chunk that meets a
+    longer read stops in front of it and the driver resumes after growing them. Where
+    that happens must leave no trace in the output."""
+
+    def test_a_chunk_stops_in_front_of_the_pair_that_needs_more(self):
+        from zna.merge.backend import get_merge_backend
+        be = get_merge_backend("python")
+        rng = random.Random(81)
+        recs1, recs2 = [], []
+        for i, readlen in enumerate((80, 100, 300, 90)):
+            frag = draw(rng, readlen * 3 // 2)
+            s1, s2 = frag[:readlen], rc(frag[-readlen:])
+            recs1.append(b"@r%d/1\n%b\n+\n%b\n" % (i, s1, b"I" * len(s1)))
+            recs2.append(b"@r%d/2\n%b\n+\n%b\n" % (i, s2, b"I" * len(s2)))
+        b1, b2 = b"".join(recs1), b"".join(recs2)
+        p = MergeParams(error_rate="0.01")
+        a = be.merge_chunk(b1, 0, len(b1), b2, 0, len(b2), *_chunk_args(p))
+        assert a[3][N_PAIRS] == 2 and a[8] == 300
+        assert b1[a[1]:].startswith(b"@r2/1")
+        p.ensure(a[8])
+        rest = be.merge_chunk(b1, a[1], len(b1), b2, a[2], len(b2), *_chunk_args(p, base=2))
+        assert rest[3][N_PAIRS] == 2 and rest[8] == 0
+        whole = be.merge_chunk(b1, 0, len(b1), b2, 0, len(b2), *_chunk_args(p))
+        assert a[0] + rest[0] == whole[0]
+
+    @pytest.mark.parametrize("threads,chunk", [(1, 2000), (1, 3), (3, 2), (2, 1)])
+    def test_a_long_read_regrows_the_tables_mid_run(self, tmp_path, monkeypatch,
+                                                    threads, chunk):
+        """The tables start at 256 bases; a longer read forces a regrow inside the chunk
+        loop, serial or threaded. Output equals the run whose tables were big enough
+        from the start."""
+        rng = random.Random(82)
+        r1s, r2s = [], []
+        for i, readlen in enumerate([100] * 6 + [600] + [100] * 5 + [1100, 90]):
+            frag = draw(rng, readlen * 3 // 2)
+            (h1, s1, _), (h2, s2, _) = make_pair(frag, readlen, name=b"G%d" % i)
+            r1s.append((h1, s1)); r2s.append((h2, s2))
+        in1, in2 = tmp_path / "g1.fastq.gz", tmp_path / "g2.fastq.gz"
+        _write_fastq_gz(in1, r1s); _write_fastq_gz(in2, r2s)
+        flags = ("--error-rate", "0.01", "--threads", str(threads), "--chunk-size",
+                 str(chunk))
+        late = _run(tmp_path, in1, in2, *flags, out="late.fastq")
+        monkeypatch.setattr(zparams, "_MIN_CAPACITY", 2048)     # never regrows
+        early = _run(tmp_path, in1, in2, *flags, out="early.fastq")
+        assert late["merged"] == 14 and late["max_read_length"] == 1100
+        for s in (late, early):
+            for k in ("elapsed_s", "pairs_per_second"):
+                s.pop(k, None)
+        assert late == early
+        assert (tmp_path / "late.fastq").read_bytes() == \
+            (tmp_path / "early.fastq").read_bytes()
 
 
 # --------------------------------------------------------------------------- #
@@ -2438,8 +3039,7 @@ class TestTheCompiledBackendIsRequiredByTheCLI:
         assert cli.run_command(self._args(tmp_path, ["--backend", "python"])) == 0
 
     def test_the_library_entry_point_never_refuses(self, tmp_path, monkeypatch):
-        """`run()` is what `zna encode --merge-pairs` will call in-process, and what
-        every other test here calls. The guard belongs to the CLI, not to it."""
+        """`run()` is what every other test here calls. The guard belongs to the CLI."""
         monkeypatch.setattr("zna.merge.backend.available_merge_backends",
                             lambda: ["python"])
         assert cli.run(self._args(tmp_path))["input_pairs"] == 1
@@ -2459,29 +3059,149 @@ class TestTheCompiledBackendIsRequiredByTheCLI:
         from zna.merge.backend import available_merge_backends
         # Without the compiled backend the CLI refuses by design, so name the one that
         # is actually there -- the point of this test is the dispatch, not the kernel.
-        backend = "auto" if "accel" in available_merge_backends() else "python"
+        backend = "accel" if "accel" in available_merge_backends() else "python"
         proc = subprocess.run(
             [sys.executable, "-m", "zna.cli", "merge", "--in1", str(in1),
              "--in2", str(in2), "--out", str(out), "--min-read-length", "10",
-             "--backend", backend, "-q"],
+             "--error-rate", "0.01", "--backend", backend, "-q"],
             capture_output=True, text=True, timeout=300)
         assert proc.returncode == 0, proc.stderr
         assert out.read_bytes().splitlines()[1] == frag
 
 
 # --------------------------------------------------------------------------- #
-# worker death: must fail, not hang
+# 12. the 19 cases of khorana's chr22 merge review (its §5-6), as fixtures
 # --------------------------------------------------------------------------- #
 
-# The process pool is gone: the merge kernel releases the GIL, so workers are threads.
-# Two tests went with it, and it is worth recording what they covered rather than
-# quietly dropping them:
-#
-#   * `test_a_killed_worker_fails_the_run_instead_of_hanging` -- mp.Pool could not
-#     detect abrupt worker death and blocked forever. There are no worker processes to
-#     kill now; a fatal fault takes the whole process down, loudly.
-#   * `test_the_parallel_path_survives_a_platform_without_fork` -- there is no fork
-#     context to be missing.
-#
-# What replaced them is stronger than either: output is written in submission order, so
-# `test_threads_match_single` compares whole files across thread counts.
+_CASES = Path(__file__).parent / "data" / "report_cases"
+
+
+def _report_cases():
+    truth = json.loads((_CASES / "truth.json").read_text())["cases"]
+
+    def fq(path):
+        lines = path.read_bytes().splitlines()
+        return [(lines[i][1:], lines[i + 1], lines[i + 3])
+                for i in range(0, len(lines), 4)]
+    return truth, fq(_CASES / "R1.fastq"), fq(_CASES / "R2.fastq")
+
+
+def _classify_case(res, frag, s2):
+    """M+ / M- / LOST / DROP-ok / K / LOSTp against the true molecule."""
+    L = len(frag)
+    if res.outcome == PairOutcome.MERGED:
+        if res.shift + len(s2) == L:
+            if not res.records:
+                return "DROP-ok"
+            # the merged record IS the molecule (in R1's orientation)
+            assert res.records[0][1] in (frag, rc(frag))
+            return "M+"
+        return "M-" if res.records else "LOST"
+    return "K" if res.records else ("LOSTp" if L >= 40 else "DROP-ok")
+
+
+#: Expected outcomes under --adapter-trimmed (khorana's simulator clips reads to the
+#: molecule, so the declaration is true), --min-read-length 40, alpha 1e-6.
+#:
+#: AT THE LIBRARY'S OWN ERROR RATE -- 1.6e-4, the disagreement of the error-free chr22
+#: simulation's true overlaps (0.0003 gives the same outcomes). A mismatch then costs
+#: ~12.2 bits, so a divergent repeat can no longer outscore a clean true overlap:
+#: C01-C06 merge CORRECTLY, including C01's
+#: true 38-base overlap that its 122/19 repeat used to beat (-> 206 - 232 < 0 bits).
+#: C14's 7 mismatches in 64 exceed dfit[64] = 2: refused, kept. C08-C19 have no
+#: mergeable true overlap (C19's is 11 bases, under the 15 T needs) and are kept whole.
+#:
+#: KNOWN RESIDUAL: C07, a PERFECT 15-base repeat (29.8 bits, over T = 28.2). It is
+#: plausible under every error model and remains a wrong merge (plan §9).
+EXPECTED_AT_LIBRARY_RATE = {
+    "C01": "M+", "C02": "M+", "C03": "M+", "C04": "M+", "C05": "M+", "C06": "M+",
+    "C07": "M-",                                                    # known residual
+    "C08": "K", "C09": "K", "C10": "K", "C11": "K", "C12": "K", "C13": "K",
+    "C14": "K", "C15": "K", "C16": "K", "C17": "K", "C18": "K", "C19": "K",
+}
+#: AT THE DEFAULT 1% -- what a run gets without --error-rate. The divergent repeats win
+#: the argmax, and the gate refuses them (C01: 19 > dfit[122] = 9; C02 9 > 8; C05,
+#: C09, C12, C15 11-14 > 7; C18 8 > 7): kept whole, never re-placed, so C01 and C02's
+#: true overlaps are forgone rather than merged. The declaration removes the false
+#: read-throughs (C03, C04, C06, C11, C17), and C03, C04, C06 then merge correctly.
+#:
+#: KNOWN RESIDUALS: C07 as above, and C14 -- 7 mismatches in 64 is exactly dfit[64] = 7
+#: at 1%, plausible under that error model (plan §9).
+EXPECTED_AT_DEFAULT = {
+    "C01": "K", "C02": "K", "C03": "M+", "C04": "M+", "C05": "K", "C06": "M+",
+    "C07": "M-",                                                    # known residual
+    "C08": "K", "C09": "K", "C10": "K", "C11": "K", "C12": "K", "C13": "K",
+    "C14": "M-",                                                    # known residual
+    "C15": "K", "C16": "K", "C17": "K", "C18": "K", "C19": "K",
+}
+IMPLAUSIBLE_AT_DEFAULT = {"C01", "C02", "C05", "C09", "C12", "C15", "C18"}
+
+
+class TestReportCases:
+    """The 19 pairs of khorana's merge review, replayed under the 0.6 policy.
+
+    Run at two error rates: the library's own and the default. The expectations are
+    derived in the comments above. These 19 were SELECTED because 0.5.3 got them wrong,
+    so their detected overlaps are mostly repeats and disagree far more than any real
+    library -- which the run's own check reports, a statement about the selection, not
+    the library (see the CLI test below).
+    """
+
+    @pytest.mark.parametrize("e,expected", [("0.00016", EXPECTED_AT_LIBRARY_RATE),
+                                            ("0.0003", EXPECTED_AT_LIBRARY_RATE),
+                                            ("0.01", EXPECTED_AT_DEFAULT)])
+    def test_each_case(self, e, expected):
+        truth, r1, r2 = _report_cases()
+        assert [c["case_id"] for c in truth] == sorted(expected)
+        p = MergeParams(error_rate=e, adapter_trimmed=True, min_read_length=40)
+        got, implausible = {}, set()
+        for c, (h1, s1, q1), (h2, s2, q2) in zip(truth, r1, r2):
+            assert h1.startswith(c["read1_name"][:-2].encode())
+            res = process_pair(h1, s1, q1, h2, s2, q2, p)
+            got[c["case_id"]] = _classify_case(res, c["fragment_mrna"].encode(), s2)
+            if res.implausible:
+                implausible.add(c["case_id"])
+        assert got == expected
+        if e == "0.01":
+            assert implausible == IMPLAUSIBLE_AT_DEFAULT
+        else:
+            assert implausible == {"C14"}
+
+    def test_no_case_is_lost_and_no_mate_is_rewritten(self):
+        """0.5.3 lost C03, C04 and C17 to false read-throughs and rewrote bases in the
+        kept mates of C08, C10, C13 and C16 through its trim path. Under the policy,
+        every kept pair is emitted exactly as read."""
+        truth, r1, r2 = _report_cases()
+        for e in ("0.00016", "0.01"):
+            p = MergeParams(error_rate=e, adapter_trimmed=True, min_read_length=40)
+            for c, (h1, s1, q1), (h2, s2, q2) in zip(truth, r1, r2):
+                res = process_pair(h1, s1, q1, h2, s2, q2, p)
+                assert res.records, c["case_id"]
+                if res.outcome == PairOutcome.KEPT:
+                    assert [r[1:] for r in res.records] == [(s1, q1), (s2, q2)]
+
+    @pytest.mark.parametrize("e,strong,outcomes,detected", [
+        # C03, C04, C06, C11, C17: every selected false read-through reaches T
+        ("0.01", 5, (5, 14, 7), 0.137931),
+        # at ~12 bits a mismatch, only C17's perfect 18-base one still does
+        ("0.00016", 1, (7, 12, 1), 0.033654),
+    ])
+    def test_through_the_cli_the_fixture_trips_both_checks(self, tmp_path, caplog, e,
+                                                            strong, outcomes, detected):
+        """Five of the 19 (C03, C04, C06, C11, C17) are selected FALSE read-throughs, and
+        most of the rest are repeats, so a declared run over this file warns twice --
+        each check doing its job on an input where it cannot know the selection. The
+        read-through check scores with the run's own weights, so how many of the five
+        still reach T depends on --error-rate; both counts are far past 1%."""
+        with caplog.at_level("WARNING", logger="zna.merge"):
+            stats = _run(tmp_path, _CASES / "R1.fastq", _CASES / "R2.fastq",
+                         "--adapter-trimmed", "--error-rate", e)
+        assert stats["readthrough_check_pairs"] == 19
+        assert stats["readthrough_check_strong_fraction"] == round(strong / 19, 6)
+        assert stats["detected_overlap_mismatch_rate"] == detected
+        msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("--adapter-trimmed was declared" in m for m in msgs)
+        assert any(f"at --error-rate {e} the test is expected to refuse" in m
+                   for m in msgs)
+        assert (stats["merged"], stats["kept_pairs"], stats["implausible_refused"]) \
+            == outcomes

@@ -30,6 +30,14 @@ because both mates were sequenced wrong there. So each merged record is scored a
 Both come from the sidecar's per-base error record, so they are exact rather than
 estimated, and the useful number is where the tool sits between them.
 
+**An unmerged pair is kept whole** (zna 0.6, ``docs/archive/MERGE_ACCURACY_PLAN.md`` §2): there
+is no trim band, so a kept pair is scored for being exactly its two input mates -- no
+base removed, none added -- and for what it carries into the corpus (the overlap both
+mates still hold, and on a kept read-through, adapter). zna's policy flags pass
+straight through: ``--alpha``, ``--error-rate``, and ``--adapter-trimmed``, which is a
+DECLARATION -- ``simulate.py`` writes raw adapter read-through, so declaring it there is
+false and forbids exactly the merges those pairs need; it exists to price that.
+
 Nothing here is part of the zna package or its test suite.
 """
 from __future__ import annotations
@@ -51,7 +59,7 @@ from simulate import rc                              # noqa: E402
 try:
     from zna.merge.params import SCALE               # the scan's fixed-point scale
 except ImportError:                                  # pragma: no cover
-    raise SystemExit("this script needs zna importable (it re-runs zna's own scan)")
+    raise SystemExit("this script needs zna importable (it re-runs zna's own decision)")
 
 MERGED, R1, R2 = 0, 1, 2
 
@@ -279,17 +287,13 @@ class ToolScore:
     actually shown rather than from a reconstruction.
     """
 
-    def __init__(self, name, truth, readlen, row_cap, max_edit, min_read_length,
-                 min_trim_overlap=0):
+    def __init__(self, name, truth, readlen, row_cap, max_edit, min_read_length):
         self.name = name
         self.truth = truth
         self.readlen = readlen
         self.row_cap = row_cap
         self.max_edit = max_edit
         self.min_read_length = min_read_length
-        #: Shortest overlap that can clear --threshold-trim, i.e. the shortest one the
-        #: tool is *able* to remove. Misses below it are the specification, not defects.
-        self.min_trim_overlap = min_trim_overlap
         n = truth.n
         self.state = np.zeros(n, dtype=np.uint8)          # 1 merged, 2 r1, 4 r2
         self.merged_len = np.zeros(n, dtype=np.int32)
@@ -425,15 +429,15 @@ class ToolScore:
     def _note(self, i, category, seq, extra=None):
         """Record one thing the tool got wrong.
 
-        *extra* is ``(emitted_len, len_err)`` for rows whose sequence is not held — a
-        trim is described by how much came off, not by the bases that remain.
+        *extra* is ``(emitted_len, len_err)`` for rows whose sequence is not held — an
+        altered kept mate is described by how its length moved, not by its bases.
         """
         self.cat_counts[category] = self.cat_counts.get(category, 0) + 1
         # Wrong merges are always kept, capped or not: their evidence is what turns a
         # chimera count into an explanation, and there should never be many of them.
         detailed = category in ("chimera", "wrong_length", "chimera_dropped",
                                 "wrong_length_dropped", "frame_violation",
-                                "false_trim", "r1_shortened")
+                                "kept_mate_altered")
         if detailed or self.cat_written.get(category, 0) < self.row_cap:
             self.pending.append((i, category, seq, extra))
 
@@ -469,18 +473,19 @@ class ToolScore:
     def write_rows(self, reads, scan):
         """Attach the scan's own evidence to each error row.
 
-        `scan` is `zna merge`'s overlap kernel, run on the pair the tool was given, so
-        `scan_*` says what the shipped scoring rule sees: the shift it picks, the
-        evidence in bits, and how well the two reads actually agree there. A chimera
-        with 90% identity over 89 bases is the genome repeating, which is a different
-        finding from a merger inventing an alignment — and the columns say which.
+        `scan` is `zna merge`'s overlap decision, run on the pair the tool was given at
+        the run's own parameters, so `scan_*` says what the shipped rule sees: its
+        verdict (merge / implausible / none), the shift, the evidence in bits, and how
+        well the two reads actually agree there. A chimera with 90% identity over 89
+        bases is the genome repeating, which is a different finding from a merger
+        inventing an alignment — and the columns say which.
         """
         t = self.truth
         for i, category, seq, extra in self.pending:
             L = int(t.frag_len[i])
             frag = t.frag[i]
             r1, r2 = reads[i]
-            shift, score_q, olen, mism = scan(r1, r2)
+            verdict, shift, score_q, olen, mism = scan(r1, r2)
             ident = f"{olen - mism}/{olen}" if olen else "."
             if olen:
                 self.identity.append((category, olen - mism, olen))
@@ -491,11 +496,13 @@ class ToolScore:
                 if at is not None:
                     true_bits = round(at[0] / SCALE, 2)
                     self.argmax_checked += 1
-                    # The scan's contract is "the best shift at or above the floor, else
-                    # nothing", so a miss is only a defect when the true shift clears
-                    # the floor. Comparing against a `no overlap found` zero would
-                    # otherwise report the floor itself as a search failure.
-                    missed = (score_q < at[0]) if olen else (at[0] >= scan.floor_q)
+                    # The scan's contract is "the best eligible shift at or above the
+                    # pair's floor T(len1 + len2 - 1), else nothing", so a miss is only
+                    # a defect when the true shift clears that floor. Comparing against
+                    # a `no overlap found` zero would otherwise report the floor itself
+                    # as a search failure.
+                    missed = ((score_q < at[0]) if olen
+                              else (at[0] >= scan.floor_q(len(r1), len(r2))))
                     if missed:
                         self.argmax_below_truth += 1
                     elif olen:
@@ -503,7 +510,7 @@ class ToolScore:
             if self.cat_written.get(category, 0) >= self.row_cap:
                 continue
             self.cat_written[category] = self.cat_written.get(category, 0) + 1
-            if seq is None:                       # a trim row, or a filtered-away merge
+            if seq is None:                    # a kept-mate row, or a filtered-away merge
                 mm, ed, off, shown = ".", ".", ".", "."
                 emitted_len, len_err = extra if extra else (".", ".")
             else:
@@ -520,7 +527,7 @@ class ToolScore:
             self.rows.append("\t".join(str(x) for x in (
                 t.index_id[i], category, t.chrom[i], t.start[i], t.strand[i], L,
                 int(t.true_ovl[i]), int(t.read_through[i]), int(t.n_err1[i]),
-                int(t.n_err2[i]), emitted_len, len_err, mm, ed,
+                int(t.n_err2[i]), emitted_len, len_err, mm, ed, verdict,
                 shift, round(score_q / SCALE, 2), olen, ident, true_bits, off, shown,
                 frag.decode())))
 
@@ -538,57 +545,33 @@ class ToolScore:
         # molecule. Structurally impossible in either tool; asserted rather than assumed.
         self.n_merged_and_paired = int((merged & ((self.state & 6) != 0)).sum())
 
-        self._score_trims(both)
+        self._score_kept(both)
         return self
 
-    # -- the trim band, contract C4 ---------------------------------------- #
+    # -- kept pairs: whole, and what they carry ---------------------------- #
 
-    def _score_trims(self, both):
-        """What the *unmerged* pairs cost the corpus.
+    def _score_kept(self, both):
+        """What the *unmerged* pairs are, and what they cost the corpus.
 
-        This half of the tool matters as much as merging to a model trained on the
-        output: a pair that does not merge is still encoded, and if its redundant
-        overlap survives, the same physical bases appear twice in the corpus with no
-        marker saying so. `zna merge` therefore cuts the overlap off R2's **3'** end,
-        leaving R1 and R2 tiling the fragment exactly once.
+        zna 0.6 keeps an unmerged pair whole -- khorana trains on one randomly chosen
+        mate of it, and wants that mate as read -- so the contract is simple: each kept
+        mate is its input, exactly as long, and nothing else. Every simulated read is
+        free of no-calls, so the N policy never fires here and any change of length is
+        a defect (``kept_mate_altered``; the C1 prefix check covers the 5' ends).
 
-        Scored over **every** kept pair, in three regimes, because the failure modes are
-        opposite and averaging them hides both:
+        Scored over **every** kept pair, split by regime, because what a kept pair
+        carries differs by regime:
 
-        * `true_ovl == 0` — the mates share nothing, so any trim **deletes real
-          sequence**. This is the specificity side, and it is the one an analysis
-          restricted to overlapping pairs cannot see at all.
-        * `0 < true_ovl`, no read-through — exactly `true_ovl` bases are redundant and
-          exactly that many should come off. Under-trimming duplicates, over-trimming
-          deletes.
-        * read-through — both mates carry the *whole* fragment plus adapter. There is no
-          trim that fixes this (the geometry is a negative shift, which the trim branch
-          does not take); it has to merge, and a kept read-through pair puts the fragment
-          in twice, with adapter.
-
-        The two numbers to carry away are the corpus-level ones: bases duplicated, and
-        real bases deleted.
+        * `true_ovl == 0` -- the mates share nothing; keeping them is the only answer.
+        * `0 < true_ovl`, no read-through -- a merge the tool did not make: the overlap
+          stays in both mates (``overlap_bases_in_kept_pairs``). Harmless to a model that
+          reads one mate, but it is sensitivity forgone -- see sections 1-2.
+        * read-through -- both mates carry the WHOLE fragment plus adapter; a kept
+          read-through puts adapter into the corpus (``adapter_bases_in_kept_read_through``),
+          which is what an undeclared run's read-through merges exist to prevent.
         """
         t = self.truth
         RL = self.readlen
-        # The trim is SYMMETRIC: the overlap sits at the 3' end of both mates and is
-        # split between them, so "how much was removed" is the sum over the pair.
-        # Charging only R2 -- which was right when only R2 was cut -- reads a correct
-        # balanced trim as half an under-trim, and every trimmed R1 as a violation.
-        cut1 = np.where(both, t.len1 - self.r1_len, 0)
-        cut2 = np.where(both, t.len2 - self.r2_len, 0)
-        removed = cut1 + cut2
-        keep2 = np.where(both, self.r2_len, 0)
-        # Neither mate may grow, and nothing may come off a 5' end -- the latter is what
-        # the C1 prefix check verifies directly, on every emitted record.
-        self.r1_shortened = int((both & (self.r1_len > t.len1)).sum())
-        # How unequal the emitted pair ended up: the reason for splitting at all.
-        tr = both & (removed > 0)
-        self.trimmed_pairs = int(tr.sum())
-        self.trim_length_gap = (int(np.abs(self.r1_len - self.r2_len)[tr].sum())
-                                if tr.any() else 0)
-        self.trim_max_gap = int(np.abs(self.r1_len - self.r2_len)[tr].max()) if tr.any() else 0
-
         no_ovl = both & (t.true_ovl == 0)
         normal = both & (t.read_through == 0) & (t.true_ovl > 0)
         rthru = both & (t.read_through == 1)
@@ -596,60 +579,20 @@ class ToolScore:
         self.kept_overlapping = int(normal.sum())
         self.kept_read_through = int(rthru.sum())
 
-        # (a) nothing to remove: every removed base is real sequence destroyed
-        self.trim_false = int((no_ovl & (removed > 0)).sum())
-        self.trim_false_bases = int(removed[no_ovl].sum())
+        altered = both & ((self.r1_len != t.len1) | (self.r2_len != t.len2))
+        self.kept_altered = int(altered.sum())
+        self.kept_grew = int((both & ((self.r1_len > t.len1)
+                                      | (self.r2_len > t.len2))).sum())
+        self.bases_emitted_unmerged = int(self.r1_len[both].sum()
+                                          + self.r2_len[both].sum())
+        self.bases_overlap_kept = int(np.where(normal, t.true_ovl, 0).sum())
+        # Each mate of a read-through pair reads RL - frag_len bases past its molecule.
+        self.bases_adapter_kept = int(np.where(rthru, 2 * (RL - t.frag_len), 0).sum())
 
-        # (b) the trim band proper
-        want = t.true_ovl
-        self.trim_exact = int((normal & (removed == want)).sum())
-        self.trim_over = int((normal & (removed > want)).sum())
-        self.trim_under = int((normal & (removed < want) & (removed > 0)).sum())
-        self.trim_none = int((normal & (removed == 0)).sum())
-        # Overlaps too short to clear --threshold-trim cannot be removed by design, so
-        # split the misses: below the floor is the specification, above it is a miss.
-        floor = self.min_trim_overlap
-        self.trim_none_below_floor = int((normal & (removed == 0)
-                                          & (t.true_ovl < floor)).sum())
-        self.trim_none_above_floor = self.trim_none - self.trim_none_below_floor
-
-        # (c) read-through kept whole: the entire fragment is in the corpus twice
-        rt_dup = np.where(rthru, np.minimum(t.frag_len, keep2), 0)
-        rt_adapter = (np.where(rthru, RL - t.frag_len, 0)
-                      + np.where(rthru, np.clip(keep2 - t.frag_len, 0, None), 0))
-
-        # corpus-level totals
-        dup = np.where(normal, np.clip(want - removed, 0, None), 0) + rt_dup
-        deleted = (np.where(normal, np.clip(removed - want, 0, None), 0)
-                   + np.where(no_ovl, removed, 0)
-                   + np.where(rthru, np.clip(t.frag_len - keep2, 0, None), 0))
-        self.bases_duplicated = int(dup.sum())
-        self.bases_deleted = int(deleted.sum())
-        # The counterfactual, which is what makes the trade legible: how much duplicated
-        # sequence would have reached the corpus had nothing been trimmed. The trim is
-        # worth its cost exactly insofar as this exceeds `bases_deleted`.
-        self.bases_duplicated_untrimmed = int(
-            (np.where(normal, t.true_ovl, 0) + np.where(rthru, t.frag_len, 0)).sum())
-        self.bases_adapter_left = int(rt_adapter.sum())
-        self.bases_emitted_unmerged = int((self.r1_len[both].sum()
-                                           + self.r2_len[both].sum()))
-
-        # the sensitivity curve for the trim, the analogue of the merge one
-        self.trim_exact_by_ovl = np.zeros(RL + 2, dtype=np.int64)
-        sel = np.flatnonzero(normal & (removed == want))
-        if sel.size:
-            np.add.at(self.trim_exact_by_ovl, np.minimum(t.true_ovl[sel], RL + 1), 1)
-
-        for i in np.flatnonzero(no_ovl & (removed > 0)):
-            self._note(int(i), "false_trim", None, (int(keep2[i]), int(removed[i])))
-        for i in np.flatnonzero(normal & (removed > want)):
-            self._note(int(i), "over_trim", None,
-                       (int(keep2[i]), int(removed[i] - want[i])))
-        for i in np.flatnonzero(normal & (removed == 0) & (t.true_ovl >= floor)):
-            self._note(int(i), "missed_trim", None, (int(keep2[i]), -int(want[i])))
-        for i in np.flatnonzero(both & (self.r1_len > t.len1)):
-            self._note(int(i), "read_grew", None,
-                       (int(self.r1_len[i]), int(self.r1_len[i] - t.len1[i])))
+        for i in np.flatnonzero(altered):
+            d = int(self.r1_len[i] + self.r2_len[i] - t.len1[i] - t.len2[i])
+            self._note(int(i), "kept_mate_altered", None,
+                       (int(self.r1_len[i] + self.r2_len[i]), d))
 
 
 # --------------------------------------------------------------------------- #
@@ -691,23 +634,23 @@ def fetch_reads(in1, in2, wanted, truth):
     return {i: (a, b) for i, (a, b) in out.items()}
 
 
-def make_scan(t_merge, t_trim):
-    """`zna merge`'s own overlap kernel, at the thresholds the run actually used.
+def make_scan(p):
+    """`zna merge`'s own overlap decision, at the parameters the run actually used.
 
-    Returns ``scan(r1, r2)`` and ``score_at(r1, r2, shift)``. The second one is what
-    separates a *defective* scan from an *ambiguous* input: score the shift the truth
-    says is right, and compare. If the tool's pick ever scores lower than the truth's,
-    the argmax or its pruning is broken; if it always scores higher, the tool is
-    maximising correctly and the sequence really does align better somewhere else.
+    Returns ``scan(r1, r2) -> (verdict, shift, score_q, overlap_len, mismatches)`` -- the
+    authoritative decision (``zna.merge.overlap.find_overlap``: the best shift eligible
+    under the run's contract, at the pair's own floor, and the plausibility gate's
+    verdict on it) -- and ``score_at(r1, r2, shift)``. The second one is what separates
+    a *defective* scan from an *ambiguous* input: score the shift the truth says is
+    right, and compare. If the tool's pick ever scores lower than the truth's, the
+    argmax or its pruning is broken; if it always scores higher, the tool is maximising
+    correctly and the sequence really does align better somewhere else.
     """
-    from zna.merge import backend as _backend
-    from zna.merge.params import MergeParams
-    p = MergeParams(t_merge=t_merge, t_trim=t_trim)
-    kern = _backend.active().scan
+    from zna.merge.overlap import find_overlap
 
     def scan(r1, r2):
-        s2rc = rc(r2)
-        return kern(r1, s2rc, len(r1), len(s2rc), p.match_q, p.step_q, p.t_trim_q)
+        o = find_overlap(r1, rc(r2), p)
+        return o.verdict, o.shift, o.score_q, o.overlap_len, o.mismatches
 
     def score_at(r1, r2, shift):
         """``(score_q, overlap_len, mismatches)`` at one specific shift, or None."""
@@ -720,7 +663,7 @@ def make_scan(t_merge, t_trim):
         return n * p.match_q - d * p.step_q, n, d
 
     scan.score_at = score_at
-    scan.floor_q = p.t_trim_q
+    scan.floor_q = lambda len1, len2: p.t_q(len1 + len2 - 1)
     return scan
 
 
@@ -770,32 +713,6 @@ def read_through_table(truth, scores, readlen):
     return "\n".join(lines)
 
 
-def trim_curve_table(truth, scores, readlen):
-    """Exact-trim rate by true overlap, over pairs the tool did NOT merge.
-
-    The denominator is per tool on purpose: a pair one tool merged and the other kept is
-    not a trim failure for the one that merged it, and pooling them would read as one.
-    """
-    lines = ["### Exact-trim rate by true overlap, over each tool's own kept pairs", "",
-             "| true overlap | " + " | ".join(
-                 f"{s.name} kept | {s.name} trimmed exactly" for s in scores) + " |",
-             "|---|" + "---:|---:|" * len(scores)]
-    normal = truth.read_through == 0
-    for lo, hi in [(1, 4), (5, 9), (10, 14), (15, 19), (20, 29), (30, 10 ** 9)]:
-        band = normal & (truth.true_ovl >= lo) & (truth.true_ovl <= hi)
-        if not band.any():
-            continue
-        cells = []
-        for s in scores:
-            kept = int((band & ((s.state & 6) == 6)).sum())
-            ok = int(s.trim_exact_by_ovl[lo:min(hi, readlen + 1) + 1].sum())
-            cells.append(f"{kept:,}")
-            cells.append(f"{ok:,} ({100.0 * ok / kept:.1f}%)" if kept else "–")
-        label = f"{lo}–{hi}" if hi <= readlen else f"{lo}+"
-        lines.append(f"| {label} | " + " | ".join(cells) + " |")
-    return "\n".join(lines)
-
-
 def evidence_table(scores):
     lines = ["| tool | wrong merges | median identity | min identity | ≥80% identical "
              "| median overlap |", "|---|---:|---:|---:|---:|---:|"]
@@ -822,10 +739,13 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True, help="results directory")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--min-read-length", type=int, default=40)
-    ap.add_argument("--threshold-merge", type=float, default=None,
+    ap.add_argument("--alpha", default=None,
                     help="passed to zna merge; default is the tool's own")
-    ap.add_argument("--threshold-trim", type=float, default=None,
-                    help="passed to zna merge; sweep this to price the trim band")
+    ap.add_argument("--error-rate", default=None,
+                    help="passed to zna merge; default is the tool's own")
+    ap.add_argument("--adapter-trimmed", action="store_true",
+                    help="passed to zna merge. FALSE on simulate.py output, which carries "
+                         "raw adapter read-through: use it to price the declaration")
     ap.add_argument("--zna", default=None, help="zna executable (default: on PATH)")
     ap.add_argument("--fastp", default="/Users/mkiyer/sw/miniforge3/envs/fastp/bin/fastp")
     ap.add_argument("--row-cap", type=int, default=DEFAULT_ROW_CAP,
@@ -858,10 +778,12 @@ def main(argv=None) -> int:
                "--json", str(outdir / "zna.json"),
                "--min-read-length", str(args.min_read_length),
                "--threads", str(args.threads), "-q"]
-    if args.threshold_merge is not None:
-        zna_cmd += ["--threshold-merge", str(args.threshold_merge)]
-    if args.threshold_trim is not None:
-        zna_cmd += ["--threshold-trim", str(args.threshold_trim)]
+    if args.alpha is not None:
+        zna_cmd += ["--alpha", args.alpha]
+    if args.error_rate is not None:
+        zna_cmd += ["--error-rate", args.error_rate]
+    if args.adapter_trimmed:
+        zna_cmd += ["--adapter-trimmed"]
     # fastp does quality filtering, polyG trimming and adapter trimming by default and
     # `zna merge` does none of them, so they are turned off: what is being compared is
     # merging, not preprocessing. `-A` was checked empirically not to change the merge
@@ -887,18 +809,26 @@ def main(argv=None) -> int:
     print("loading truth ...", file=sys.stderr)
     truth = Truth(f"{pre}.truth.tsv")
 
-    # The shortest overlap the trim can act on at all, taken from the run's own
-    # parameters rather than recomputed: a miss below it is the specification.
+    # The run's own policy, rebuilt for the re-scan and checked against the integers
+    # the run reports it used -- so the evidence columns are the decision that was made.
+    from zna.merge.params import DEFAULT_ALPHA, DEFAULT_ERROR_RATE, MergeParams
     zj = json.loads((outdir / "zna.json").read_text())
-    zp = zj["params"]
-    min_trim_overlap = -(-zp["threshold_trim_q"] // zp["match_q"])
+    policy = MergeParams(alpha=args.alpha or DEFAULT_ALPHA,
+                         error_rate=args.error_rate or DEFAULT_ERROR_RATE,
+                         adapter_trimmed=args.adapter_trimmed,
+                         min_read_length=args.min_read_length)
+    if (zj["params"]["alpha"], zj["params"]["match_q"], zj["params"]["step_q"],
+            zj["adapter_trimmed"]) != (float(policy.alpha_exact), policy.match_q,
+                                       policy.step_q, policy.adapter_trimmed):
+        raise SystemExit(f"{outdir}/zna.json was not made with this policy "
+                         f"(--skip-run with different flags?)")
 
     scores = []
     for name, records in (("zna", zna_records(zna_out)),
                           ("fastp", fastp_records(fp_m, fp_1, fp_2))):
         print(f"scoring {name} ...", file=sys.stderr)
         sc = ToolScore(name, truth, readlen, args.row_cap, args.max_edit,
-                       args.min_read_length, min_trim_overlap)
+                       args.min_read_length)
         for kind, rid, seq in records:
             sc.add(kind, rid, seq)
         sc.finish()
@@ -910,7 +840,7 @@ def main(argv=None) -> int:
         print(f"re-reading {len(wanted):,} error pairs from the input ...",
               file=sys.stderr)
         reads = fetch_reads(in1, in2, wanted, truth)
-        scan = make_scan(zp["threshold_merge_bits"], zp["threshold_trim_bits"])
+        scan = make_scan(policy)
         for sc in scores:
             sc.write_rows(reads, scan)
 
@@ -972,42 +902,18 @@ def summarise(sc, truth, readlen):
         if sc.argmax_margin else None,
         "correct_length_merges_scored": sc.scored_merges - (sc.wrong_length
                                                             - sc.n_merged_dropped),
-        # --- the trim band (contract C4) --------------------------------- #
+        # --- kept pairs: whole (0.6 has no trim band) -------------------- #
         "kept_pairs_no_true_overlap": sc.kept_no_overlap,
         "kept_pairs_overlapping": sc.kept_overlapping,
         "kept_pairs_read_through": sc.kept_read_through,
-        "min_trimmable_overlap": sc.min_trim_overlap,
-        "trim_exact": sc.trim_exact,
-        "trim_over": sc.trim_over,
-        "trim_under": sc.trim_under,
-        "trim_absent": sc.trim_none,
-        "trim_absent_below_threshold": sc.trim_none_below_floor,
-        "trim_absent_above_threshold": sc.trim_none_above_floor,
-        # A trim on a pair that shares nothing destroys real sequence. This is the
-        # specificity side of the trim, and it must be zero.
-        "false_trims": sc.trim_false,
-        "false_trim_bases": sc.trim_false_bases,
-        "emitted_read_longer_than_input": sc.r1_shortened,
-        "trimmed_pairs": sc.trimmed_pairs,
-        # The point of splitting the overlap rather than taking it all off R2: the two
-        # emitted mates come out the same length.
-        "trimmed_mean_length_gap": round(sc.trim_length_gap / sc.trimmed_pairs, 2)
-        if sc.trimmed_pairs else 0.0,
-        "trimmed_max_length_gap": sc.trim_max_gap,
-        # What the corpus actually receives, in bases.
+        # A kept mate is its input, exactly. Must be zero: the simulation has no
+        # no-calls, so not even the N policy may change a length.
+        "kept_mate_altered": sc.kept_altered,
+        "emitted_read_longer_than_input": sc.kept_grew,
+        # What the corpus actually receives from kept pairs, in bases.
         "bases_emitted_unmerged": sc.bases_emitted_unmerged,
-        "fragment_bases_duplicated": sc.bases_duplicated,
-        "fragment_bases_duplicated_if_untrimmed": sc.bases_duplicated_untrimmed,
-        "fragment_bases_removed_correctly": sc.bases_duplicated_untrimmed
-                                            - sc.bases_duplicated,
-        "fragment_bases_deleted": sc.bases_deleted,
-        "trim_benefit_ratio": round(
-            (sc.bases_duplicated_untrimmed - sc.bases_duplicated) / sc.bases_deleted, 2)
-        if sc.bases_deleted else None,
-        "adapter_bases_left_in_kept_read_through": sc.bases_adapter_left,
-        "duplicated_per_10k_unmerged_bases": round(
-            1e4 * sc.bases_duplicated / sc.bases_emitted_unmerged, 2)
-        if sc.bases_emitted_unmerged else 0.0,
+        "overlap_bases_in_kept_pairs": sc.bases_overlap_kept,
+        "adapter_bases_in_kept_read_through": sc.bases_adapter_kept,
         "error_categories": sc.cat_counts,
         "error_rows_written": sc.cat_written,
     }
@@ -1044,13 +950,13 @@ def write_outputs(outdir, meta, truth, scores, readlen, zna_cmd, fastp_cmd, args
             for c in sorted(sc.cat_counts))
         head = ("# every pair this tool got wrong, capped per category\n"
                 f"{cap_note}\n"
-                "# scan_* is zna's own overlap kernel re-run on this pair: the shift it\n"
-                "# picks, the evidence in bits, the overlap length, and how well the two\n"
-                "# reads agree there. A '.' in emitted_* means the merged record was\n"
-                "# below --min-read-length and never written.\n"
+                "# scan_* is zna's own overlap decision re-run on this pair at the run's\n"
+                "# parameters: its verdict, the shift, the evidence in bits, the overlap\n"
+                "# length, and how well the two reads agree there. A '.' in emitted_*\n"
+                "# means the merged record was below --min-read-length and never written.\n"
                 "read_id\tcategory\tchrom\tstart\tstrand\tfrag_len\ttrue_ovl\t"
                 "read_through\tn_err1\tn_err2\temitted_len\tlen_err\tn_mismatch\t"
-                "edit_distance\tscan_shift\tscan_score_bits\tscan_olen\t"
+                "edit_distance\tscan_verdict\tscan_shift\tscan_score_bits\tscan_olen\t"
                 "scan_identity\ttrue_shift_score_bits\tbest_offset\temitted_seq\t"
                 "true_fragment\n")
         (outdir / f"{sc.name}_errors.tsv").write_text(head + "\n".join(sc.rows) + "\n")
@@ -1208,71 +1114,30 @@ def write_outputs(outdir, meta, truth, scores, readlen, zna_cmd, fastp_cmd, args
         "molecule emitted twice. Both must be zero. `pairs_with_no_output` are the "
         "filtered-away merges of section 3, not lost pairs.",
         "",
-        "## 7. The trim band (contract C4), and what the corpus receives",
+        "## 7. Kept pairs, and what the corpus receives from them",
         "",
-        "A pair that does not merge is **still encoded**, so its redundant overlap "
-        "matters as much as a merge does: leave it in and the same physical bases enter "
-        "the corpus twice with nothing marking them as one molecule; cut too much and "
-        "real sequence is destroyed. `zna merge` removes the overlap from R2's **3'** "
-        "end, leaving R1 and R2 tiling the fragment exactly once.",
-        "",
-        "Scored over **every** kept pair, split by regime, because the failure modes are "
-        "opposite and an average hides both.",
+        "An unmerged pair is **kept whole**: each emitted mate is its input read, "
+        "exactly. `kept_mate_altered` and `emitted_read_longer_than_input` must be zero "
+        "(the simulation has no no-calls, so not even the N policy may change a length); "
+        "the C1 prefix check of section 5 covers the 5' ends.",
         "",
         "| metric | " + " | ".join(s.name for s in scores) + " |",
         "|---|" + "---:|" * len(scores),
         pair("kept_pairs_no_true_overlap"),
         pair("kept_pairs_overlapping"),
         pair("kept_pairs_read_through"),
-        pair("min_trimmable_overlap"),
-        pair("trim_exact"),
-        pair("trim_over"),
-        pair("trim_under"),
-        pair("trim_absent"),
-        pair("trim_absent_below_threshold"),
-        pair("trim_absent_above_threshold"),
-        pair("false_trims"),
-        pair("false_trim_bases"),
+        pair("kept_mate_altered"),
         pair("emitted_read_longer_than_input"),
-        pair("trimmed_pairs"),
-        pair("trimmed_mean_length_gap"),
-        pair("trimmed_max_length_gap"),
-        "",
-        "`false_trims` is the specificity side and the one an analysis restricted to "
-        "overlapping pairs cannot see: a pair whose mates share nothing, trimmed anyway, "
-        "has had real sequence deleted. `trim_absent_below_threshold` is the "
-        "specification, not a miss — an overlap shorter than `min_trimmable_overlap` "
-        "cannot clear `--threshold-trim` and is left in deliberately.",
-        "",
-        "`trimmed_*_length_gap` is `|len(R1) − len(R2)|` over trimmed pairs, and is why "
-        "the overlap is **split** between the two 3' ends rather than taken entirely off "
-        "R2: the emitted mates come out the same length, which is what downstream "
-        "aligners and models expect. Taking it all off R2 leaves a gap equal to the "
-        "whole overlap on every trimmed pair.",
-        "",
-        "### Bases, which is what a model actually sees",
-        "",
-        "| metric | " + " | ".join(s.name for s in scores) + " |",
-        "|---|" + "---:|" * len(scores),
         pair("bases_emitted_unmerged"),
-        pair("fragment_bases_duplicated_if_untrimmed"),
-        pair("fragment_bases_removed_correctly"),
-        pair("fragment_bases_duplicated"),
-        pair("duplicated_per_10k_unmerged_bases"),
-        pair("fragment_bases_deleted"),
-        pair("trim_benefit_ratio"),
-        pair("adapter_bases_left_in_kept_read_through"),
+        pair("overlap_bases_in_kept_pairs"),
+        pair("adapter_bases_in_kept_read_through"),
         "",
-        "`fragment_bases_duplicated` is the count of fragment positions covered twice in "
-        "an emitted pair — the thing the trim exists to remove. `..._if_untrimmed` is "
-        "the counterfactual, which is what makes the trade legible: the trim is worth "
-        "its cost insofar as `fragment_bases_removed_correctly` exceeds "
-        "`fragment_bases_deleted`, and `trim_benefit_ratio` is that quotient. `fastp` "
-        "has no redundant-overlap trim at all (it trims *adapter*, not shared "
-        "sequence), so its column is the size of the problem rather than a competing "
-        "result.",
-        "",
-        trim_curve_table(truth, scores, readlen),
+        "`overlap_bases_in_kept_pairs` is the true overlap still held by both mates of "
+        "an overlapping pair the tool did not merge -- sensitivity forgone, not a "
+        "defect of the kept pair. `adapter_bases_in_kept_read_through` is adapter "
+        "reaching the corpus through a read-through pair left unmerged: 0.6 merges "
+        "those unless `--adapter-trimmed` is declared, and on this raw input the "
+        "declaration is false.",
         "",
         "## 8. Throughput",
         "",
@@ -1300,14 +1165,13 @@ def write_outputs(outdir, meta, truth, scores, readlen, zna_cmd, fastp_cmd, args
         "below `--min-read-length` and were never written. `frame_violation` — the "
         "record does not align to the fragment at offset 0. `consensus_miss` — right "
         "length, but more base errors than the oracle floor, i.e. it had the evidence "
-        "to fix a base and did not. `false_trim` — cut sequence off a pair that shares "
-        "none. `over_trim` / `missed_trim` — cut more or less than the true overlap "
-        "(misses are only counted above the trim threshold). `r1_shortened` — moved a "
-        "3' end on R1, which nothing should. On trim rows `emitted_len` is R2's emitted "
-        "length and `len_err` is bases removed minus the true overlap.",
+        "to fix a base and did not. `kept_mate_altered` — a kept pair whose mates are "
+        "not their input lengths; on those rows `emitted_len` is the pair's emitted "
+        "bases and `len_err` their change.",
         "",
-        "The `scan_*` columns are `zna merge`'s own kernel re-run on the pair, so a row "
-        "carries the evidence the decision was made on rather than only its outcome.",
+        "The `scan_*` columns are `zna merge`'s own decision re-run on the pair at the "
+        "run's parameters (verdict, shift, bits, overlap), so a row carries the "
+        "evidence the decision was made on rather than only its outcome.",
         "",
     ]
     (outdir / "report.md").write_text("\n".join(lines))

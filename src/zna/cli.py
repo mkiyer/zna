@@ -1373,15 +1373,51 @@ def encode_command(args):
     # stamps its own True.)
     shuffled_in = False
     merged_in_process_in = False
+    merge_record_in = None
     if is_reencoding:
         with open(files[0], "rb") as _f:
             _prov = ZnaReader(_f).provenance
         shuffled_in = bool(_prov is not None and _prov.shuffled)
         # A copy preserves record content, so the merged-in-process
-        # attestation survives re-encode exactly as `shuffled` does.
+        # attestation survives re-encode exactly as `shuffled` does -- and so
+        # does the merge record, verbatim, or its absence (MERGE_ACCURACY_PLAN §5).
         merged_in_process_in = bool(_prov is not None and _prov.merged_in_process)
+        merge_record_in = _prov.merge if _prov is not None else None
 
     with ExitStack() as stack:
+        merge_acc = None
+        merge_source = None
+        if merge_pairs:
+            # Opened BEFORE the writer, and before label_defs dispatch: the
+            # prologue the writer emits at construction carries the merge
+            # record, and an unreadable input should fail before an output
+            # file exists.  (And dispatching here, not through
+            # stream_inputs_labeled, is what stops that function's own
+            # two-file mode silently emitting an UNMERGED stream at exit 0 --
+            # MERGE_PAIRS_PLAN.md §0.3, the audit's third blocker.)
+            import logging
+            from .merge.encode_stream import MergePairsSource
+            from .merge.cli import _new_acc, log_policy, params_from_args
+            from .merge.fastqio import InputError
+            merge_acc = _new_acc()
+            try:
+                merge_source = stack.enter_context(MergePairsSource(
+                    files, params_from_args(args),
+                    check_sync=not getattr(args, 'no_sync_check', False),
+                    merge_backend=getattr(args, 'merge_backend', 'auto'),
+                    label_defs=label_defs, tag_map=tag_map,
+                    allow_empty=getattr(args, 'allow_empty', False),
+                    acc=merge_acc))
+            except InputError as e:
+                sys.exit(f"Error: {e}")
+
+            def _say(level, msg, _quiet=quiet):
+                if level >= logging.WARNING:
+                    print(f"[ZNA] WARNING: merge: {msg}", file=sys.stderr)
+                elif not _quiet:
+                    print(f"[ZNA] merge: {msg}", file=sys.stderr)
+            log_policy(merge_source.params, _say)
+
         f_out = stack.enter_context(get_output_handle(args.output))
         writer = stack.enter_context(ZnaWriter(
             f_out, header, block_size=block_size, npolicy=codec_npolicy,
@@ -1389,6 +1425,8 @@ def encode_command(args):
             rng_seed=getattr(args, 'seed', 0) or 0,
             shuffled=shuffled_in,
             merged_in_process=merge_pairs or merged_in_process_in,
+            merge_record=(merge_source.merge_record() if merge_source is not None
+                          else merge_record_in),
         ))
 
         def _trim3(seq):
@@ -1414,30 +1452,8 @@ def encode_command(args):
             return seq.count('N') + seq.count('n')
         treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
 
-        merge_acc = None
-        if merge_pairs:
-            # Dispatched BEFORE label_defs, deliberately: stream_inputs_labeled
-            # also knows the two-file mode and would silently emit an UNMERGED
-            # stream, writing an unmerged corpus at exit 0
-            # (MERGE_PAIRS_PLAN.md §0.3 -- the audit's third blocker).
-            from .merge.encode_stream import stream_merge_pairs
-            from .merge.cli import _new_acc
-            from .merge.params import MergeParams
-            merge_acc = _new_acc()
-            merge_params = MergeParams(
-                t_merge=getattr(args, 't_merge', 28.0),
-                t_trim=getattr(args, 't_trim', 8.0),
-                min_read_length=getattr(args, 'min_read_length', 40),
-                npolicy=npolicy or "trim3",
-                rng_seed=getattr(args, 'seed', 0) or 42,
-            )
-            stream = stream_merge_pairs(
-                files, merge_params,
-                check_sync=not getattr(args, 'no_sync_check', False),
-                merge_backend=getattr(args, 'merge_backend', 'auto'),
-                label_defs=label_defs, tag_map=tag_map,
-                allow_empty=getattr(args, 'allow_empty', False),
-                acc=merge_acc, quiet=quiet)
+        if merge_source is not None:
+            stream = iter(merge_source)
             carries_ends = True
         elif label_defs:
             stream = stream_inputs_labeled(args, label_defs, tag_map)
@@ -1603,15 +1619,24 @@ def encode_command(args):
         # records, which must be a crash, not a statistic
         # (MERGE_PAIRS_PLAN.md §10.2; subsumed at read time by
         # `zna inspect --verify` check 4).
-        emitted = merge_acc[0][4]
+        from .merge.cli import (EMITTED, KEPT, MERGED, N_PAIRS, DROPPED,
+                                IMPLAUSIBLE)
+        emitted = merge_acc[0][EMITTED]
         if emitted != count:
             raise AssertionError(
                 f"merge emitted {emitted} records but {count} were written")
         if not quiet and not is_stdout:
             c = merge_acc[0]
-            print(f"[ZNA] merge: {c[0]} pairs -> {c[1]} merged, "
-                  f"{c[2]} trimmed, {c[3]} kept; {c[5]} dropped short",
+            print(f"[ZNA] merge: {c[N_PAIRS]} pairs -> {c[MERGED]} merged, "
+                  f"{c[KEPT]} kept ({c[IMPLAUSIBLE]} refused as implausible); "
+                  f"{c[DROPPED]} dropped short",
                   file=sys.stderr)
+        # What the run says about --error-rate, --adapter-trimmed and whether anything
+        # could merge at all -- the same checks `zna merge` makes, printed whatever -q
+        # says: each one means a parameter may be wrong for this library.
+        from .merge.cli import run_warnings
+        for msg in run_warnings(merge_acc, merge_source.params):
+            print(f"[ZNA] WARNING: merge: {msg}", file=sys.stderr)
         merge_json_path = getattr(args, 'merge_json', None)
         if merge_json_path:
             import json as _json
@@ -1622,7 +1647,7 @@ def encode_command(args):
             # `files` is safe to index: the --merge-pairs guard above exits unless it
             # holds exactly two paths.
             stats = _assemble_stats(
-                merge_acc, merge_params,
+                merge_acc, merge_source.params,
                 inflate=inflate_backend_for(files[0], files[1]))
             # _assemble_stats reads the process-global backend selection, which
             # --merge-backend deliberately never mutates; report the kernel
@@ -1683,11 +1708,13 @@ def encode_command(args):
             # overlap rescue; encode's own counters are legitimately zero and
             # reporting them would claim the policy did nothing.  Report the
             # kernel's numbers -- the same quantities `zna merge` prints.
-            npolicy_bases = merge_acc[0][13]
+            from .merge.cli import NPOLICY_BASES
+            npolicy_bases = merge_acc[0][NPOLICY_BASES]
             npolicy_records = 0        # the kernel counts bases, not records
         if npolicy and not is_reencoding and merge_pairs and merge_acc is not None:
             verb = "removed" if npolicy == "trim3" else "substituted"
-            rescued = merge_acc[0][14]
+            from .merge.cli import N_RESCUED
+            rescued = merge_acc[0][N_RESCUED]
             print(f"[ZNA] no-calls: --npolicy {npolicy} {verb} {npolicy_bases} "
                   f"base{'' if npolicy_bases == 1 else 's'} in the merge kernel; "
                   f"{rescued} rescued from the mate at no cost.",
@@ -2261,6 +2288,13 @@ def inspect_command(args):
             print(f"Shuffled:         {prov.shuffled}")
             if prov.merged_in_process:
                 print("Merged in-process:True")
+            if prov.merge is not None:
+                # The policy the records were merged under (MERGE_ACCURACY_PLAN §5).
+                # Printed key by key, in the record's own order, so a field a later
+                # schema adds shows up here without a code change.
+                print("Merge record:")
+                for k, v in prov.merge.items():
+                    print(f"  {k + ':':<19}{v}")
         else:
             print("(none: written by zna < 0.5, or truncated)")
 
@@ -2470,7 +2504,10 @@ def main():
         "line). Pairing is handed over by the merger rather than re-derived "
         "from read names -- and mate names are CHECKED per pair, so two "
         "files that do not correspond now fail loudly where the two-file "
-        "reader silently mispaired them (see --no-sync-check).")
+        "reader silently mispaired them (see --no-sync-check). The merge "
+        "policy -- --alpha, --error-rate, --adapter-trimmed -- is recorded "
+        "in the file's prologue, which `zna inspect` prints and shuffle and "
+        "re-encode carry.")
     mp_group.add_argument("--merge-pairs", action="store_true",
                           help="merge overlapping pairs in process while encoding")
     from .merge.args import add_merge_algorithm_arguments

@@ -252,6 +252,48 @@ class TestStamping(unittest.TestCase):
         self.assertTrue(p.shuffled)
         self.assertTrue(p.merged_in_process)
 
+    MERGE_RECORD = {"policy": "zna-merge-0.6", "zna_version": "0.6.0",
+                    "alpha": "0.000001", "error_rate": "0.01",
+                    "adapter_trimmed": True, "min_read_length": 40,
+                    "npolicy": "trim3"}
+
+    def test_the_merge_record_round_trips_and_is_absent_by_default(self):
+        """Absent means UNKNOWN: a writer not given a record writes none."""
+        self.assertIsNone(ZnaReader(io.BytesIO(build())).provenance.merge)
+        self.assertNotIn("merge", ZnaReader(io.BytesIO(build())).provenance.raw)
+        p = ZnaReader(io.BytesIO(build(merged_in_process=True,
+                                       merge_record=self.MERGE_RECORD))).provenance
+        self.assertEqual(p.merge, self.MERGE_RECORD)
+        self.assertEqual(p.raw["merge"], self.MERGE_RECORD)
+
+    def test_shuffle_propagates_the_merge_record_verbatim(self):
+        """A permutation cannot change which policy made the records."""
+        import tempfile, pathlib as pl, json
+        with tempfile.TemporaryDirectory() as d:
+            src = pl.Path(d) / "in.zna"
+            dst = pl.Path(d) / "out.zna"
+            src.write_bytes(build(n_pairs=100, n_single=10, block_size=256,
+                                  merged_in_process=True,
+                                  merge_record=self.MERGE_RECORD))
+            shuffle_zna(str(src), str(dst), seed=3, buffer_bytes=1 << 16,
+                        block_size=256, tmp_dir=d, quiet=True)
+            p = ZnaReader(io.BytesIO(dst.read_bytes())).provenance
+        self.assertTrue(p.shuffled)
+        self.assertEqual(json.dumps(p.merge, sort_keys=True),
+                         json.dumps(self.MERGE_RECORD, sort_keys=True))
+
+    def test_a_malformed_merge_record_is_corruption_not_absence(self):
+        """A present-but-wrong record must never read as "unknown": a prologue whose
+        ``merge`` is not an object is corrupt, like any other unparseable prologue."""
+        import json
+        data = build(comp=COMPRESSION_NONE, merge_record=self.MERGE_RECORD)
+        obj = json.dumps(self.MERGE_RECORD, sort_keys=True,
+                         separators=(",", ":")).encode()
+        self.assertEqual(data.count(obj), 1)
+        bad = data.replace(obj, b'"' + b"x" * (len(obj) - 2) + b'"')
+        with self.assertRaisesRegex(ValueError, "Corrupt provenance prologue"):
+            ZnaReader(io.BytesIO(bad)).provenance
+
 
 class TestWriterEdges(unittest.TestCase):
     def test_zero_record_file_has_a_trailer(self):

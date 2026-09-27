@@ -10,19 +10,48 @@ The Python backend is the **reference oracle**, not a fallback. It is never dele
 never optimised at the cost of clarity — it is what the accelerated backend is defined
 to agree with, so it has to stay readable enough to be believed.
 
-Backends implement::
+Backends implement (``docs/archive/MERGE_ACCURACY_PLAN.md`` §6)::
 
-    scan(s1, s2rc, len1, len2, match_q, step_q, floor_q)
+    POLICY_ABI = 2
+
+    scan(s1, s2rc, len1, len2, match_q, step_q, floor_q, adapter_trimmed)
         -> (shift, score_q, overlap_len, mismatches)
 
-    process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_merge_q, t_trim_q,
-                 min_read_length, disagree_q[, npolicy, rng_seed, pair_index])
-        -> (records, outcome, n_dropped, score_q, overlap_len, mismatches,
-            bases_consensus_changed, trim_guard_fired, npolicy_bases, n_rescued)
+    overlap(s1, s2rc, len1, len2, match_q, step_q, t_table, dfit_table, adapter_trimmed)
+        -> (verdict, shift, score_q, overlap_len, mismatches, informative_mismatches)
 
-All scoring arguments are integers in the fixed-point scale of :mod:`zna.merge.params`;
-no float crosses this boundary, which is what makes the two implementations comparable
-for exact equality rather than approximate agreement.
+    process_pair(h1, s1, q1, h2, s2, q2, match_q, step_q, t_table, dfit_table,
+                 adapter_trimmed, min_read_length, disagree_q[, npolicy, rng_seed,
+                 pair_index, rt_check])
+        -> (records, outcome, n_dropped, shift, score_q, overlap_len, mismatches,
+            bases_consensus_changed, implausible, npolicy_bases, n_rescued,
+            detected_bases, detected_mismatches, readthrough_strong,
+            detected_overlap_len)
+
+    merge_chunk(buf1, start1, end1, buf2, start2, end2, match_q, step_q, t_table,
+                dfit_table, adapter_trimmed, min_read_length, disagree_q, check_sync,
+                base_index[, npolicy, rng_seed, rt_check_pairs])
+        -> (blob, consumed1, consumed2, counters, len_hist, olen_hist, insert_hist,
+            det_olen_hist, need)
+
+    merge_chunk_records(... as merge_chunk ..., base_index, want_headers[, npolicy,
+                        rng_seed, rt_check_pairs])
+        -> (seqs, ends, consumed1, consumed2, counters, len_hist, olen_hist,
+            insert_hist, det_olen_hist, need)
+
+    split_records(buf, start, max_records) -> (offset, found)
+
+All scoring arguments are integers in the fixed-point scale of :mod:`zna.merge.params`,
+and the two tables are ``int64`` buffers (``array('q')``) derived there; no float crosses
+this boundary, which is what makes the two implementations comparable for exact equality
+rather than approximate agreement. :mod:`zna.merge._pymerge` documents each function.
+
+**The ABI marker.** The argument lists above are not the 0.5.x ones, and a compiled
+extension built from an older tree would be called with the wrong arguments -- or,
+worse, with the right *number* of them meaning different things. So a backend must
+declare ``POLICY_ABI`` equal to :data:`POLICY_ABI`; one that does not (every 0.5.x build
+lacks it) is refused exactly as if it had not been built, and everything runs on the
+reference backend, loudly, as in the no-extension configuration.
 """
 from __future__ import annotations
 
@@ -39,8 +68,11 @@ _BACKEND_MODULES = {
 _PREFERENCE = ("accel", "python")
 
 _REQUIRED_FUNCTIONS = frozenset(
-    {"scan", "process_pair", "merge_chunk", "merge_chunk_records",
+    {"scan", "overlap", "process_pair", "merge_chunk", "merge_chunk_records",
      "split_records"})
+
+#: The backend contract this tree's callers speak. See "The ABI marker" above.
+POLICY_ABI = 2
 
 _loaded: dict[str, ModuleType] = {}
 _default: Optional[ModuleType] = None
@@ -48,11 +80,11 @@ _default_name: Optional[str] = None
 
 
 def available_merge_backends() -> list[str]:
-    """Names of every backend that can be imported."""
+    """Names of every backend that can be imported AND speaks this tree's ABI."""
     out: list[str] = []
-    for name, modpath in _BACKEND_MODULES.items():
+    for name in _BACKEND_MODULES:
         try:
-            importlib.import_module(modpath)
+            _load(name)
             out.append(name)
         except ImportError:
             pass
@@ -97,6 +129,12 @@ def _load(name: str) -> ModuleType:
         raise ImportError(
             f"unknown merge backend {name!r}; choose from {sorted(_BACKEND_MODULES)}")
     mod = importlib.import_module(modpath)
+    abi = getattr(mod, "POLICY_ABI", None)
+    if abi != POLICY_ABI:
+        raise ImportError(
+            f"merge backend {name!r} implements merge-policy ABI {abi}, but this zna "
+            f"needs {POLICY_ABI}: it was built from an older source tree. Rebuild the "
+            f"extension (pip install -e . with a C++ toolchain).")
     missing = _REQUIRED_FUNCTIONS - set(dir(mod))
     if missing:
         raise ImportError(

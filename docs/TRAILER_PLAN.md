@@ -417,7 +417,10 @@ The layout becomes symmetric:
 - **Prologue payload** (canonical JSON, compressed like the file): `prologue_schema: 1`,
   `writer_version`, `shuffled`, and `merged_in_process` (present iff true). Nothing else — the
   owner's ruling also excludes parameter echoes (merge thresholds, npolicy): those are QC
-  material, not file facts, and stay out entirely.
+  material, not file facts, and stay out entirely. *(Amended in 0.6.0: one exception, the
+  optional `merge` record — the policy the records were merged under decides whether a
+  file may enter training, and nothing else in the file can say. Written only when known,
+  carried verbatim by shuffle and re-encode, no schema bump; `docs/METHODS.md` §3.8.)*
 - **Trailer payload** drops those three fields and keeps only derived facts: `trailer_schema`,
   `n_records`, `n_bases`, `n_pairs`, `n_unpaired`, `flag_counts`, both histograms, `blocks`,
   plus `prologue_crc32` — the end attests the start, closing the integrity gap for uncompressed

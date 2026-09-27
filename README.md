@@ -19,9 +19,9 @@
 - **Minimal Dependencies**: `zstandard` and `pyyaml` only (C++ extensions ship prebuilt)
 - **Flexible**: Single-end, paired-end, and interleaved reads
 - **Block-Parallel**: fragments never split across blocks, so any subset of blocks decodes independently — shard a file by block without splitting a pair
-- **Self-Describing**: every file carries its provenance (writer version, shuffled?) up front and its exact contents (counts, length histograms, block index, checksums) in a trailer — `zna inspect --verify` certifies a file with no sidecar
+- **Self-Describing**: every file carries its provenance (writer version, shuffled?, the merge policy its records were made under) up front and its exact contents (counts, length histograms, block index, checksums) in a trailer — `zna inspect --verify` certifies a file with no sidecar
 - **In-Process Merging**: `zna encode --merge-pairs R1.fq R2.fq` merges and encodes in one step, no FASTQ intermediate
-- **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score, with a compiled kernel and byte-identical output on any platform
+- **Overlap Merging**: `zna merge` collapses overlapping pairs into full-fragment reads on one calibrated likelihood-ratio score — a floor derived per pair from one tolerance, and a plausibility test that refuses divergent repeats — with a compiled kernel and byte-identical output on any platform
 - **Strand-Specific Support**: dUTP, TruSeq, and custom strand protocols
 - **Built-in Shuffle**: Memory-bounded random shuffling for training data preparation
 - **Metadata Rich**: Read groups, descriptions, and custom flags
@@ -167,8 +167,9 @@ reference and the Python API are all below.
 | | |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | what changed in each release, and why |
-| [docs/METHODS.md](docs/METHODS.md) | the algorithms: the overlap score and its two thresholds, the quality-aware consensus, fragment geometry and what the flags mean, the codec |
-| [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) | `zna merge` scored against known ground truth and head to head with fastp. Read this before changing a threshold |
+| [docs/METHODS.md](docs/METHODS.md) | the algorithms: the overlap score, the derived merge floor and the plausibility gate, the `--adapter-trimmed` contract, the quality-aware consensus, fragment geometry, provenance and what the flags mean, the codec |
+| [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) | `zna merge` scored against known ground truth: 0.5.x head to head with fastp, and 0.6 against 0.5.3 pair by pair. Read this before changing `--alpha` or `--error-rate` |
+| [docs/archive/MERGE_ACCURACY_PLAN.md](docs/archive/MERGE_ACCURACY_PLAN.md) | the 0.6 merge policy, executed in 0.6.0: why each piece is there, what was measured and rejected, how it was qualified, and its known limits |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | compression ratios, throughput, and tuning |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
@@ -615,8 +616,17 @@ Strand Normalized:True
 Compression:      ZSTD (Level 9)
 
 --- Provenance ---
-Writer:           zna 0.5.0
+Writer:           zna 0.6.0
 Shuffled:         True
+Merged in-process:True
+Merge record:
+  adapter_trimmed:   True
+  alpha:             0.000001
+  error_rate:        0.01
+  min_read_length:   40
+  npolicy:           trim3
+  policy:            zna-merge-0.6
+  zna_version:       0.6.0
 
 --- Content Statistics ---
 Total Blocks:       356
@@ -658,10 +668,14 @@ Overlap merging (--merge-pairs):
                          (takes exactly two FASTQ files, R1 R2, adjacent on the
                          command line; no FASTQ intermediate). Mate names are
                          checked per pair — input that silently mispaired under
-                         the plain two-file reader now fails loudly.
-  --threshold-merge N    Overlap score (bits) to merge (default: 28)
-  --threshold-trim N     Overlap score (bits) to trim the redundant overlap
-                         (default: 8)
+                         the plain two-file reader now fails loudly. The policy
+                         is recorded in the file's prologue (see zna merge).
+  --alpha ALPHA          The merge policy's one tolerance (default: 1e-6);
+                         the floor is log2((len1+len2-1)/ALPHA) bits per pair
+  --error-rate E         Expected mate disagreement in a true overlap
+                         (default: 0.01)
+  --adapter-trimmed      Declare that no read extends past its molecule
+                         (never for raw reads)
   --min-read-length N    Drop emitted reads shorter than this (default: 40)
   --no-sync-check        Skip the per-pair mate-name check
   --merge-json PATH      Write the merge run's statistics as JSON (same block
@@ -796,71 +810,134 @@ zna shuffle paired.zna -o shuffled_paired.zna
 ### `zna merge`
 
 Overlap-merge paired-end reads into one mixed interleaved FASTQ, ready for
-`zna encode --interleaved`. Replaces fastp's PE-merge step.
+`zna encode --interleaved`. Replaces fastp's PE-merge step. Each pair has exactly two
+outcomes: it is **merged** into one full-fragment record, or **kept** as its two mates,
+exactly as read.
 
 Each pair is scored **once**: R1 is slid against `revcomp(R2)` over the single axis of
 candidate fragment lengths, and every shift gets a log-likelihood ratio in **bits** —
-`+1.99` per matching base (that is `log2 4`, the information in agreeing on one of four
-bases), `-6.23` per mismatch at a 1% error rate. Both weights fall out of the error
+`+1.99` per matching base (just under `log2 4`, the information in agreeing on one of
+four bases), `-6.23` per mismatch at a 1% error rate. Both weights fall out of the error
 rate; neither is tuned. The best-scoring shift (`argmax`, not fastp's first-accept) is
-then read at two thresholds:
+**merged** when both of these hold, and otherwise the pair is kept:
 
-| | condition | action |
+| test | condition | what it bounds |
 |---|---|---|
-| **merge** | `score ≥ --threshold-merge` | emit one full-fragment record |
-| **trim** | `--threshold-trim ≤ score < merge` | keep both; split the redundant overlap between their **3'** ends |
-| **keep** | `score < --threshold-trim` | keep both, untouched |
+| **evidence** | score ≥ `T = log2(N / α)`, `N = len1 + len2 − 1` | at most `α` chance merges of *unrelated* sequence per pair |
+| **plausibility** | mismatches ≤ `dfit[n]`, the most a true `n`-base overlap shows with probability ≥ `α` at `--error-rate` | at most `α` true overlaps refused per pair |
 
-Three parameters, all with units. Both thresholds read one calibrated scale, so `T` bits
-tolerates a spurious rate of about `N · 2^-T` over the `N ≈ 2 · readlen` candidate
-shifts — the default 28 is one spurious merge in 10⁶ pairs *against chance alignment*
-(measured: 0 in 40,000 uniform-random pairs, at every read length from 50 to 300). It is
-not a bound against real sequence, where reads share genuine homology and repeat
-content. Trim sits far lower only because a wrong trim deletes bases from a read tail
-while a wrong merge invents sequence.
+One tolerance, `--alpha` (default `1e-6`), sets both. The floor is derived per pair, so
+it follows the read length: 26.6 bits at 2×50, 28.2 at 2×150, 29.2 at 2×300 — the
+shortest clean overlap that can merge is 14–15 bases. The plausibility test is what
+catches a long *divergent* repeat outscoring a short true overlap (122 bases with 19
+mismatches, where a true overlap of that length shows at most 9 at 1%): the pair is
+kept whole, and nothing is searched for in its place, because re-placing it landed on
+another wrong shift for 37–38% of caught wrong merges on held-out genes.
 
-The overlap sits at the 3' end of **both** mates — each read starts at a fragment end
-and reads inward — so a trim splits it between them. The emitted pair tiles the fragment
-exactly once and comes out at equal length, and where the mates disagree both carry the
-consensus call.
+Three things the merge does **not** do, all deliberately:
 
-#### Choosing `--threshold-merge`, measured against ground truth
+- **It does not trim unmerged pairs.** 0.5.x split the redundant overlap of a weakly
+  overlapping pair between its mates' 3' ends; that trim band caused every wrong trim and
+  every rewritten base in a kept mate, and 0.6 removed it. A kept mate is its input,
+  changed by nothing but `--npolicy`.
+- **It does not remove adapters by sequence.** A read contains adapter only when its
+  insert is shorter than the read, so the mates overlap completely and the merged record
+  `[0, L)` excludes the adapter — that *is* overlap-based adapter removal, and it is the
+  default. If adapters were already trimmed, say so (below).
+- **It does not bound near-identical repeats.** A perfect 15-base repeat, or 7
+  mismatches in 64, is plausible under any error model and still merges. No threshold
+  reaches zero there; see the table below for what is left.
 
-The defaults are not a guess. On 1,000,000 simulated pairs from hg38 with the true
-fragment length known exactly ([docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md)),
-against fastp 1.1.0 at its own defaults:
+#### `--error-rate`: a setting, checked against the data
 
-| setting | chimera rate¹ | sensitivity² | merges that are wrong | reconstructed exactly³ |
-|---|---:|---:|---:|---:|
-| **`--threshold-merge 28`** (default) | 1.231% | **99.83%** | 0.96% | 86.59% |
-| `--threshold-merge 60` | 0.597% | 92.63% | 0.55% | 88.87% |
-| `--threshold-merge 100` | 0.245% | 83.57% | 0.29% | 91.39% |
-| fastp defaults | 0.621% | 92.98% | 0.65% | 85.90% |
+`--error-rate E` (default `0.01`) is the expected fraction of positions at which the two
+mates **disagree** where they truly overlap — about twice the per-base sequencing error,
+since either read can be wrong. It is a documented setting, not an estimate, and it has
+two jobs:
 
-¹ fraction of pairs with **no true overlap** that were merged anyway — the false-positive
-rate. ² fraction of pairs with a true overlap ≥ 15 bases that merged. ³ merged records
-equal to the true fragment, base for base.
+- in the **score** it sets strictness: a larger `E` makes a mismatch cost less, so
+  sequencing errors and repeat divergence are both tolerated more. It does not affect
+  the `α` bound on chance merges.
+- in the **plausibility test** it is a promise: true overlaps are refused at most `α` of
+  the time only if `E` is at least the library's real disagreement. Set too low, true
+  overlaps are refused and kept whole — never merged wrongly. A library that truly
+  disagrees at 3% loses 0.07–0.6% of them at the default; at 5%, 1–13%.
 
-**If you want fastp's false-positive rate, use `--threshold-merge 60.`** That is not a
-coincidence: 60 bits is 31 clean bases, which is essentially fastp's
-`--overlap_len_require 30`. At that matched operating point zna's sensitivity is the
-same (92.63% vs 92.98%) and its reconstruction is better (88.87% vs 85.90% exact),
-because the overlap consensus recovers 90.4% of recoverable overlap errors against
-fastp's 74.1%.
+Each run reports `detected_overlap_mismatch_rate`, the disagreement over every overlap
+the scan detected, and `expected_refused_true_overlap_fraction`, the share of those
+overlaps the plausibility test is expected to refuse at `E` if they are true and
+disagree at that rate. **It warns when that share exceeds 0.1%**, with the number of
+pairs refused and a suggested value. Raising `E` is a trade, not a free fix: it recovers
+the refused pairs, but every mismatch then costs less, so more short or divergent
+overlaps merge, false ones included — on a simulated 3'-degraded library, 240 wrong
+merges at 0.01 against 745 at the suggested 0.036. Production RNA libraries measure
+~0.9% disagreement, and every full-scale benchmark expects under 4×10⁻⁹ refused; the
+setting is for poor or 3'-degraded libraries (2–5%) whose runs warn.
 
-**For best overall accuracy, keep the default 28.** It minimises false positives plus
-false negatives by a wide margin — 6,603 total errors per million pairs against 44,145
-for the fastp-equivalent setting. Raising the threshold trades ~10.9 extra missed merges
-for every wrong merge it prevents at 28→34, worsening to 15.7 at 28→60, so it only pays
-if a chimera costs you more than ~11x what a missed merge does. A missed merge is not
-lost data: the pair is still emitted, correctly bounded and with its redundant overlap
-trimmed.
+#### `--adapter-trimmed`: a declaration zna trusts, and checks
 
-**Tuning cannot reach zero.** At 100 bits — 3.6x the default — 1,403 wrong merges per
-million remain. Every one is a fragment whose two ends are genuinely homologous (median
-88% identity over 79 bases, hotspots entirely pericentromeric), and the scan never
-picks a lower-scoring alignment than the true one. That residue is a property of the
-genome, not of the threshold.
+Pass it when **no read extends past its molecule**: adapters were removed upstream, or
+the reads were clipped to the fragment. Read-through alignments are then impossible and
+are never merged, which removes the false read-throughs behind most lost fragments —
+on the clean transcriptome benchmark, declaring it took 0.5.3's 1,448 wrong merges to
+589 and its 34 lost fragments to 0, where the same run undeclared leaves 769 and 33, and
+gained 230 correct merges.
+
+**Never pass it for raw reads.** It forbids exactly the merges read-through pairs need —
+231,000 correct merges lost per million raw hg38 pairs. zna scans the first 100,000 pairs
+for strong read-through alignments and warns above 1% (honest input measures 0–0.11%,
+raw input 2–23%).
+
+**It is only as honest as the trimmer.** Trimming is the trimmer's job, not zna's: the
+declaration requires reads whose adapters were removed completely upstream. A
+read-through pair left with 1–3 bp of adapter can no longer align at its true length.
+With fastp, **drop `--cut_tail`**: it quality-trims R2's last base before fastp's overlap
+analysis, which hides R1's 1–2 bp adapter overhang. On 500,000 transcriptome pairs it
+leaves adapter on 42 pairs; without it, 7 (declared: 7 correct merges forgone, 0.002%,
+and 8 adapter bases emitted), which no fastp setting tried removes (fastp 1.1.0 and
+1.3.6 identical). One pass:
+
+```bash
+fastp -i R1.fq.gz -I R2.fq.gz -o R1.trim.fq.gz -O R2.trim.fq.gz \
+      --detect_adapter_for_pe --allow_gap_overlap_trimming \
+      --length_required 40    # + your length limits; no --cut_tail
+zna encode --merge-pairs --adapter-trimmed R1.trim.fq.gz R2.trim.fq.gz -o sample.zna
+```
+
+Declared, that input gives 664 wrong merges against 750 undeclared and 0 lost fragments
+against 15 (`docs/METHODS.md` §1.7 has the fastp variants measured). Leaving the flag
+off on trimmed reads is always safe; it only forgoes the gain.
+
+#### What it does, measured against ground truth
+
+zna 0.5.3 against 0.6 at the defaults, every pair classified against simulated truth
+(`docs/MERGE_BENCHMARK_RESULTS.md` §9). *Wrong merges* are merged records that are not
+their fragment; *lost* fragments were wrongly merged into a record too short to keep;
+*wrong trims* and *mate substitutions* are 0.5.3 kept pairs with real bases deleted or
+rewritten:
+
+| benchmark | pairs | wrong merges | lost | correct merges | wrong trims | mate substitutions |
+|---|---:|---|---|---|---|---|
+| hg38, raw reads | 1M | 5,086 → 2,132 | 505 → 495 | 577,517 = | 2,948 → 0 | 5,158 → 0 |
+| chr22, reads clipped to the molecule, declared | 1M | 950 → 245 | 96 → 0 | +76 | 1,454 → 0 | 1,755 → 0 |
+| transcriptome, clean, declared | 500k | 1,448 → 589 | 34 → 0 | +230 | 660 → 0 | 830 → 0 |
+| transcriptome, one fastp pass without `--cut_tail`, declared | 500k | 1,421 → 664 | 16 → 0 | +179, −7 | 662 → 0 | 2,148 → 0 |
+
+The plausibility test refused 5,632 pairs across the qualification's 4.11M, none of them
+at the true fragment length. What remains is the near-identical repeat above:
+2,131 of the 2,627 wrong merges on hg38 are pairs with no true overlap at all,
+concentrated in pericentromeric satellite, and on transcriptome input a handful of
+repeat-rich transcripts carry about half of them.
+
+**`--alpha` is the knob, and the default is 0.5.x's operating point.** At 2×150 the
+default reproduces 0.5.x's fixed 28 bits, which minimized false plus missed merges on
+the 0.5.x benchmark (6,603 per million, against 44,145 at fastp's operating point).
+Each factor of 10 in `α` moves the floor by 3.3 bits, ~1.7 bases; fastp's 30-base
+floor is worth about 60 bits, `--alpha 2.6e-16` at 2×150. On 0.5.x, raising the floor
+traded ~11 missed merges for every wrong merge prevented, and the plausibility test has
+since removed half of those wrong merges — so raising it only pays if a false fragment
+costs you much more than a missed one. A missed merge is not lost data: the pair is
+still emitted, whole and correctly bounded.
 
 **Usage:**
 
@@ -872,18 +949,28 @@ Required:
   --in2 FILE             R2 FASTQ (optionally .gz), positionally synced with --in1
   --out FILE             Output mixed interleaved FASTQ (.gz to gzip)
 
+Policy:
+  --alpha ALPHA          The one statistical tolerance (default: 1e-6): at most
+                         ALPHA chance merges of unrelated sequence, and at most
+                         ALPHA true overlaps refused, per pair. Exact decimal,
+                         in [1e-300, 1)
+  --error-rate E         Expected mate disagreement in a true overlap
+                         (default: 0.01). Exact decimal, in [1e-9, 0.75)
+  --adapter-trimmed      Declare that no read extends past its molecule;
+                         read-through alignments become impossible. Checked
+                         on the first 100,000 pairs. Never for raw reads
+  --min-read-length N    Drop emitted reads shorter than this (default: 40);
+                         an unmerged pair is dropped whole if either mate is
+                         short
+
 Options:
-  --json FILE            Write run statistics as JSON (counts, histograms, provenance)
-  --threshold-merge BITS Score at or above this merges the pair (default: 28.0)
-  --threshold-trim BITS  Score at or above this (but below merge) keeps both mates
-                         and splits the redundant overlap between their 3' ends
-                         (default: 8.0)
+  --json FILE            Write run statistics as JSON (counts, diagnostics,
+                         histograms, provenance)
   --npolicy {trim3,random}
                          No-call policy for an N the overlap could not rescue
                          from the mate (default: trim3; same flag and values
                          as zna encode)
   --seed N               Seed for --npolicy random (default: 42)
-  --min-read-length N    Drop emitted reads shorter than this (default: 40)
   --threads N            Merge worker threads (default: min(4, cpu count))
   --io-threads N         pigz threads for the gzipped output (default: 4)
   --chunk-size N         Read pairs per work unit (default: 2000)
@@ -894,18 +981,24 @@ Options:
   -q, --quiet            Suppress progress logging
 ```
 
+`--threshold-merge` and `--threshold-trim` were removed in 0.6 and are rejected: the
+floor is derived from `--alpha`, and there is no trim band.
+
+**What `--json` reports.** Counts (`merged`, `kept_pairs`, `implausible_refused`,
+`dropped_below_min_length`, …); the policy (`policy`, `error_rate`, `adapter_trimmed`,
+`params.alpha`, and the exact integer weights `params.match_q`/`step_q`); the two checks
+above (`detected_overlap_mismatch_rate`, `expected_refused_true_overlap_fraction`,
+`detected_overlap_length_histogram`, `readthrough_check_pairs`,
+`readthrough_check_strong_fraction`); `overlap_mismatch_rate` over the merged overlaps;
+and the emitted-length, overlap-length and insert-size histograms. Every value is finite
+and of a fixed type whatever the input, so a cohort gather can rely on the schema.
+
 **Speed.** The merge kernel is compiled C++ and releases the GIL, so `--threads` are
-real worker threads. It is not usually the bottleneck — inflate is — so **2 threads
-saturate and more does nothing**:
-
-| | µs/pair |
-|---|---:|
-| `--threads 1` | 2.78 |
-| `--threads 2` | **1.40** |
-| `--threads 4` | 1.43 |
-
-With gzip removed from both ends the tool runs at 0.42 µs/pair, so on compressed input
-it is I/O bound. (Apple silicon, 8 cores.)
+real worker threads. On plain FASTQ at `--threads 1`, 1M pairs take 0.92 s (0.76 s
+declared) against 0.5.3's 1.07 s — the higher floor prunes earlier, and the declaration
+halves the scan's work. On gzipped input the kernel is not the bottleneck, inflate is, so
+**2 threads saturate and more does nothing** (measured at 0.4.0: 2.78 µs/pair at
+`--threads 1`, **1.40** at 2, 1.43 at 4). `docs/PERFORMANCE.md` has the kernel numbers.
 
 > **Install `zna[fast]` if your input is gzipped.** Inflate is the largest single cost of
 > a merge — a profile at `--threads 1` puts a quarter of all cycles inside `pigz`'s
@@ -914,22 +1007,20 @@ it is I/O bound. (Apple silicon, 8 cores.)
 > `--threads 1` goes from 5.84 s to 4.04 s wall while also using less CPU. It is
 > optional — without it, `pigz` is used when on `PATH`, then stdlib `gzip`, exactly as
 > before. `zna merge` logs which one ran and records it in `--json`.
->
-> **0.5.2 also made the scan itself 2.04x faster on x86-64.** Every earlier number here
-> was measured on aarch64; on Linux/x86 the kernel had been reducing each vector compare
-> through a PLT call to libgcc's `__popcountdi2`. See CHANGELOG and `docs/METHODS.md` §2.4.
 
-**Determinism.** The score is computed in fixed-point integers and the argmax has a
-specified tie-break, so a given FASTQ produces **byte-identical output on any platform,
-compiler and thread count**. `--backend python` selects the pure-Python reference
-implementation, which exists as an oracle for the compiled one; it is ~50x slower and
-is never chosen for you.
+**Determinism.** The score is computed in fixed-point integers, the floor and the
+plausibility table are exact integers derived once per run with no floating point, and
+the argmax has a specified tie-break, so a given FASTQ produces **byte-identical output
+on any platform, compiler and thread count**. `--backend python` selects the
+pure-Python reference implementation, which exists as an oracle for the compiled one;
+it is ~50x slower and is never chosen for you.
 
 **Output** is one stream mixing both shapes: merged reads as single records with the
 `/1`,`/2` suffix stripped, unmerged pairs as adjacent `/1`,`/2` records. Feed it to
 `zna encode --interleaved --treat-unpaired-as-merged`, which is exact here because
 merged records span their fragment and unmerged pairs are emitted all-or-nothing —
-never a lone mate.
+never a lone mate. `zna encode --merge-pairs` does both in one step and also records the
+merge policy in the file (below).
 
 #### Per-record provenance
 
@@ -967,15 +1058,40 @@ and nothing changes. There is no provenance-specific code in the encoder.
 
 | bit | | set when |
 |---:|---|---|
-| 1 | trimmed | the pair's redundant overlap was split between its mates |
-| 2 | rescued | ≥1 no-call was recovered from the mate |
+| 1 | *retired* | was "trimmed" in 0.5.x (the trim band); never set since 0.6, and never reused |
+| 2 | rescued | ≥1 no-call in a merged record was recovered from the mate |
 | 4 | N-trimmed | ≥1 base was removed by `--npolicy trim3` |
 | 8 | N-substituted | ≥1 base was invented by `--npolicy random` |
 
 There is deliberately **no "merged" bit**: that fact already has two homes, the
 `merged_` token here and `IS_FULL_FRAGMENT` in the corpus. Every bit above is one with
-nowhere else to live — a trimmed pair in particular is emitted as an ordinary pair, and
-nothing in the ZNA flag byte distinguishes it from one kept whole.
+nowhere else to live.
+
+#### File provenance: the merge record
+
+`zna encode --merge-pairs` writes the policy the records were merged under into the
+file's prologue, and `zna shuffle` and re-encode carry it verbatim:
+
+```
+$ zna inspect sample.zna
+...
+--- Provenance ---
+Writer:           zna 0.6.0
+Shuffled:         False
+Merged in-process:True
+Merge record:
+  adapter_trimmed:   False
+  alpha:             0.000001
+  error_rate:        0.01
+  min_read_length:   40
+  npolicy:           trim3
+  policy:            zna-merge-0.6
+  zna_version:       0.6.0
+```
+
+`policy` changes whenever the merge decision does, so check it rather than the writer
+version. A file made by the two-step path, or by zna < 0.6, has **no** merge record, and
+that means *unknown* — not some default policy.
 
 **Examples:**
 
@@ -986,19 +1102,22 @@ zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
 # With run statistics for a pipeline to collect
 zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz --json merge.json
 
-# Straight into a training corpus
-zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz
-zna encode --interleaved --treat-unpaired-as-merged --strand-normalize \
-           --shuffle merged.fq.gz -o reads.zna
+# Adapter-trimmed input (see above for the fastp command)
+zna merge --in1 R1.trim.fq.gz --in2 R2.trim.fq.gz --out merged.fq.gz --adapter-trimmed
+
+# Straight into a training corpus, with the policy recorded in the file
+zna encode --merge-pairs --adapter-trimmed --strand-normalize --shuffle \
+           R1.trim.fq.gz R2.trim.fq.gz -o reads.zna
 ```
 
 **Boundary guarantee.** Base 0 of every emitted read is a true fragment boundary —
-nothing is ever removed from a read's 5' end, and trimming only ever cuts 3' ends. A
-merged record is the tool's assertion of its fragment. This is what makes `IS_RC` and
-`IS_FULL_FRAGMENT` honest for merged input; verified at 0 violations over 1,416,630
-records against genome truth. See [docs/METHODS.md](docs/METHODS.md) for the derivation
-and [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) for the
-verification.
+nothing is ever removed from a read's 5' end: a merged record is built from R1's 5' end,
+a kept mate is its input, and the only thing that ever shortens a read is
+`--npolicy trim3`, which cuts at the first `N` and keeps the 5' part. A merged record is
+the tool's assertion of its fragment. This is what makes `IS_RC` and `IS_FULL_FRAGMENT`
+honest for merged input; verified at 0 violations over 1,416,630 records against genome
+truth. See [docs/METHODS.md](docs/METHODS.md) for the derivation and
+[docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) for the verification.
 
 ---
 

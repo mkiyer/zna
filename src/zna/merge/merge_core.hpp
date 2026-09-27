@@ -230,18 +230,36 @@ struct ScanResult {
     int mismatches;
 };
 
-/// Best-scoring shift over s in [-(len2-1), len1-1], on the signed single axis.
-inline ScanResult scan(const uint8_t* s1, int len1, const uint8_t* s2rc, int len2,
-                       int64_t match_q, int64_t step_q, int64_t floor_q) noexcept {
+/// Best-scoring ELIGIBLE shift on the signed single axis, with `floor_q` as the least
+/// score that counts. Mirrors `_pymerge.scan`.
+///
+/// Eligible is every s in [-(len2-1), len1-1] by default. Under `adapter_trimmed` -- the
+/// declaration that no read extends past its molecule -- only s >= max(0, len1 - len2),
+/// i.e. inferred fragment L = s + len2 >= max(len1, len2). In the loops that is exactly
+/// two things: the plateau shrinks to its last shift, and the read-through flank is
+/// never visited (every shift on it is < plo <= 0). Restricting eligibility removes
+/// shifts from the visiting order without reordering the rest, so the argmax total
+/// order holds over the eligible set unchanged.
+///
+/// **The contract is a template parameter, not a runtime test in the flank loop.** With
+/// `if (!adapter_trimmed)` inside the loop the undeclared scan measured 0.494 us/pair on
+/// 1M chr22 pairs -- 6% SLOWER than 0.5.3's 0.466 despite a floor 20 bits higher; as two
+/// instantiations it is 0.400, and `process_pair` 0.612 -> 0.519 (declared 0.362 ->
+/// 0.337, dev panel 0.709 -> 0.609 raw and 0.392 -> 0.363 declared; Apple M3 Max,
+/// clang -O3, median of 7).
+template <bool ADAPTER_TRIMMED>
+inline ScanResult scan_eligible(const uint8_t* s1, int len1, const uint8_t* s2rc,
+                                int len2, int64_t match_q, int64_t step_q,
+                                int64_t floor_q) noexcept {
     const int nmax = len1 < len2 ? len1 : len2;
     if (nmax <= 0) return {0, 0, 0, 0};
 
     int64_t best = floor_q - 1;        // a score exactly equal to floor_q must win
     int best_s = 0, best_n = 0, best_d = 0;
 
-    // The plateau: every shift achieving the maximal overlap, ascending.
-    const int plo = (len1 >= len2) ? 0 : len1 - len2;
+    // The plateau: every eligible shift achieving the maximal overlap, ascending.
     const int phi = (len1 >= len2) ? len1 - len2 : 0;
+    const int plo = ADAPTER_TRIMMED ? phi : ((len1 >= len2) ? 0 : len1 - len2);
     for (int s = plo; s <= phi; ++s) {
         int d = 0;
         const int64_t v = shift_score(s1, s2rc, s, nmax, match_q, step_q, best, &d);
@@ -252,15 +270,123 @@ inline ScanResult scan(const uint8_t* s1, int len1, const uint8_t* s2rc, int len
     for (int n = nmax - 1; n > 0; --n) {
         if (static_cast<int64_t>(n) * match_q <= best) break;
         int d = 0;
-        int64_t v = shift_score(s1, s2rc, n - len2, n, match_q, step_q, best, &d);
-        if (v > best) { best = v; best_s = n - len2; best_n = n; best_d = d; }
-        d = 0;
+        int64_t v;
+        if (!ADAPTER_TRIMMED) {
+            v = shift_score(s1, s2rc, n - len2, n, match_q, step_q, best, &d);
+            if (v > best) { best = v; best_s = n - len2; best_n = n; best_d = d; }
+            d = 0;
+        }
         v = shift_score(s1, s2rc, len1 - n, n, match_q, step_q, best, &d);
         if (v > best) { best = v; best_s = len1 - n; best_n = n; best_d = d; }
     }
 
     if (best_n == 0) return {0, 0, 0, 0};
     return {best_s, best, best_n, best_d};
+}
+
+inline ScanResult scan(const uint8_t* s1, int len1, const uint8_t* s2rc, int len2,
+                       int64_t match_q, int64_t step_q, int64_t floor_q,
+                       bool adapter_trimmed = false) noexcept {
+    return adapter_trimmed
+        ? scan_eligible<true>(s1, len1, s2rc, len2, match_q, step_q, floor_q)
+        : scan_eligible<false>(s1, len1, s2rc, len2, match_q, step_q, floor_q);
+}
+
+/// The two exact policy tables, as `zna/merge/params.py` derives them (int64, borrowed
+/// from the caller -- nothing here copies, owns or derives a table).
+///
+///   * `t_q[N]`, N = len1 + len2 - 1: the pair's merge floor log2(N / alpha) in fixed
+///     point. Covers reads up to `t_len / 2` bases.
+///   * `dfit[n]`: the most mismatches a TRUE overlap of n bases shows with probability
+///     >= alpha. Covers overlaps up to `dfit_len - 1`.
+///
+/// No float and no libm reaches a decision: both are integers computed once per run in
+/// Python with `decimal`/`Fraction`, so the two backends compare the same numbers.
+struct Tables {
+    const int64_t* t_q;
+    size_t t_len;
+    const int64_t* dfit;
+    size_t dfit_len;
+
+    /// The longest read both tables cover. Mirrors `_pymerge.table_capacity`.
+    int64_t capacity() const noexcept {
+        const int64_t cap = static_cast<int64_t>(t_len / 2);
+        const int64_t dcap = static_cast<int64_t>(dfit_len) - 1;
+        return cap < dcap ? cap : dcap;
+    }
+};
+
+/// `overlap` verdicts. Mirror `VERDICT_*` in `_pymerge.py`.
+constexpr int VERDICT_NONE = 0;
+constexpr int VERDICT_MERGE = 1;
+constexpr int VERDICT_IMPLAUSIBLE = 2;
+
+/// One pair's overlap decision (`_pymerge._decide`): the scan's winner W, the verdict on
+/// it, and W's positions where exactly one mate / both mates read `N`.
+struct Decision {
+    int verdict;
+    ScanResult w;       ///< all zero for VERDICT_NONE
+    int one_n;          ///< one-sided N positions in W (all of them mismatches)
+    int both_n;         ///< N-against-N positions in W (all of them matches)
+};
+
+/// `(one_sided, both)`: positions of the overlap at shift `s` where exactly one mate
+/// reads `N`, and where both do. Mirrors `_pymerge._n_positions`.
+///
+/// Neither says anything about whether the mates agree. A one-sided N is a mismatch in
+/// the scan, so the gate discounts it; N against N is a match, so the detected-overlap
+/// rate discounts it from the compared bases. Byte `N` only: the parser upper-cases,
+/// and IUPAC codes compare as themselves.
+///
+/// Gated on `memchr` over the two overlap slices, which is what keeps an N-free overlap
+/// -- nearly every one -- at the cost of two vectorised searches rather than a counting
+/// loop. The reference gates on the whole reads; the count is identical either way,
+/// since an N outside the overlap contributes nothing to it.
+inline void n_positions(const uint8_t* s1, const uint8_t* s2rc, int s, int n,
+                        int* one, int* both) noexcept {
+    *one = *both = 0;
+    if (n <= 0) return;
+    const uint8_t* a = s1 + (s > 0 ? s : 0);
+    const uint8_t* b = s2rc + (s < 0 ? -s : 0);
+    if (!std::memchr(a, 'N', static_cast<size_t>(n)) &&
+        !std::memchr(b, 'N', static_cast<size_t>(n))) {
+        return;
+    }
+    int o = 0, t = 0;
+    for (int k = 0; k < n; ++k) {
+        const int x = a[k] == 'N', y = b[k] == 'N';
+        o += x ^ y;
+        t += x & y;
+    }
+    *one = o;
+    *both = t;
+}
+
+/// The authoritative overlap decision for one pair (plan §2; `_pymerge._decide`).
+///
+///   W = the best eligible shift with the pair's own floor T_q[len1 + len2 - 1];
+///       nothing reaching it is VERDICT_NONE.
+///   d_inf = W's mismatches minus its one-sided N positions;
+///       d_inf > dfit[n_W] is VERDICT_IMPLAUSIBLE -- abstain, never re-place: nothing
+///       is searched for in W's place.
+///   otherwise VERDICT_MERGE.
+///
+/// The gate is one table lookup on the winner and adds no state to the scan loop. The
+/// caller guarantees the tables cover max(len1, len2) (`Tables::capacity`); then
+/// N <= 2*cap - 1 < t_len and n_W <= cap <= dfit_len - 1, so both lookups are in range.
+inline Decision decide(const uint8_t* s1, int len1, const uint8_t* s2rc, int len2,
+                       int64_t match_q, int64_t step_q, const Tables& tab,
+                       bool adapter_trimmed) noexcept {
+    Decision out{VERDICT_NONE, {0, 0, 0, 0}, 0, 0};
+    if (len1 <= 0 || len2 <= 0) return out;
+    const ScanResult w = scan(s1, len1, s2rc, len2, match_q, step_q,
+                              tab.t_q[len1 + len2 - 1], adapter_trimmed);
+    if (w.overlap_len == 0) return out;
+    out.w = w;
+    n_positions(s1, s2rc, w.shift, w.overlap_len, &out.one_n, &out.both_n);
+    out.verdict = (w.mismatches - out.one_n > tab.dfit[w.overlap_len])
+                      ? VERDICT_IMPLAUSIBLE : VERDICT_MERGE;
+    return out;
 }
 
 // ===========================================================================
@@ -292,8 +418,6 @@ inline void revcomp_into(const uint8_t* s, int n, uint8_t* out) noexcept {
     for (int i = 0; i < n; ++i) out[i] = COMPLEMENT.t[s[n - 1 - i]];
 }
 
-inline uint8_t complement_base(uint8_t c) noexcept { return COMPLEMENT.t[c]; }
-
 struct Span {
     const uint8_t* p;
     int n;
@@ -307,17 +431,22 @@ struct OutRec {
     Span h, s, q;
 };
 
-enum Outcome { OUTCOME_MERGED = 0, OUTCOME_TRIMMED = 1, OUTCOME_KEPT = 2 };
+/// Pair outcomes: merged into one record or kept as two. There is no third outcome --
+/// 0.6 removed the trim band (MERGE_ACCURACY_PLAN.md §2). Mirrors `MERGED`/`KEPT` in
+/// `_pymerge.py`.
+enum Outcome { OUTCOME_MERGED = 0, OUTCOME_KEPT = 1 };
 
 struct Params {
-    int64_t match_q, step_q, t_merge_q, t_trim_q;
+    int64_t match_q, step_q;
+    Tables tab;                  ///< T_q and dfit, borrowed; see Tables
+    bool adapter_trimmed;        ///< the declaration: read-through is impossible
     int min_read_length;
     const uint8_t* disagree_q;   ///< 256*256, built in Python (params.py)
     /// What to do with a no-call the overlap could not rescue from the mate.
     /// 0 = keep it (internal/testing), 1 = trim3, 2 = random. Same vocabulary as
     /// `zna encode --npolicy`, deliberately: one flag, one meaning, both tools.
     int npolicy = 1;
-    uint64_t rng_seed = 0;       ///< for NPOLICY_RANDOM; see zna_sub_base
+    uint64_t rng_seed = 0;       ///< for NPOLICY_RANDOM; see merge_sub_base
 };
 
 constexpr int NPOLICY_KEEP = 0;
@@ -345,7 +474,9 @@ constexpr int NPOLICY_RANDOM = 2;
 ///
 /// The vocabulary is shared with `zna encode --merge-pairs` (0.5.0), which computes the
 /// same `PairResult` and writes the same bits with no FASTQ in between.
-constexpr int PROV_TRIMMED   = 1;   ///< from a pair whose redundant overlap was split
+///
+/// Bit 1 was PROV_TRIMMED until 0.6 removed the trim band. It is retired rather than
+/// reused, so a set bit in any corpus still means one thing.
 constexpr int PROV_RESCUED   = 2;   ///< >=1 no-call recovered from the mate
 constexpr int PROV_NTRIMMED  = 4;   ///< >=1 base removed by --npolicy trim3
 constexpr int PROV_NSUBBED   = 8;   ///< >=1 base substituted by --npolicy random
@@ -383,7 +514,7 @@ constexpr size_t NAME_RESERVE = 128;
 /// never allocates. Measured 27% faster than sizing buffers per pair, because dropping
 /// the fixed-size assumption is what makes the copy-on-write below natural.
 struct Scratch {
-    std::vector<uint8_t> s2rc, q2r, s1b, q1b, s2b, q2b, seq, qual, name, name2;
+    std::vector<uint8_t> s2rc, q2r, s1b, q1b, s2b, seq, qual, name, name2;
     size_t cap = 0;
 
     void ensure(size_t n) {
@@ -391,7 +522,7 @@ struct Scratch {
         size_t c = cap ? cap : 1024;
         while (c < n) c <<= 1;
         s2rc.resize(c); q2r.resize(c); s1b.resize(c); q1b.resize(c);
-        s2b.resize(c); q2b.resize(c);            // R2 gets consensus written into it too
+        s2b.resize(c);                           // R2's copy, for --npolicy random only
         seq.resize(2 * c); qual.resize(2 * c);   // a merged record is at most len1+len2
         cap = c;
     }
@@ -415,8 +546,8 @@ struct Scratch {
 
     /// The second name buffer, for R2 of an unmerged pair.
     ///
-    /// A merged pair emits one record and needs one buffer; a kept or trimmed pair emits
-    /// two, and both mates can carry provenance of their own. Sizing this from R2's
+    /// A merged pair emits one record and needs one buffer; a kept pair emits two, and
+    /// both mates can carry provenance of their own. Sizing this from R2's
     /// header rather than R1's matters -- the two are usually the same length, but
     /// nothing guarantees it.
     void ensure_name2(size_t n) {
@@ -432,34 +563,47 @@ struct PairResult {
     int n_recs;
     int outcome;
     int n_dropped;
+    /// The alignment the pair was merged from -- all zero when no overlap was admitted,
+    /// including when one was refused as implausible. Kept when a MERGE verdict falls
+    /// back to KEPT because trim3 broke tiling, exactly as the reference reports it.
+    int shift;
     int64_t score_q;
     int overlap_len;
     int mismatches;
     int bases_consensus_changed;
-    int trim_guard_fired;
+    /// 1 when the best alignment reached T but failed the plausibility gate.
+    int implausible;
     /// Bases the N policy removed (trim3) or invented (random). Reported so a library
     /// that loses a lot of sequence to no-calls says so, instead of finishing quietly.
     int npolicy_bases;
-    /// No-calls the overlap recovered from the mate, which cost nothing.
+    /// No-calls the overlap recovered from the mate, which cost nothing. Always R1's:
+    /// the merged record takes the overlap from R1, and only it is built from the
+    /// consensus.
     int n_rescued;
-    /// The same two quantities split per MATE, for the per-record header tokens.
-    ///
-    /// `npolicy_bases == npolicy_1 + npolicy_2` and `n_rescued == n_rescued_1 +
-    /// n_rescued_2` always, so the run-level counters keep their exact previous values
-    /// and the 15-field counter tuple does not grow. That is deliberate: `_fold` in
-    /// merge/cli.py sums a fixed prefix, and a counter added past it reports zero.
+    /// The N-policy count split per MATE, for the per-record header tokens;
+    /// `npolicy_bases == npolicy_1 + npolicy_2` always.
     int npolicy_1, npolicy_2;
-    int n_rescued_1, n_rescued_2;
+    /// The run's diagnostics (plan §4). None of them affects a decision.
+    ///   det_bases / det_mismatches: informative positions and informative mismatches
+    ///     of the best alignment whenever it reached T -- MERGE and IMPLAUSIBLE alike,
+    ///     i.e. BEFORE the gate, which is what a too-low --error-rate makes wrong.
+    ///   rt_strong: with the read-through check on, 1 when the UNRESTRICTED best shift
+    ///     reaches T as a read-through (L < max(len1, len2)).
+    ///   det_len: that detected overlap's length, the n its gate looked up dfit[n] at
+    ///     (0 when nothing reached T). Its histogram is what the run's expected share of
+    ///     refused true overlaps is computed over.
+    int det_bases, det_mismatches, rt_strong, det_len;
     /// Provenance bits per emitted record, parallel to `recs`. See PROV_* above.
     int prov[2];
 };
 
 /// Resolve overlap disagreements into R1 alone, by posterior. Returns bases *changed*.
 ///
-/// Used for a MERGED pair, where R1's copy of the overlap is the one emitted -- R2
-/// contributes only *outside* it, so its copy is discarded and there is nothing to
-/// correct. Every other case that corrects at all corrects both mates
-/// (`consensus_pair`); see `process_pair` for the rule.
+/// R1 alone, because the merged record is the only record built from the overlap: it
+/// takes the overlap from R1 and R2 contributes only outside it, so R2's copy is
+/// discarded. (0.5.x also wrote R2 on its trim path, where each mate kept part of the
+/// overlap; the trim path is gone.) A KEPT pair gets no consensus at all -- nothing about
+/// it depends on the alignment being right.
 ///
 /// **N rescue.** An `N` carries no base information, so a real call on the other mate
 /// beats it whatever the two quality scores say, and the rescued base keeps the
@@ -498,119 +642,35 @@ inline int consensus_r1(uint8_t* s1, uint8_t* q1, const uint8_t* s2rc,
     return changed;
 }
 
-/// Resolve overlap disagreements into **both** mates, by posterior. Returns bases
-/// *changed* in R1 (the historical counter; the same decisions are written to R2).
+/// One mate after the N policy (`_pymerge._npolicy_mate`): the sequence to emit, its
+/// length, and the bases the policy touched -- cut off under trim3, substituted under
+/// random (`rec` = 2 * pair_index + mate, which is what makes substitution
+/// position-derived), none under keep.
 ///
-/// Used **only** on the trim path, where the pair keeps roughly half the overlap in each
-/// read, so R2's copy does reach the corpus. Writing only R1 -- correct while R1 kept
-/// the whole overlap -- would emit R2's *uncorrected* bases for its half, giving back
-/// part of the consensus exactly where the mates disagreed.
-///
-/// Restricting it to that branch is not an optimisation. Written on every detected
-/// overlap it rewrites bases around a fragment boundary on an inference too weak to
-/// merge on -- measured, 237 corrupted 5. ends per million pairs.
-///
-/// Note `shift >= 0` is NOT what makes this safe, though it was once claimed to be. The
-/// real bound is  min written R2 index = max(0, len2 - len1 + shift),  which for
-/// unequal-length mates reaches index 0 at non-negative shifts: 9 of those 237 are at
-/// `shift >= 0`. What keeps the TRIM branch clear of R2. s 5. end is `trim_is_allowed`,
-/// which forces `shift >= min_read_length`.
-///
-/// `s2` and `q2` are R2 in its OWN orientation, which is how it is emitted; overlap
-/// slot `ib` of the reverse-complemented axis is R2 index `len2 - 1 - ib`, and the base
-/// stored there is the complement of the resolved call.
-inline int consensus_pair(uint8_t* s1, uint8_t* q1, uint8_t* s2rc, uint8_t* q2r,
-                          uint8_t* s2, uint8_t* q2, int len2, int s, int olen,
-                          const uint8_t* disagree_q,
-                          int* rescued1, int* rescued2) noexcept {
-    const int a0 = s > 0 ? s : 0;      // mirrors the scan's overlap alignment
-    const int b0 = s < 0 ? -s : 0;
-    int changed = 0;
-    for (int i = 0; i < olen; ++i) {
-        const int ia = a0 + i, ib = b0 + i;
-        if (s1[ia] != s2rc[ib]) {
-            const uint8_t qa = q1[ia], qb = q2r[ib];
-            const int j2 = len2 - 1 - ib;                  // same base, R2's frame
-            const bool a_is_n = s1[ia] == 'N', b_is_n = s2rc[ib] == 'N';
-            if (a_is_n != b_is_n) {             // rescue: a real call beats an N
-                // Charged to the mate that was REPAIRED, so each emitted record's
-                // `rescued_<n>` token counts only its own recovered no-calls.
-                if (a_is_n) {                   // R2 rescues R1
-                    ++*rescued1;
-                    s1[ia] = s2rc[ib];
-                    q1[ia] = qb;
-                    ++changed;                  // `changed` counts R1 only, by contract
-                } else {                        // R1 rescues R2
-                    ++*rescued2;
-                    s2rc[ib] = s1[ia];
-                    q2r[ib] = qa;
-                    s2[j2] = complement_base(s1[ia]);
-                    q2[j2] = qa;
-                }
-            } else if (a_is_n) {                // both N: nothing to rescue from
-                continue;
-            } else if (qb > qa) {               // R2 is the better-supported call
-                const uint8_t nq = disagree_q[(size_t)qb * 256 + qa];
-                s1[ia] = s2rc[ib];
-                q1[ia] = nq;
-                q2r[ib] = nq;
-                q2[j2] = nq;
-                ++changed;
-            } else {                            // R1 wins, but contested: derate it
-                const uint8_t nq = disagree_q[(size_t)qa * 256 + qb];
-                q1[ia] = nq;
-                s2rc[ib] = s1[ia];
-                q2r[ib] = nq;
-                s2[j2] = complement_base(s1[ia]);
-                q2[j2] = nq;
-            }
-        }
+/// trim3 cuts at the first N, keeping [0, first_N): 3' only, so base 0 -- a fragment
+/// terminus -- is never disturbed, and the quality span is the same pointer, shorter.
+/// random writes into `buf` (copying `s` there first unless it already IS `buf`, since
+/// memcpy with src == dst is undefined) and leaves the length alone.
+struct MateOut {
+    const uint8_t* s;
+    int n;
+    int touched;
+};
+
+inline MateOut npolicy_mate(const uint8_t* s, int n, uint8_t* buf, int npolicy,
+                            uint64_t seed, uint64_t rec) noexcept {
+    if (npolicy == NPOLICY_KEEP || n <= 0) return {s, n, 0};
+    const uint8_t* first = static_cast<const uint8_t*>(
+        std::memchr(s, 'N', static_cast<size_t>(n)));
+    if (!first) return {s, n, 0};
+    const int k = static_cast<int>(first - s);
+    if (npolicy == NPOLICY_TRIM3) return {s, k, n - k};
+    if (s != buf) std::memcpy(buf, s, static_cast<size_t>(n));
+    int touched = 0;
+    for (int i = k; i < n; ++i) {
+        if (buf[i] == 'N') { buf[i] = merge_sub_base(seed, rec, i); ++touched; }
     }
-    return changed;
-}
-
-/// Emitted lengths for a trimmed pair: as close to equal as the geometry allows.
-///
-/// The pair must tile the fragment exactly once, so `keep1 + keep2 == L` is forced and
-/// the only freedom is where the cut falls. Splitting the overlap down the middle
-/// (rather than taking all of it off R2) keeps the two emitted reads the same length,
-/// which is what downstream aligners and models expect, and it discards the *last*
-/// cycles of both reads -- the lowest-quality bases in the pair -- instead of one
-/// read's entire copy.
-///
-/// `keep1` is clamped into `[L - len2, len1]`, the range in which both reads can supply
-/// their share; for equal-length mates that clamp never binds and this is exactly
-/// "cut `olen / 2` from each".
-inline void balanced_split(int L, int len1, int len2, int& keep1, int& keep2) noexcept {
-    int k = (L + 1) / 2;                       // odd overlap: the extra base stays on R1
-    const int lo = L - len2;
-    if (k < lo) k = lo;
-    if (k > len1) k = len1;
-    keep1 = k;
-    keep2 = L - k;
-}
-
-/// May this pair be trimmed at all? Each mate must reach at least `lr` bases past the
-/// other's 3' end.
-///
-/// Two things at once, and both matter:
-///
-///  1. **The guard.** A trim must never turn a usable pair into a dropped fragment.
-///     `balanced_split` clamps `keep1` into `[L - len2, len1]`, so `keep1 >= L - len2`
-///     and `keep2 >= L - len1`; requiring both of those to be at least `lr` therefore
-///     puts both emitted reads at or above the length filter, by construction.
-///
-///  2. **A ceiling on the overlap the trim band may act on.** For equal-length mates
-///     this is exactly the old rule `len2 - olen >= lr`, and it was doing more work than
-///     its name suggested: it refuses a trim whose inferred overlap covers nearly the
-///     whole read. Such an overlap is spurious almost by definition -- 145 clean bases
-///     score 288 bits and would have merged, so reaching the 8-28 bit trim band at that
-///     length takes a pile of mismatches. Dropping the rule when the trim became
-///     symmetric admitted exactly those pairs and cost 133 extra false trims, 17,214
-///     deleted bases and 9 corrupted 5' ends per million pairs -- all of them fragments
-///     with no true overlap at all.
-inline bool trim_is_allowed(int L, int len1, int len2, int lr) noexcept {
-    return (L - len1) >= lr && (L - len2) >= lr;
+    return {buf, n, touched};
 }
 
 /// Build one emitted record's name: the input header, then its provenance tokens.
@@ -697,175 +757,129 @@ inline Span name_for(Scratch& sc, int which, const Span& h, int bits, int npolic
     return {nm, nl};
 }
 
-/// Classify one pair and build its output records.
+/// Classify one pair and build its output records. Mirrors `_pymerge._process_pair_ex`.
 ///
-/// Every construction path takes from the 5' end, and trimming only ever cuts 3' ends,
-/// so base 0 of every emitted read stays a true fragment boundary. A merged record is
-/// built from the inferred span `L = s + len2`, so its length is `L` identically for
-/// every geometry -- do not reintroduce per-direction case analysis.
+/// The decision is `decide`'s verdict, and there are two outcomes:
+///
+///   MERGE            -> one full-fragment record (R1 wins ties in the posterior
+///                       consensus), unless trim3 has cut the mates so far that they no
+///                       longer tile the fragment, and then as below
+///   NONE/IMPLAUSIBLE -> both mates, unchanged apart from the N policy -- never the
+///                       consensus, which only a merged record uses
+///
+/// Every construction path takes from the 5' end, and trim3 only ever cuts 3' ends, so
+/// base 0 of every emitted read stays a true fragment boundary. A merged record is built
+/// from the inferred span `L = s + len2`, so its length is `L` identically for every
+/// geometry -- do not reintroduce per-direction case analysis.
+///
+/// `rt_check` asks for the read-through diagnostic (plan §4); the chunk adapters set it
+/// for the input's first pairs by input index. Without the declaration every shift is
+/// eligible, so the scan's own winner answers it for free; under it, one extra
+/// unrestricted scan runs. The caller guarantees the tables cover max(len1, len2).
 inline PairResult process_pair(const Read& r1, const Read& r2,
                                const Params& p, Scratch& sc,
-                               int64_t pair_index = 0) {
+                               int64_t pair_index = 0, bool rt_check = false) {
     const int len1 = r1.s.n, len2 = r2.s.n;
     sc.ensure(static_cast<size_t>(len1 > len2 ? len1 : len2));
 
     uint8_t* s2rc = sc.s2rc.data();
     revcomp_into(r2.s.p, len2, s2rc);
 
-    const ScanResult r = scan(r1.s.p, len1, s2rc, len2,
-                              p.match_q, p.step_q, p.t_trim_q);
+    const Decision dec = decide(r1.s.p, len1, s2rc, len2, p.match_q, p.step_q, p.tab,
+                                p.adapter_trimmed);
+    const ScanResult& w = dec.w;
 
     PairResult out{};
-    out.score_q = r.score_q;
-    out.overlap_len = r.overlap_len;
-    out.mismatches = r.mismatches;
+    out.implausible = dec.verdict == VERDICT_IMPLAUSIBLE;
+    // Compared positions minus the uninformative ones (all zero for VERDICT_NONE).
+    out.det_bases = w.overlap_len - dec.one_n - dec.both_n;
+    out.det_mismatches = w.mismatches - dec.one_n;
+    out.det_len = w.overlap_len;
+    if (rt_check && len1 > 0 && len2 > 0) {
+        int rs = w.shift, rn = w.overlap_len;
+        if (p.adapter_trimmed) {
+            const ScanResult u = scan(r1.s.p, len1, s2rc, len2, p.match_q, p.step_q,
+                                      p.tab.t_q[len1 + len2 - 1], false);
+            rs = u.shift;
+            rn = u.overlap_len;
+        }
+        out.rt_strong = (rn > 0 && rs + len2 < (len1 > len2 ? len1 : len2)) ? 1 : 0;
+    }
+
+    // Nothing is built from a refused alignment, and nothing about it is reported as
+    // the pair's alignment.
+    const bool merge = dec.verdict == VERDICT_MERGE;
+    if (merge) {
+        out.shift = w.shift;
+        out.score_q = w.score_q;
+        out.overlap_len = w.overlap_len;
+        out.mismatches = w.mismatches;
+    }
 
     const int lr = p.min_read_length;
-    const bool detected = r.overlap_len > 0;
-    const int L = r.shift + len2;          // inferred fragment length (meaningless if !detected)
+    const int L = out.shift + len2;        // the inferred fragment length, if merging
 
-    // PROVISIONAL decision, on the full reads. It settles where the consensus is written,
-    // and it carries the evidence forward: the score is a statement about this pair's
-    // FRAGMENT LENGTH, and trimming interior bases cannot change a fragment's length. The
-    // final decision is re-taken after trim3 below -- on GEOMETRY, never by re-scoring.
-    // See docs/NPOLICY_PLAN.md D4a.
-    const bool prov_merge = detected && r.score_q >= p.t_merge_q;
-    const bool prov_band = detected && r.shift >= 0 &&
-                           r.score_q >= p.t_trim_q && r.score_q < p.t_merge_q;
-    const bool prov_trim = prov_band && trim_is_allowed(L, len1, len2, lr);
-
-    // WHERE the consensus is written: into the records whose CONSTRUCTION depends on the
-    // overlap being real, and nowhere else.
+    // The consensus is written only into R1, and only on the merge verdict: the merged
+    // record takes the overlap from R1. A pair with no admitted overlap is emitted
+    // untouched -- an alignment too suspect to merge on is too suspect to rewrite bases
+    // on (measured under 0.5.x: of 3,068 kept pairs with a detected overlap, zero had
+    // found the true shift, and writing R1 there turned 1,379 correct bases wrong to fix
+    // 78).
     //
-    //   merged  -> R1 alone. R1's overlap region becomes the merged record; R2
-    //              contributes only outside it, so its copy is discarded.
-    //   trimmed -> both. Each mate keeps part of the overlap, so both copies are
-    //              emitted and both must carry the same call.
-    //   kept    -> neither. Nothing emitted depends on the alignment being right.
-    //
-    // The kept case is not a symmetry nicety, it is what the measurements say. A
-    // detection that lands in KEPT is spurious almost by construction, and for two
-    // independent reasons:
-    //
-    //   * shift >= 0 lands here only because `trim_is_allowed` refused it, which needs
-    //     shift < min_read_length and hence an inferred overlap over ~110 bases. A
-    //     genuine 110-base overlap scores ~218 bits and would have merged at 28. That is
-    //     the trim guard's own argument, and it applies verbatim here: an overlap too
-    //     suspect to CUT on is too suspect to REWRITE BASES on.
-    //   * shift < 0 (read-through) needs the overlap to equal the fragment length, so
-    //     scoring in [8, 28) requires a 5-14 bp fragment.
-    //
-    // Measured on 1M ground-truth pairs: of 3,068 kept pairs carrying a detected
-    // overlap, ZERO found the true shift and 97.3% had no true overlap at all. Wrong
-    // emitted bases in the overlap window under the three candidate rules --
-    // correct-neither 208, correct-R1-only (the old behaviour) 1,509, correct-both
-    // 17,870. The old R1 write turned 1,379 correct bases wrong to fix 78.
-    //
-    // Note `shift >= 0` is NOT a safe proxy for "the write stays off R2's 5' end". The
-    // real bound is  min written R2 index = max(0, len2 - len1 + shift),  which for
-    // unequal-length mates reaches index 0 at non-negative shifts: 9 of the recorded 237
-    // corrupted 5' ends are at shift >= 0.
-    const bool write_r1 = prov_merge || prov_trim;
-    const bool write_r2 = prov_trim;
-
-    // Copy-on-write: a clean winning overlap (56.5% of real pairs) needs no mutable
-    // copy of either read at all, and only a trim needs R2 copied.
+    // Copy-on-write: a clean winning overlap (56.5% of real pairs) needs no mutable copy
+    // of either read at all.
     const uint8_t* S1 = r1.s.p;
     const uint8_t* Q1 = r1.q.p;
-    const uint8_t* S2 = r2.s.p;
-    const uint8_t* Q2 = r2.q.p;
-    if (r.mismatches > 0 && write_r1) {
+    const bool consensus = merge && w.mismatches > 0;
+    if (consensus) {
         uint8_t* q2r = sc.q2r.data();
         for (int i = 0; i < len2; ++i) q2r[i] = r2.q.p[len2 - 1 - i];
         uint8_t* s1b = sc.s1b.data();
         uint8_t* q1b = sc.q1b.data();
         std::memcpy(s1b, r1.s.p, static_cast<size_t>(len1));
         std::memcpy(q1b, r1.q.p, static_cast<size_t>(len1));
-        if (write_r2) {
-            uint8_t* s2b = sc.s2b.data();
-            uint8_t* q2b = sc.q2b.data();
-            std::memcpy(s2b, r2.s.p, static_cast<size_t>(len2));
-            std::memcpy(q2b, r2.q.p, static_cast<size_t>(len2));
-            out.bases_consensus_changed =
-                consensus_pair(s1b, q1b, s2rc, q2r, s2b, q2b, len2,
-                               r.shift, r.overlap_len, p.disagree_q,
-                               &out.n_rescued_1, &out.n_rescued_2);
-            S2 = s2b;
-            Q2 = q2b;
-        } else {
-            // The merged path rescues into R1 only -- R2's copy of the overlap is
-            // discarded -- so every rescue here is charged to mate 1.
-            out.bases_consensus_changed =
-                consensus_r1(s1b, q1b, s2rc, q2r, r.shift, r.overlap_len, p.disagree_q,
-                             &out.n_rescued_1);
-        }
+        out.bases_consensus_changed =
+            consensus_r1(s1b, q1b, s2rc, q2r, w.shift, w.overlap_len, p.disagree_q,
+                         &out.n_rescued);
         S1 = s1b;
         Q1 = q1b;
     }
 
-    // ---- trim3: cut each read at its first SURVIVING N -----------------------------
-    //
-    // After the rescue, so a no-call the mate could answer costs nothing. 3' only, so
-    // both 5' anchors -- the two fragment termini -- are untouched however short the
-    // reads get.
-    int elen1 = len1, elen2 = len2;
-    int shift = r.shift;
-    if (p.npolicy == NPOLICY_RANDOM) {
-        // Substitution does not change a length, so the coverage test below is
-        // unaffected and `random` never costs a merge -- unlike trim3.
-        bool any = false;
-        for (int i = 0; i < elen1 && !any; ++i) any = S1[i] == 'N';
-        for (int i = 0; i < elen2 && !any; ++i) any = S2[i] == 'N';
-        if (any) {
-            uint8_t* s1b = sc.s1b.data();
-            uint8_t* s2b = sc.s2b.data();
-            (void)0;  // S1/S2 may ALREADY be these buffers -- the consensus writes into them --
-            // and memcpy with src == dst is undefined. Copy only when they differ.
-            if (S1 != s1b) std::memcpy(s1b, S1, static_cast<size_t>(elen1));
-            if (S2 != s2b) std::memcpy(s2b, S2, static_cast<size_t>(elen2));
-            const uint64_t k1 = static_cast<uint64_t>(pair_index) * 2;
-            for (int i = 0; i < elen1; ++i) {
-                if (s1b[i] == 'N') { s1b[i] = merge_sub_base(p.rng_seed, k1, i);
-                                     ++out.npolicy_1; }
-            }
-            for (int i = 0; i < elen2; ++i) {
-                if (s2b[i] == 'N') { s2b[i] = merge_sub_base(p.rng_seed, k1 + 1, i);
-                                     ++out.npolicy_2; }
-            }
-            S1 = s1b; S2 = s2b;
-            revcomp_into(S2, elen2, s2rc);
-        }
-    } else if (p.npolicy == NPOLICY_TRIM3) {
-        int k1 = elen1, k2 = elen2;
-        for (int i = 0; i < elen1; ++i) { if (S1[i] == 'N') { k1 = i; break; } }
-        for (int i = 0; i < elen2; ++i) { if (S2[i] == 'N') { k2 = i; break; } }
-        if (k1 != elen1 || k2 != elen2) {
-            out.npolicy_1 = elen1 - k1;
-            out.npolicy_2 = elen2 - k2;
-            elen1 = k1;
-            elen2 = k2;
-            // `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to
-            // len2. R2 keeps its 5' anchor at fragment position L-1, so the trimmed mate
-            // covers [L - elen2, L) and the offset becomes L - elen2. L is unchanged --
-            // that is the whole point.
-            shift = L - elen2;
-            revcomp_into(S2, elen2, s2rc);       // s2rc must match the trimmed mate
-        }
-    }
+    // ---- the N policy, after the rescue, so a no-call the mate could answer costs
+    //      nothing. trim3 is 3' only, so both 5' anchors -- the two fragment termini --
+    //      are untouched however short the reads get.
+    const uint64_t rec1 = static_cast<uint64_t>(pair_index) * 2;
+    MateOut m1 = npolicy_mate(S1, len1, sc.s1b.data(), p.npolicy, p.rng_seed, rec1);
+    const MateOut m2 = npolicy_mate(r2.s.p, len2, sc.s2b.data(), p.npolicy, p.rng_seed,
+                                    rec1 + 1);
+    const uint8_t* Q2 = r2.q.p;
 
-    // ---- the final decision, on GEOMETRY, reusing the original evidence -------------
+    // ---- merge on GEOMETRY, reusing the evidence -----------------------------------
     //
     // The pair still tiles the fragment iff elen1 + elen2 >= L, and when it does the
-    // reconstruction IS the fragment, exactly and N-free. Nothing is re-scored.
-    const bool covers = detected && (elen1 + elen2) >= L;
-    const bool will_merge = prov_merge && covers;
-    const bool will_trim = !will_merge && prov_band && (elen1 + elen2) > L &&
-                           trim_is_allowed(L, elen1, elen2, lr);
+    // reconstruction IS the fragment, exactly and N-free. Nothing is re-scored: trimming
+    // cuts 3' ends, which is where a normal overlap lives, so a re-scan would refuse
+    // merges it had ample evidence for a moment earlier. Only trim3 changes a length, so
+    // only trim3 can turn a merge verdict into a kept pair here.
+    const bool will_merge = merge && (m1.n + m2.n) >= L;
 
-    // The run-level counters are the per-mate ones summed, so they keep their exact
-    // previous values and the counter tuple does not grow. See PairResult.
-    out.npolicy_bases = out.npolicy_1 + out.npolicy_2;
-    out.n_rescued = out.n_rescued_1 + out.n_rescued_2;
+    if (!will_merge && consensus) {
+        // A merge verdict that trim3 cut below tiling: the pair is KEPT, and a kept mate
+        // is the input with the N policy applied and nothing else (plan §2, and §8's
+        // "kept-mate substitutions are zero by construction"). The consensus -- its
+        // substitutions, derated qualities and rescues -- existed only to build the
+        // merged record, so R1 is re-derived from the input and none of it is counted.
+        // Under 0.5.x the rewritten R1 was emitted here (167 kept pairs on the dev
+        // panel's N benches, 10 of their substitutions to a wrong base).
+        m1 = npolicy_mate(r1.s.p, len1, sc.s1b.data(), p.npolicy, p.rng_seed, rec1);
+        Q1 = r1.q.p;
+        out.bases_consensus_changed = 0;
+        out.n_rescued = 0;
+    }
+
+    out.npolicy_1 = m1.touched;
+    out.npolicy_2 = m2.touched;
+    out.npolicy_bases = m1.touched + m2.touched;
 
     // Which policy bit a touched record earns. Set per RECORD, from that record's own
     // count -- a kept pair whose R1 lost bases and whose R2 did not says exactly that.
@@ -875,13 +889,19 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
     int n_cand;
 
     if (will_merge) {
-        // Enough evidence to assert the fragment: collapse to one read.
-        const int s = shift;
+        // `shift` is the offset of revcomp(R2) on the shared axis, so it is tied to R2's
+        // length. R2 keeps its 5' anchor at fragment position L-1, so a trimmed mate
+        // covers [L - elen2, L) and the offset becomes L - elen2. L itself is unchanged
+        // -- that is the whole point. s2rc must match the emitted mate, so it is rebuilt
+        // when the N policy changed R2 (a cut or a substitution).
+        const int elen1 = m1.n, elen2 = m2.n;
+        if (m2.s != r2.s.p || elen2 != len2) revcomp_into(m2.s, elen2, s2rc);
+        const int s = L - elen2;
         const int take1 = elen1 < L ? elen1 : L;
         const int take2 = L - take1;
         uint8_t* seq = sc.seq.data();
         uint8_t* qual = sc.qual.data();
-        std::memcpy(seq, S1, static_cast<size_t>(take1));
+        std::memcpy(seq, m1.s, static_cast<size_t>(take1));
         std::memcpy(qual, Q1, static_cast<size_t>(take1));
         if (take2) {
             const int b = take1 - s;
@@ -916,40 +936,16 @@ inline PairResult process_pair(const Read& r1, const Read& r2,
         n_cand = 1;
         paired = false;
         out.outcome = OUTCOME_MERGED;
-    } else if (will_trim) {
-        // Real overlap, but not enough evidence to risk a chimera: keep both reads and
-        // split the redundant overlap between them, so the fragment is tiled exactly
-        // once and the two emitted reads stay the same length.
-        int keep1, keep2;
-        balanced_split(L, elen1, elen2, keep1, keep2);
-        out.prov[0] = PROV_TRIMMED | (out.n_rescued_1 ? PROV_RESCUED : 0)
-                                   | (out.npolicy_1 ? npolicy_bit : 0);
-        out.prov[1] = PROV_TRIMMED | (out.n_rescued_2 ? PROV_RESCUED : 0)
-                                   | (out.npolicy_2 ? npolicy_bit : 0);
-        out.recs[0] = {name_for(sc, 0, r1.h, out.prov[0], p.npolicy,
-                                out.npolicy_1, out.n_rescued_1),
-                       {S1, keep1}, {Q1, keep1}};
-        out.recs[1] = {name_for(sc, 1, r2.h, out.prov[1], p.npolicy,
-                                out.npolicy_2, out.n_rescued_2),
-                       {S2, keep2}, {Q2, keep2}};
-        n_cand = 2;
-        paired = true;
-        out.outcome = OUTCOME_TRIMMED;
     } else {
-        // No detectable overlap, an unmergeable read-through, or a trim blocked by the
-        // guard: keep both reads exactly as they are.
-        //
-        // No consensus is written on this path, so a kept record can never carry
-        // PROV_RESCUED -- only the N policy can have touched it.
-        if (prov_band && !prov_trim) {
-            out.trim_guard_fired = 1;
-        }
+        // No admitted overlap, or a merge the N policy broke: keep both reads, touched
+        // by the N policy and nothing else -- so a kept record never carries
+        // PROV_RESCUED.
         out.prov[0] = out.npolicy_1 ? npolicy_bit : 0;
         out.prov[1] = out.npolicy_2 ? npolicy_bit : 0;
         out.recs[0] = {name_for(sc, 0, r1.h, out.prov[0], p.npolicy, out.npolicy_1, 0),
-                       {S1, elen1}, {Q1, elen1}};
+                       {m1.s, m1.n}, {Q1, m1.n}};
         out.recs[1] = {name_for(sc, 1, r2.h, out.prov[1], p.npolicy, out.npolicy_2, 0),
-                       {S2, elen2}, {Q2, elen2}};
+                       {m2.s, m2.n}, {Q2, m2.n}};
         n_cand = 2;
         paired = true;
         out.outcome = OUTCOME_KEPT;

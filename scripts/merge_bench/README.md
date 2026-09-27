@@ -4,7 +4,9 @@
 > away in commit 158a204; read it at `git show 158a204^:docs/MERGE_CPP_DESIGN.md`.
 > The surviving algorithmic content is `docs/METHODS.md` §2.
 
-Every number in those documents comes from these scripts. They are kept so the design
+Every number in those documents comes from these scripts — except 0.6's full-scale
+qualification, whose scripts live beside its data in the policy study's evidence
+directory (layer 3 below). They are kept so the design
 can be re-argued against measurements rather than recollection, and so the same numbers
 can be taken on a Linux/x86 box. That happened in 0.5.2 and it mattered exactly where
 the note used to warn it would — `popcount` — see docs/ROADMAP.md, "Closed by measurement
@@ -12,8 +14,48 @@ in 0.5.2".
 
 Nothing here is part of the zna package or the test suite.
 
-Two groups of scripts: `simulate.py` + `compare.py` measure **accuracy** against ground
-truth, and everything else measures **speed** and pins the C++ design.
+Three groups of scripts: `mine_panel.py` + `panel_eval.py` judge a change to the merge
+**policy** pair by pair; `simulate.py` + `compare.py` (and `compare_zna.py`) measure
+**accuracy** end to end against ground truth; and the rest measure **speed** and pin
+the C++ design, with `asan_scan.cpp` keeping the kernel honest under sanitizers.
+
+---
+
+## How a merge change is tested: three layers, seconds each
+
+The method 0.6 was built and qualified with (`docs/archive/MERGE_ACCURACY_PLAN.md` §8). Each
+layer answers a different question, and none substitutes for another.
+
+**1. Exact tests, no data** — `tests/test_merge.py`. Everything the decision uses is
+derived, so it can be pinned exactly: golden values of the floor `T(N)` and the gate's
+`dfit`, checked against their definitions; the gate's sensitivity as a closed form,
+`P(Binom(n, e′) > dfit[n])`, against exact rational enumeration; the fixed-point scale by
+exhaustive enumeration over `(n, d)`; both contract ranges; the argmax total order with
+deliberately built ties; the review's 19 ground-truth pairs (`tests/data/report_cases/`);
+and the two backends compared for exact equality at every level. Seconds, in all three
+test configurations (compiled; `--merge-backend=python`; no extension).
+
+**2. The truth panel and its ledger** — `mine_panel.py`, `panel_eval.py` (below). 245k
+pairs mined from 14.1M simulated ones over 46 substrates: every pair zna 0.5.3 got wrong
+plus a weighted stratified sample of those it got right, each row carrying its 0.5.3
+class. A change is judged by the **pair-level ledger** — which pairs changed outcome,
+from what to what — not by a headline rate, because a rate can improve while the pairs
+underneath trade one error for another. Seconds on the compiled backend, under a minute
+on the reference one.
+
+**3. Full-scale confirmation, at release only.** Regenerate the substrates from their
+recipes (deterministic seeds; the recipes are in the policy study's evidence directory,
+`data-recipes/`, and each records the sha256 its output must match), run the compiled
+merger over every pair — seconds per million — classify each pair against truth for both
+the old and the new version, then delete the data. This is where rates that the panel's
+sampling cannot resolve are settled: one sampled correct-merge row weighs ~0.05% of a
+bench, five times a 0.01% criterion. For 0.6 it ran over 4.11M pairs
+(`docs/MERGE_BENCHMARK_RESULTS.md` §9); the scripts are in the evidence directory's
+`stageC-results/scripts/`.
+
+A **sealed holdout** backs layers 2 and 3: a panel from genes and a genome draw never
+used while designing, looked at exactly once, after the policy and its acceptance
+criteria are frozen. 0.6 spent holdout-2; a future policy change needs a fresh one.
 
 ---
 
@@ -51,32 +93,79 @@ Four things that are easy to get wrong here, all of them load-bearing:
 - **Put the working environment's `bin/` on `PATH`** or `shutil.which("pigz")` returns
   None and everything silently falls back to stdlib gzip.
 
-`compare.py` re-runs `zna merge`'s own kernel on every pair that merged wrongly, and
-scores the *true* shift alongside the one the tool chose. That is what distinguishes a
-defective search from an ambiguous input, and it is the difference between "fix the
-code" and "the genome repeats here".
+`compare.py` re-runs `zna merge`'s own decision -- verdict, shift, bits -- at the run's
+parameters on every pair that merged wrongly, and scores the *true* shift alongside the
+one the tool chose. That is what distinguishes a defective search from an ambiguous
+input, and it is the difference between "fix the code" and "the genome repeats here".
 
-**Trimming is scored as its own contract, not as a footnote to merging.** Most pairs in
-a real library do not merge, and an unmerged pair is still encoded, so whether its
-redundant overlap came off matters to the corpus exactly as much as a merge does. Two
-traps worth knowing:
+**Kept pairs are scored for being whole.** 0.6 has no trim band (plan §2): an unmerged
+pair is its two input mates, exactly, and `kept_mate_altered` must be zero. What a kept
+pair still carries into the corpus is reported rather than scored -- the overlap both
+mates hold, and on a kept read-through, adapter.
 
-- **Score every kept pair, not just the overlapping ones.** A trim applied to a pair
-  whose mates share nothing deletes real sequence, and an analysis restricted to pairs
-  with a true overlap cannot see it. There are 2,733 of those in 1M pairs.
-- **Report the counterfactual.** "28,074 duplicated bases survived" means nothing without
-  "283,838 would have, untrimmed". `compare.py` emits both, plus the bases deleted, so
-  the trade is legible rather than asserted.
-
-`compare.py --threshold-trim T` passes the value straight through to `zna merge`, which
-is how the band gets priced — the merge decision does not move with it, so a sweep
-isolates the trim cleanly:
+`--alpha`, `--error-rate` and `--adapter-trimmed` pass straight through to `zna merge`,
+and the re-scan is rebuilt from the same values and checked against the integers the
+run's JSON reports. `simulate.py` writes raw adapter read-through, so
+`--adapter-trimmed` is a FALSE declaration on its output: it forbids exactly the merges
+those pairs need (on 50k chr22 pairs, 11,493 read-throughs kept whole with 1.04M adapter
+bases, and zna's read-through check warns at 23%). Use it to price the declaration, not
+as the default.
 
 ```bash
-for T in 8 12 16 20; do
-  python compare.py --sim-prefix sim --out sweep_t$T --threshold-trim $T --threads 4
+for E in 0.005 0.01 0.02; do
+  python compare.py --sim-prefix sim --out sweep_e$E --error-rate $E --threads 4
 done
 ```
+
+---
+
+## The 0.6 truth panel: `mine_panel.py` and `panel_eval.py`
+
+How a change to the merge **policy** is judged (`docs/archive/MERGE_ACCURACY_PLAN.md` §8, layer
+2). The panel is 245k pairs mined from 14.1M simulated ones over 46 substrates: every
+pair zna 0.5.3 got wrong, plus a weighted stratified sample of the ones it got right,
+each row recording its 0.5.3 class. It lives with the policy study's evidence, not in this
+repo (`sealed/` is holdout-2, opened once for 0.6's qualification, and `panel_eval.py` refuses it without
+`--final-qualification`).
+
+```bash
+# evaluate the CURRENT policy, pair by pair, against the recorded 0.5.3 classes.
+# ~13 s on the reference backend with 12 workers; seconds on the compiled one.
+python panel_eval.py <panel_dir> --workers 12 --json eval.json --ledger ledger.tsv
+python panel_eval.py <panel_dir> --error-rate 0.03      # zna's --error-rate; default 0.01
+```
+
+It prints, per bench, 0.5.3 against the current policy: wrong merges retained (M-),
+lost fragments (LOST + LOSTp), correct merges (M+), kept pairs, pairs refused as
+implausible, and the run's diagnostics -- the detected-overlap disagreement rate, the
+share of true overlaps the gate is expected to refuse at that rate (`refused`, through
+zna's own closed form over the weighted detected-length histogram), and the read-through
+share -- with whether zna would warn on each. **Counts are weighted**:
+a sampled correct row stands for up to a few hundred pairs, so one such row changing
+class moves a total by its weight -- read the ledger (`--ledger`, every pair whose class
+changed) before reading a small difference as a trend. The contract (`--adapter-trimmed`)
+per bench and the weighted form of the diagnostics are in the script's docstring.
+
+`mine_panel.py` is the tool that made the panel. It records 0.5.3's classes, trim band
+included, so it runs only under a pinned zna 0.5.3 and refuses a newer tree; it is only
+needed to add a substrate:
+
+```bash
+# in a scratch environment -- never the development one
+pip install "zna==0.5.3"
+python mine_panel.py <substrate_dir> <bench_name> <bench_name>.tsv.gz
+```
+
+A substrate is `R1.fq[.gz]`, `R2.fq[.gz]` and `truth.tsv.gz` (one row per pair in FASTQ
+order: `pair name L frag true_r1 true_r2 source`, the fragment in R1's orientation and
+`source` a locus id for concentration statistics). Add the new bench's contract to
+`panel_eval.py`'s docstring and table: `--adapter-trimmed` where every read ends at or
+before its molecule, undeclared otherwise.
+
+**Reading a result.** Compare against 0.5.3 bench by bench, then read the ledger for the
+pairs that moved. A useful check before trusting a new policy: run `panel_eval.py
+--backend accel` and `--backend python` and diff the two ledgers — they must be
+identical, and for 0.6 they are.
 
 ---
 
@@ -89,46 +178,54 @@ cd scripts/merge_bench
 #    Merges at 88.6% against production's measured 88.8%.
 python gen_library.py 200000 r1.fq.gz r2.fq.gz
 
-# 2. where the per-pair time actually goes  (retired-design §1)
-python bench_breakdown.py r1.fq.gz r2.fq.gz
-
-# 3. is the argmax tie-break a specifiable total order?  (retired-design §5)
+# 2. is the argmax tie-break a specifiable total order?  (retired-design §5)
 #    Builds ties deliberately -- random sequence essentially never ties.
 python verify_tiebreak.py r1.fq.gz r2.fq.gz
 
-# 4. scan kernel variants, full pruned scans, packing inside the timed region,
+# 3. scan kernel variants, full pruned scans, packing inside the timed region,
 #    every variant checked against the shipped kernel pair by pair  (retired-design §6.1)
 python dump_pairs.py r1.fq.gz r2.fq.gz 50000 pairs.bin
 c++ -O3 -std=c++17 -o bench_scan bench_scan.cpp && ./bench_scan pairs.bin   # scalar vs 2-bit packed
 c++ -O3 -std=c++17 -o bench_simd bench_simd.cpp && ./bench_simd pairs.bin   # ...vs byte-wise SIMD
 # on x86 see "Taking these on x86" below before adding -mavx2: it enables POPCNT too,
 # which silently folds the reduction fix into what looks like a vector-width result
-
-# 5. the whole path in C++, which must be BYTE-IDENTICAL to `zna merge`  (retired-design §3)
-c++ -O3 -std=c++17 -o proto_merge proto_merge.cpp
-./proto_merge r1.fq.gz r2.fq.gz cpp.fq 40
-zna merge --in1 r1.fq.gz --in2 r2.fq.gz --out py.fq --min-read-length 40 -q
-cmp cpp.fq py.fq        # must be silent
 ```
 
-## `proto_merge.cpp` is a prototype, not the implementation
+**Steps 2 and 3 measure the SCAN, not the 0.6 decision.** `dump_pairs.py` and
+`verify_tiebreak.py` call the shipped backend's `scan` over every shift at the fixed
+8-bit floor the C++ benches hard-code, with the `e = 0.01` weights; 0.6 wraps that same
+loop in a per-pair floor, the `--adapter-trimmed` contract and the plausibility gate,
+none of which changes which kernel variant is faster or whether it finds the same
+argmax. Ported to the 0.6 API, `dump_pairs.py` writes a `pairs.bin` byte-identical to
+the one the 0.5.x script wrote, and `bench_scan` reports 0 mismatches against it;
+`verify_tiebreak.py` finds 144 exercised ties and 0 violations of (max score, max n,
+min s), scoring in the kernel's integers rather than the floats it used before.
 
-It is the artifact that proves the design lands where it claims: on 200,000 real pairs
-it emits a byte-identical file to `zna merge` at **2.32 µs/pair against 8.34**. It
-carries the byte-wise SIMD kernel the design settled on (`neq16` + a 32-base bail) and
-the self-sizing `Scratch` arena of retired-design §7.4, and was re-verified byte-identical after
-each of those replaced its predecessor — which is the check that matters when swapping a
-kernel or an allocation strategy.
+## Retired in 0.6
 
-Do **not** read it as a model for the real backend. It is single-threaded, its
-`popen("pigz -dc")` reader is a stand-in for the chunk protocol in retired-design §7.3, and it
-builds the consensus table in C++ where retired-design §4 says to build it once in Python and
-pass it across. It also has no error handling worth the name.
+Deleted because they measured the 0.5.x merge -- its trim band, its two fixed
+thresholds, its kernel API -- and have no meaningful 0.6 form. Each is recoverable at
+the 0.5.3 tag (`git show v0.5.3:scripts/merge_bench/<file>`).
 
-`/tmp/proto_v1.cpp`-style comparisons are how §7.4's arena numbers were taken: the
-same program with per-pair `std::vector` `.assign()`/`.resize()` and unconditional
-consensus copies runs at 2.71 µs/pair end to end and 1.38 µs/pair of compute, against
-the arena's 2.32 and 1.00.
+- **`bench_breakdown.py`** -- cumulative per-stage timing of the 0.5.x Python path
+  (retired-design §1), down to `merge_chunk` called with `t_trim_q`. The finding it made
+  -- per-pair work belongs in one GIL-releasing chunk call -- is the shipped design; the
+  whole run's rate is `pairs_per_second` in `zna merge --json`.
+- **`proto_merge.cpp`** -- the whole 0.5.x path in one C++ file, whose point was to emit
+  a file byte-identical to 0.5.x `zna merge` (2.32 µs/pair against 8.34 on 200,000
+  pairs; retired-design §3 and §7.4). The compiled backend superseded it in 0.4.0, and
+  what it proved is now proved continuously: `tests/test_merge.py` holds the compiled
+  backend byte-identical to the reference one, and `panel_eval.py --backend accel` vs
+  `python` on the truth panel. Porting it would mean re-implementing the 0.6 policy a
+  third time with nothing to verify it against but the other two.
+
+## Sanitizers: `asan_scan.cpp`
+
+Runs the header-only core (`merge_core.hpp`, `fastq_chunk.hpp`) under AddressSanitizer
+and UBSan, with every read placed so its last byte is the last byte of its allocation and
+every policy table allocated at exactly its capacity, so a one-byte overread or a table
+lookup one past the end traps instead of landing in slack. Build and run it after any
+kernel change (the command is in the file's header); it reports "… clean" or aborts.
 
 ## One number that is easy to get wrong
 
@@ -163,7 +260,7 @@ innermost loop. `merge_core.hpp` now reduces with `psadbw` instead.
 - **`-mavx2` also enables POPCNT**, so a bare `./bench_simd` against a `-mavx2` build
   compares *two* changes at once and will credit the vector width for the reduction's
   win. Build with `-mpopcnt` alone to separate them; the numbers are in ROADMAP.
-- The bail granularity is per-ISA now (`BAIL_VECTORS`): 48 bases on x86, 32 on aarch64.
+- The bail granularity is per-ISA now (`BAIL_VECTORS`): 48 bases on x86, 64 on aarch64.
 
 ```bash
 c++ -O3 -std=c++17 -o bench_simd bench_simd.cpp && ./bench_simd pairs.bin  # as shipped
@@ -171,6 +268,5 @@ c++ -O3 -std=c++17 -mpopcnt  -o bs_pc bench_simd.cpp && ./bs_pc pairs.bin  # iso
 c++ -O3 -std=c++17 -mavx2    -o bs_v2 bench_simd.cpp && ./bs_v2 pairs.bin  # + 32 B vectors
 ```
 
-Still open, and scheduled as 0.5.3: **none of the 0.5.2 numbers are aarch64.** The grouped
-reduction changed the NEON path too, and its `BAIL_VECTORS` is still the value tuned for
-the old per-vector reduction.
+The aarch64 re-measure this section once scheduled was 0.5.3: `BAIL_VECTORS` went
+2 -> 4 there (1.22x on the kernel); see docs/ROADMAP.md.

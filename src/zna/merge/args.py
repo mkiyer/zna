@@ -17,62 +17,80 @@ import os
 #: More threads than this cannot help -- see --threads.
 _DEFAULT_THREADS = min(4, os.cpu_count() or 1)
 
-_DESCRIPTION = ("Overlap-merge paired-end reads (and trim residual overlap on unmerged "
-                "pairs) into one mixed interleaved FASTQ for ZNA encoding.")
+_DESCRIPTION = ("Overlap-merge paired-end reads into one mixed interleaved FASTQ for ZNA "
+                "encoding: each pair becomes one full-fragment read or stays two mates.")
 
 _EPILOG = """\
 Every pair is scored ONCE: R1 is slid against revcomp(R2) over the single axis of
 candidate fragment lengths, and each shift gets a log-likelihood ratio in BITS --
-+2 bits per matching base (log2 4), -6.2 bits per mismatch at a 1% error rate. The
-best-scoring shift (argmax, not first-accept) is then read at two thresholds:
+~+2 bits per matching base (log2 4), ~-6.2 bits per mismatch at a 1% error rate. The
+best-scoring shift (argmax, not first-accept) is MERGED when both hold:
 
-  * score >= --threshold-merge                -> MERGE into one read
-      (R1 wins the overlap; R2's non-overlapping tail is appended, reverse-
-       complemented). Emitted as a single record with the /1,/2 suffix stripped.
-  * --threshold-trim <= score < merge         -> KEEP BOTH, splitting the redundant
-      overlap between their 3' ends so it is not counted twice. The overlap sits at
-      the 3' end of BOTH mates, so cutting half from each tiles the fragment exactly
-      once and leaves the two emitted reads the same length -- which is what
-      downstream aligners and models expect -- while discarding the last cycles of
-      both reads instead of one read's whole copy. Where they disagree, both mates
-      get the consensus call.
-  * score < --threshold-trim                  -> KEEP BOTH, unchanged.
+  * its score reaches T = log2(N / alpha) bits, N = len1 + len2 - 1 candidate shifts
+    (28.2 bits at 2x150, 26.6 at 2x50, 29.2 at 2x300): at most alpha chance merges of
+    UNRELATED sequence per pair;
+  * its mismatches are plausible as sequencing error: a true overlap of n bases shows
+    more than dfit[n] of them with probability below the same alpha (dfit = 9 of 122
+    at a 1% error rate). A long divergent repeat that outscores a short true overlap
+    fails this, and the pair is KEPT -- nothing is searched for in its place.
 
-Both thresholds are on one calibrated scale: T bits tolerates a spurious rate of
-about N * 2**-T over the N ~ 2*readlen candidate shifts, so the default 28 is one
-spurious merge in 1e6 pairs AGAINST CHANCE ALIGNMENT (measured: 0 in 40,000
-uniform-random pairs, at every read length from 50 to 300). It is not a bound
-against real sequence, where reads share genuine homology and repeat content --
-raising T there buys far less than the formula suggests.
+Anything else keeps both reads unchanged. A merged record is R1 then R2's
+non-overlapping tail, reverse-complemented; where the mates disagree the consensus
+takes the better-supported call by posterior from the two Phred scores (and derates its
+quality) -- no cutoffs, nothing to tune.
 
-CHOOSING --threshold-merge. Measured on 1M simulated pairs from hg38 with the true
-fragment known (docs/MERGE_BENCHMARK_RESULTS.md §6):
+WHAT --alpha BOUNDS, AND WHAT IT DOES NOT. alpha caps chance merges of unrelated
+sequence (measured: 0 in 40,000 random pairs at the default) and, through the
+plausibility test, the rate at which true overlaps are refused. It does NOT bound merges
+of genuinely homologous sequence -- a near-identical repeat (a perfect 15 bp match, or
+7 mismatches in 64, plausible even at the default error rate) is plausible under any
+error model and still merges; no threshold reaches zero there. Divergent repeats are
+what the plausibility test catches, at the same alpha. Each factor of 10 in alpha moves T by 3.3 bits, i.e.
+~1.7 matching bases.
 
-  * the DEFAULT 28 minimises false positives plus false negatives -- 6,603 errors
-    per million against 44,145 at the fastp-equivalent setting. Raising it trades
-    ~11 extra missed merges for each wrong merge prevented, so it pays only if a
-    chimera costs you more than that. A missed merge is not lost data: the pair is
-    still emitted, correctly bounded, with its redundant overlap trimmed.
-  * --threshold-merge 60 matches FASTP'S DEFAULT false-positive rate (0.597% vs
-    0.621% on pairs with no true overlap) at the same sensitivity (92.6% vs 93.0%).
-    60 bits is 31 clean bases, which is essentially fastp's --overlap_len_require
-    30. At that matched point zna reconstructs 88.9% of merged records exactly
-    against fastp's 85.9%.
-  * no threshold reaches zero. At 100 bits, 1,403 wrong merges per million remain,
-    every one a fragment whose two ends are genuinely homologous.
+--error-rate E (default 0.01) is the expected fraction of positions at which the two
+mates DISAGREE where they truly overlap -- about twice the per-base sequencing error,
+since either read can be wrong. It is not estimated; it is a setting, and it does two
+different jobs:
 
-Trim keeps a much lower threshold only because a wrong trim deletes bases from a
-read tail while a wrong merge is a chimera. That asymmetry is now measured rather than asserted: at 8 bits
-a wrong trim removes a median of 9 bases (mean 20, up to 110), and the band as a
-whole removes 4.4 bases of genuinely duplicated sequence for every base it
-deletes. See docs/MERGE_BENCHMARK_RESULTS.md.
+  * in the SCORE it sets strictness: a larger E makes a mismatch cost less, so both
+    sequencing errors and repeat divergence are tolerated more. It does NOT affect the
+    alpha bound on chance merges, which holds at any E.
+  * in the PLAUSIBILITY TEST it is a promise: a true overlap is refused with
+    probability at most alpha only if E is at least the library's real disagreement
+    rate. Set too low, true overlaps are refused and kept whole (never merged wrongly):
+    a library that truly disagrees at 3% loses 0.07-0.6% of them at the default, at 5%
+    1-13% (overlaps of 50-150 bases).
+
+zna checks the setting against the data: --json reports
+detected_overlap_mismatch_rate, the disagreement over every overlap the scan detected
+(before the plausibility test), and expected_refused_true_overlap_fraction, the share of
+those overlaps the test is expected to refuse at E were they all true and disagreeing at
+that rate. The run warns when that share exceeds 0.1%, with the number of pairs the test
+refused and a suggested value. It is a check, not an estimate: repeats inflate the rate
+on clean libraries, and on degraded ones it can read below the truth. Production RNA
+libraries measured ~0.9% on 0.5.3's comparable statistic, just under the default.
+
+Raising E is a TRADE, not a free fix. It stops the plausibility test refusing true
+overlaps, but it also makes every mismatch cost less in the score, so more short or
+divergent overlaps merge -- false ones included. On a simulated 3'-degraded library
+(true disagreement ~3.9%), E = 0.01 gave 240 wrong merges and E = 0.036 gave 745. Raise
+it when the refused pairs matter more than that: typically poor or 3'-degraded
+libraries (2-5%) whose run warns and refuses many pairs.
+
+--adapter-trimmed DECLARES that no read extends past its molecule (adapters removed,
+or reads clipped to the fragment). Read-through alignments then become impossible and
+are never merged. zna checks the declaration on the first 100,000 pairs and warns when
+more than 1% still look like strong read-through (honest declarations measure ~0.1%,
+false ones 2-23%). WITHOUT the flag, read-through is inferred as before: that IS overlap-based
+adapter removal -- a read contains adapter only when its insert is shorter than the
+read, so the mates overlap fully and the merged record excludes the adapter. Declaring
+it on raw reads is catastrophic (measured: 231,000 correct merges lost per million
+raw hg38 pairs); leaving it off on trimmed reads only forgoes the gain.
 
 Output is ONE mixed interleaved FASTQ: merged reads are singles, unmerged pairs are
-adjacent /1,/2 records. Feed it to `zna encode --interleaved`. Where the mates
-overlap and DISAGREE, the consensus takes the better-supported call by posterior
-from the two Phred scores (and derates its quality, because a contested base is
-less certain) -- no cutoffs, nothing to tune. Defaults suit 2x150 bp data; you
-normally set nothing.
+adjacent /1,/2 records. Feed it to `zna encode --interleaved`, or merge in process with
+`zna encode --merge-pairs`, which also records the policy in the file's prologue.
 
 Example:
   zna merge --in1 R1.fq.gz --in2 R2.fq.gz --out merged.fq.gz --json merge.json
@@ -97,22 +115,35 @@ def add_merge_algorithm_arguments(p):
     owning command (`zna encode` already has its own ``--npolicy``, ``--seed``
     and ``-q``, with identical semantics).
     """
-    p.add_argument("--threshold-merge", type=float, default=28.0, dest="t_merge",
-                   help="overlap score (bits) >= this -> merge the pair into one "
-                        "full-fragment read. 28 bits = one spurious merge per 1e6 "
-                        "pairs at 2x150; each extra bit halves that.")
-    p.add_argument("--threshold-trim", type=float, default=8.0, dest="t_trim",
-                   help="overlap score (bits) >= this (but below --threshold-merge) "
-                        "-> keep both reads and split the redundant overlap between "
-                        "their 3' ends. Low on purpose: a wrong trim deletes read tail, "
-                        "where a wrong merge invents sequence. Measured against ground "
-                        "truth (docs/MERGE_BENCHMARK_RESULTS.md), 8 bits removes 4.4 "
-                        "bases of duplicated sequence per base it deletes, and is the "
-                        "value that minimises the two costs added together.")
+    p.add_argument("--alpha", default="1e-6", metavar="ALPHA",
+                   help="the policy's one statistical tolerance: at most ALPHA chance "
+                        "merges of UNRELATED sequence per pair (the merge threshold is "
+                        "log2((len1+len2-1)/ALPHA) bits, per pair), and at most ALPHA "
+                        "true overlaps refused as implausible. It does not bound merges "
+                        "of near-identical repeats, which no threshold can. Read as an "
+                        "exact decimal; must be in [1e-300, 1).")
+    p.add_argument("--error-rate", default="0.01", dest="error_rate", metavar="E",
+                   help="expected fraction of positions at which the two mates disagree "
+                        "in a TRUE overlap (~2x the per-base sequencing error). In the "
+                        "score it sets how much a mismatch costs (strictness, not the "
+                        "alpha guarantee); in the plausibility test it must be >= the "
+                        "library's real rate, or true overlaps are refused and kept "
+                        "whole. The run warns when, at the disagreement its detected "
+                        "overlaps show, over 0.1%% of true overlaps would be refused; "
+                        "raising it then recovers refused pairs but also merges more "
+                        "short or divergent overlaps, false ones included (see below). "
+                        "Read as an exact decimal; must be in [1e-9, 0.75).")
+    p.add_argument("--adapter-trimmed", action="store_true", dest="adapter_trimmed",
+                   help="declare that no read extends past its molecule (adapters "
+                        "already removed, or reads clipped to the fragment): read-through "
+                        "alignments become impossible. Checked on the first 100,000 "
+                        "pairs, with a warning if the reads still look like they "
+                        "contain adapter. Do NOT pass it for raw reads.")
     p.add_argument("--min-read-length", type=int, default=40, dest="min_read_length",
-                   help="drop emitted reads shorter than this (after merge/trim; a "
-                        "trimmed read can fall below it). MUST match the pipeline-wide "
-                        "floor used by any earlier quality-trimming step.")
+                   help="drop emitted reads shorter than this (a merged read is its "
+                        "fragment; an unmerged pair is dropped whole if either mate is "
+                        "short). MUST match the pipeline-wide floor used by any earlier "
+                        "quality-trimming step.")
     p.add_argument("--no-sync-check", action="store_true",
                    help="skip the per-pair R1/R2 read-name consistency check. Only "
                         "for input whose mate names genuinely differ by design.")

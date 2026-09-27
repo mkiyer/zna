@@ -1,5 +1,17 @@
 # `zna merge` against fastp on simulated ground truth — results
 
+> **§1–§8 describe zna 0.4.0 through 0.5.3, whose merge decision did not change between
+> those releases. 0.6.0 changed it**: the merge floor is derived per pair from `--alpha`,
+> a plausibility gate refuses divergent repeats, `--adapter-trimmed` declares
+> read-through impossible, and there is no trim band (`docs/METHODS.md` §1). **§9 is
+> 0.6, measured against 0.5.3 pair by pair**, on this benchmark's own input regenerated
+> byte-identically and on seven more. Read §1–§8 as the 0.5.x baseline: the score, the
+> merge construction, the consensus (§3) and the 5' boundary contract (C1) are unchanged
+> in 0.6; the trim band (§5, contract C4's trimming half) and the `--threshold-merge`
+> sweep (§6) describe flags that no longer exist; and `scripts/merge_bench/compare.py`,
+> ported to 0.6, no longer produces the trim-band outputs or the threshold sweeps.
+> Numbers below keep the flag names they were measured with.
+
 Run 2026-08-12 against zna at `710957d` (0.4.0-unreleased), on **1,000,000 pairs**
 simulated from hg38. This is the measurement
 the 0.4.0 benchmark plan specified, and it gates the 0.4.0
@@ -220,7 +232,7 @@ produced no records at all, and they are included in the chimera counts above. T
 
 ---
 
-## 5. The trim band (contract C4) — what the *unmerged* pairs cost
+## 5. The trim band (contract C4) — what the *unmerged* pairs cost (0.5.x; removed in 0.6)
 
 A pair that does not merge is still encoded, so this half of the tool reaches the corpus
 just as directly as merging does. `zna merge` splits the redundant overlap between the
@@ -363,7 +375,7 @@ re-running this benchmark against the modified tool.
 
 ---
 
-## 6. Head to head with fastp: matching its false-positive rate, and beating it
+## 6. Head to head with fastp: matching its false-positive rate, and beating it (0.5.x)
 
 The two tools sit at different points on one trade-off, so "which is better" is only
 answerable at a matched operating point. Sweeping `--threshold-merge` with everything
@@ -436,7 +448,7 @@ saying what genome the fragments came from is quoting the input, not the tool.
 
 ---
 
-## 7. Throughput
+## 7. Throughput (0.4.0)
 
 | tool | wall s | µs/pair |
 |---|---:|---:|
@@ -492,3 +504,146 @@ Three things a reader should carry away rather than a number:
    at all. Any change to `--threshold-trim` should be argued on the sweep in §5, not on
    the ratio alone — the ratio improves monotonically while the benefit falls off a
    cliff.
+
+---
+
+## 9. zna 0.6 against 0.5.3, pair by pair (2026-09-26)
+
+The 0.6 policy was fixed, with its acceptance criteria, before this run
+(`docs/archive/MERGE_ACCURACY_PLAN.md` §8). Every substrate was regenerated from its recipe —
+R1, R2 and truth byte-identical to the recorded sha256, the genome and annotation too —
+and every pair's truth re-verified. Both versions ran on the same pairs with the
+defaults (`α` 10⁻⁶, `--error-rate` 0.01, `--min-read-length` 40, `--npolicy trim3`):
+0.5.3 through the policy study's `candidate.py`, whose per-class counts equal the
+compiled 0.5.3 CLI's on every bench and reproduce the counts khorana's chr22 review published exactly; 0.6
+through the compiled backend, whose counts equal the 0.6 CLI's. Then everything
+regenerated was deleted; the per-bench JSON, the pair-level ledgers and the scripts are
+in the evidence directory (`stageC-results/`).
+
+**The benches.** `hg38` is this document's own input (`simulate.py`, seed 42; 0.5.3's
+5,086 emitted + 505 lost wrong merges are §2's 5,591). `chr22-*` is khorana's simulator:
+error-free, reads clipped to the molecule, so `--adapter-trimmed` is true. `tx-dev-*`
+are transcriptome-wide, from genes disjoint from chr22: `clean` in khorana's profile;
+`noisy` with NovaSeq qualities, 0.2% error and adapters; `fastp` the noisy set passed
+through hulkrna's fastp pass (with `--cut_tail`); `fastp2` the same through two fastp
+passes (adapters, then `--cut_tail`), both fastp 1.1.0; `fastp3` through one pass without `--cut_tail`, the
+recommended trimmer, measured after the qualification with the same scripts (fastp 1.3.6; the live
+0.6 tree, which reproduces the `fastp2` rows exactly). Each has a *primary* contract —
+declared where the declaration is true of the input, undeclared where it is not — marked
+`*`.
+
+**Classes**, per pair against the true fragment length `L`: *wrong merge* (M−, a
+merged record that is not its fragment, emitted); *lost* (a wrong merge whose record fell
+under the length floor, or a mate cut under it by `trim3`); *correct merge* (M+);
+*forgone* (a 0.5.3 M+ that is not M+ in 0.6); *wrong trim* and *mate substitution*
+(0.5.3's trim band deleting real bases or its consensus rewriting a kept mate);
+*adapter bases* (kept-mate bases past `L`); *affected* (a pair with any of these).
+
+| bench | contract | pairs | wrong merges | lost | correct merges (forgone / gained) | wrong trims | mate subs | adapter bases | affected | refused by the gate (at true L) |
+|---|---|---:|---|---|---|---|---|---|---|---|
+| chr22-pilot | declared* | 10k | 11 → 2 | 3 → 0 | 7,594 → 7,597 (0 / 3) | 16 → 0 | 14 → 0 | 0 → 0 | 30 → 2 | 7 (0) |
+| chr22-val | declared* | 100k | 120 → 40 | 14 → 0 | 76,162 → 76,175 (0 / 13) | 153 → 0 | 162 → 0 | 0 → 0 | 287 → 40 | 43 (0) |
+| chr22-train | declared* | 1M | 950 → 245 | 96 → 0 | 761,030 → 761,106 (0 / 76) | 1,454 → 0 | 1,755 → 0 | 0 → 0 | 2,500 → 245 | 378 (0) |
+| chr22-train | undeclared | 1M | 950 → 334 | 96 → 96 | 761,030 = | 1,454 → 0 | 1,755 → 0 | 0 → 0 | 2,500 → 430 | 616 (0) |
+| tx-dev-clean | declared* | 500k | 1,448 → 589 | 34 → 0 | 379,849 → 380,079 (0 / 230) | 660 → 0 | 830 → 0 | 0 → 0 | 2,142 → 589 | 426 (0) |
+| tx-dev-clean | undeclared | 500k | 1,448 → 769 | 34 → 33 | 379,849 = | 660 → 0 | 830 → 0 | 0 → 0 | 2,142 → 802 | 678 (0) |
+| tx-dev-noisy | undeclared* | 500k | 1,418 → 732 | 35 → 34 | 378,647 = | 657 → 0 | 2,139 → 0 | 0 → 0 | 2,110 → 766 | 685 (0) |
+| tx-dev-fastp | undeclared* | 500k | 1,421 → 748 | 16 → 15 | 378,227 = | 668 → 0 | 2,154 → 0 | 0 → 0 | 2,105 → 763 | 672 (0) |
+| tx-dev-fastp | declared | 500k | 1,421 → 663 | 16 → 0 | 378,227 → 378,363 (**42** / 178) | 668 → 0 | 2,154 → 0 | **0 → 47** | 2,105 → 663 | 477 (0) |
+| tx-dev-fastp2 | declared* | 500k | 1,421 → 663 | 16 → 0 | 378,227 → 378,400 (7 / 180) | 669 → 0 | 2,154 → 0 | **0 → 8** | 2,106 → 663 | 475 (0) |
+| tx-dev-fastp2 | undeclared | 500k | 1,421 → 749 | 16 → 15 | 378,227 = | 669 → 0 | 2,154 → 0 | 0 → 0 | 2,106 → 764 | 671 (0) |
+| tx-dev-fastp3 | declared* | 500k | 1,421 → 664 | 16 → 0 | 378,563 → 378,735 (7 / 179) | 662 → 0 | 2,148 → 0 | **0 → 8** | 2,099 → 664 | 475 (0) |
+| tx-dev-fastp3 | undeclared | 500k | 1,421 → 750 | 16 → 15 | 378,563 = | 662 → 0 | 2,148 → 0 | 0 → 0 | 2,099 → 765 | 670 (0) |
+| hg38 | undeclared* | 1M | 5,086 → 2,132 | 505 → 495 | 577,517 = | 2,948 → 0 | 5,158 → 0 | 0 → 0 | 8,539 → 2,627 | 2,946 (0) |
+
+**Over the primary contracts** (the qualification's eight benches, `fastp3` not included; 4.11M
+pairs): wrong merges 11,875 → **5,151**, lost fragments 719 → **544**, wrong trims 7,225
+→ **0**, mate substitutions 14,366 → **0**, affected pairs 19,819 → **5,695**, correct
+merges 2,937,253 → 2,937,748 (7 forgone, 502 gained). The gate refused 5,632 pairs and **none at the true fragment length**; on hg38
+every one of its 2,946 refusals was a pair 0.5.3 had merged wrongly.
+
+**The error model holds everywhere.** The true disagreement inside true overlaps is 0 on
+chr22 and the clean set and 0.0041–0.0049 on the noisy, fastp and hg38 sets, all under
+`--error-rate` 0.01. The run's own check agrees: `expected_refused_true_overlap_fraction`
+is at most 4×10⁻⁹ on every bench, so no run warns. The `--adapter-trimmed` check reads
+0–0.11% on every honestly trimmed input and 2.3% (tx-dev-noisy) and 23% (hg38) on raw
+input.
+
+**Acceptance (§8 of the plan).** Wrong merges retained and lost fragments do not rise on
+any bench; wrong trims and mate substitutions are 0; affected pairs fall everywhere; and
+compiled time is 9–29% *lower*. Two criteria fail, both on declared fastp output, and
+both for the same reason — the declaration is not fully honest there:
+
+- **tx-dev-fastp declared forgoes 42 correct merges, 0.0111%** (the limit is 0.01%), and
+  emits 47 adapter bases in 38 kept pairs. Every one of the 42 input pairs still carries
+  1–3 bp of adapter (inserts 147–149). 35 are the `--cut_tail` class: it runs before
+  fastp's overlap-based adapter detection and, by trimming R2's last (adapter) base,
+  hides R1's 1–2 bp overhang; the other 7 keep adapter on both mates (next item). 37 are
+  kept because the only true alignment is a read-through the declaration forbids, 4
+  became wrong merges at a wrong length, and 1 was refused as implausible elsewhere.
+  Undeclared, the same bench passes every criterion.
+- **tx-dev-fastp3 and tx-dev-fastp2 declared emit 8 adapter bases** (3 pairs) and forgo
+  7 correct merges (0.0019%, within the limit). Dropping `--cut_tail` removes its whole
+  class in one pass (42 → 7 residual pairs); a second, quality-only pass adds nothing
+  to adapter removal. The 7 keep 1–3 bp on *both* mates (inserts 147–149, five with no
+  sequencing error in the insert) and are the same pairs on all three benches: fastp's
+  overlap detection misses them itself. Our hypothesis, not verified: low-complexity
+  inserts on which fastp accepts a full-length overlap. No flag tried removes them
+  (`--overlap_diff_limit` 10: 53 residual pairs with `--cut_tail`, 18 without; 1 and 0:
+  46 and 368). Declared, 4 of the 7 become wrong merges and 3 are kept with their
+  adapter. Declaring is still better on net than not: 664 wrong merges against 750
+  (`fastp3`), 0 lost fragments against 15.
+
+So `--adapter-trimmed` is documented as for honest input only, the output of a fastp
+pass with `--cut_tail` as not honest, and one fastp pass without `--cut_tail` as the
+recommended trimmer, with its measured residual (`docs/METHODS.md` §1.7). Keeping the
+3' ends also leaves more overlap to merge: `fastp3` has 378,735 correct merges declared
+against `fastp2`'s 378,400. What it gives up is 3' quality trimming, which on this set
+removed 0.9% of sequencing errors.
+
+**Where the residual is.** 0.6 roughly halves wrong merges, and what is left is more
+concentrated — near-identical repeats, which no error model can call implausible:
+
+| bench | 0.5.3: loci / inverse Simpson / top-5 share | 0.6: loci / inverse Simpson / top-5 share |
+|---|---|---|
+| chr22-train, declared | 6 / 3.6 / 99.8% | 5 / 2.5 / 100% (one transcript, 140 of 245) |
+| tx-dev-clean, declared | 180 / 21.9 / 39.7% | 99 / 7.4 / 54.5% (one transcript, 200 of 589) |
+| tx-dev-noisy | 176 / 21.6 / 40.0% | 119 / 11.1 / 50.3% |
+| tx-dev-fastp2, declared | 177 / 21.9 / 39.8% | 111 / 9.3 / 51.1% |
+| tx-dev-fastp3, declared | 176 / 21.8 / 39.8% | 111 / 9.2 / 51.4% |
+| hg38 (100 kb bins) | 2,570 / 1,366 / 1.2% | 1,700 / 1,117 / 1.7% |
+
+On hg38, 2,131 of the 2,627 residual wrong merges are pairs with no true overlap at all
+(0.5.3: 4,757).
+
+**Time.** `zna merge --threads 1`, plain FASTQ, three interleaved repetitions, medians,
+CPU seconds, 0.5.3 → 0.6: chr22-train 1.08 → 0.77 declared (−28.7%) and 0.94 undeclared
+(−13.0%); tx-dev-clean 0.56 → 0.46 declared (−17.9%); tx-dev-noisy 0.60 → 0.54 (−10.0%);
+tx-dev-fastp 0.56 → 0.45 declared (−19.6%) and 0.51 undeclared (−8.9%); hg38 1.06 → 0.90
+(−15.1%); tx-dev-fastp3, measured later, 0.58 → 0.50 declared (−13.8%) and 0.51
+undeclared (−12.1%). `docs/PERFORMANCE.md` has the kernel breakdown.
+
+### The sealed holdout, run once
+
+A second 34,034-row truth panel from genes never sampled before and an unseen hg38 draw
+(holdout-2), sealed until this run and evaluated exactly once with
+`panel_eval.py --final-qualification` as the repo held it then (sha256 `85635cbd…`,
+recorded in `stageC-results/sealed_scripts_sha256.txt`; the repo's copy has since moved
+its `--error-rate` warning to `expected_refused_true_overlap_fraction`, which the run
+computed alongside), compiled backend. Counts are weighted projections
+of a stratified sample onto the full substrates (1M pairs each):
+
+| bench | wrong merges | lost | correct merges | forgone (weighted) | wrong trims | affected | refused (at true L) |
+|---|---|---|---|---|---|---|---|
+| hg38-hold2 (raw) | 5,050 → 2,094 | 499 → 491 | 576,787 = | 0 | 2,954 → 0 | 8,503 → 2,585 | 2,941 (0) |
+| tx-hold2-clean (declared) | 1,895 → 1,024 | 30 → 0 | 760,053 → 760,288 | 0 | 1,243 → 0 | 3,168 → 1,024 | 538 (0) |
+| tx-hold2-fastp (with `--cut_tail`, declared) | 1,866 → 1,023.5 | 18 → 0 | 756,684 → 756,842 | 63 (0.0083%) | 1,257 → 0 | 3,141 → 1,023.5 | 566 (0) |
+| tx-hold2-noisy (raw) | 1,862 → 1,217 | 28 → 27 | 757,475 = | 0 | 1,244 → 0 | 3,134 → 1,244 | 643 (0) |
+| **total** | **10,673 → 5,359** | **575 → 518** | | | | | |
+
+No bench warns. Undeclared, tx-hold2-fastp gives 1,866 → 1,223 wrong merges, 18 → 17
+lost and 0 forgone. **The panel cannot resolve the 0.01% forgone criterion**: correct
+merges are sampled at 1,534–1,955 rows per bench, each standing for 376–398 pairs, so
+one row is 0.05–0.065% of baseline — five to six times the limit. That criterion rests on
+the full-scale benches above, and the panel measures neither adapter bases nor mate
+substitutions.

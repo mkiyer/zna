@@ -8,6 +8,197 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
+## [Unreleased] — 0.6.0
+
+**`zna merge` and `zna encode --merge-pairs` produce different output from 0.5.x, and
+every corpus built with them must be regenerated.** The merge decision changed: pairs
+0.5.x merged are now kept, pairs it trimmed are now kept whole, and some pairs it kept
+are now merged. The `.zna` format itself did not change — format version 3, prologue
+schema 1, and 0.5.x files read exactly as before — so nothing refuses an old file; a
+consumer that needs 0.6 records has to check for them, by the prologue's new `merge`
+record (below), not by `writer_version`. Two flags are gone and the JSON statistics
+changed shape. The design, every rejected alternative and the acceptance criteria are
+`docs/archive/MERGE_ACCURACY_PLAN.md`; the algorithm is `docs/METHODS.md` §1–§3.
+
+**Why.** khorana's review of a chr22 corpus (2026-09-25; not in this repository) found 0.5.3's residual
+errors concentrated in three places: long divergent repeats outscoring a short true
+overlap, false read-through merges that destroyed the fragment, and the trim band, which
+deleted real bases and rewrote kept mates. 0.6 replaces tuned thresholds with one
+derived tolerance and one documented model parameter. Measured at full scale against
+0.5.3, pair by pair against simulated truth (4.11M pairs over eight benches, each under
+its intended contract; `docs/MERGE_BENCHMARK_RESULTS.md` §9):
+
+| | 0.5.3 | 0.6 |
+|---|---:|---:|
+| wrong merges emitted | 11,875 | **5,151** |
+| fragments lost to a wrong merge or an N-trim | 719 | **544** |
+| wrong trims (real bases deleted from a kept mate) | 7,225 | **0** |
+| kept-mate bases rewritten | 14,366 | **0** |
+| correct merges | 2,937,253 | 2,937,748 (7 forgone, 502 gained) |
+| compiled CPU, `merge --threads 1`, plain FASTQ | — | **9–29% less** |
+
+### Changed — the merge decision
+
+- **The merge floor is derived per pair**: `T = log2((len1 + len2 − 1) / α)` bits, from
+  one tolerance `--alpha` (default `1e-6`) — at most `α` chance merges of unrelated
+  sequence per pair. At 2×150 that is 28.2 bits, 0.5.x's fixed 28; at 2×50 it is 26.6
+  and at 2×300 29.2, where 0.5.x was too strict and too lax respectively.
+- **A plausibility gate refuses divergent repeats.** The best alignment's mismatches —
+  not counting positions where exactly one mate is `N`, which carry no information —
+  must be plausible as sequencing error at the same `α`: `d ≤ dfit[n]`, the most a true
+  `n`-base overlap shows with probability ≥ `α`. An implausible winner is a repeat; the
+  pair is kept whole and nothing is searched for in its place. It refused 5,632 pairs in
+  qualification, none at the true fragment length.
+- **The error rate is a documented parameter**, `--error-rate` (default 0.01, 0.5.x's
+  hidden `err_rate`). It sets the score's mismatch cost and the gate's `dfit`. It is not
+  estimated from the data: an estimator was built and measured, and on 3′-degraded
+  libraries it admitted *more* wrong merges (560 → 741 against 560 → 240 at a fixed 1%).
+- **The trim band is gone.** An unmerged pair is emitted as its two input mates, changed
+  by nothing but `--npolicy`. The band removed ~0.55 duplicated bases per pair while
+  causing every wrong trim and every rewritten kept-mate base; the duplicated overlap now
+  stays in kept pairs.
+- **`--adapter-trimmed` declares that no read extends past its molecule**, which makes
+  read-through alignments ineligible. On honestly trimmed input it removes the false
+  read-throughs behind most lost fragments; without it zna infers read-through as before,
+  which is overlap-based adapter removal. It is checked, not verified: see the warnings
+  below, and `docs/METHODS.md` §1.7 for what fastp must do for the declaration to hold.
+- Everything a decision uses is exact: `α` and `e` are parsed from their decimal strings
+  into rationals, and the weights, the floor table and `dfit` are computed with
+  correctly rounded `decimal` and integer arithmetic, with no libm anywhere. The weights
+  at `e = 0.01` are the same two integers 0.5.3 used.
+
+### Removed
+
+- **`--threshold-merge` and `--threshold-trim`**, from `zna merge` and
+  `zna encode --merge-pairs`. Passing either is an error.
+- JSON keys `trimmed_pairs`, `trimmed_pct`, `bases_trimmed`, `trim_guard_kept_untrimmed`,
+  and under `params`: `threshold_merge_bits`, `threshold_trim_bits`, `err_rate`,
+  `threshold_merge_q`, `threshold_trim_q`.
+- `PairOutcome.TRIMMED`, `MergeParams(t_merge=, t_trim=, err_rate=)`, and `find_overlap`'s
+  `(direction, shift, overlap_len, diff, score_q)` tuple with its `FORWARD`/`REVERSE`/
+  `NO_OVERLAP` codes (see Added). `threshold_bits(n_shifts, alpha)` now takes the pair's
+  shift count `N = len1 + len2 − 1`, not a read length.
+- Per-record provenance bit 1, `PROV_TRIMMED`, is **retired, not reused**: no 0.6 record
+  sets it, and on a 0.5.x corpus it still means a trimmed pair.
+- `scripts/merge_bench/bench_breakdown.py` and `proto_merge.cpp`, which measured the 0.5.x
+  path and have no meaningful 0.6 form (recover them from `v0.5.3`).
+
+### Added
+
+- **Flags** (on both `zna merge` and `zna encode --merge-pairs`): `--alpha`,
+  `--error-rate`, `--adapter-trimmed`.
+- **JSON keys**: `policy` (`"zna-merge-0.6"`), `implausible_refused`, `error_rate`,
+  `detected_overlap_mismatch_rate`, `detected_overlap_bases`,
+  `expected_refused_true_overlap_fraction`, `detected_overlap_length_histogram`,
+  `adapter_trimmed`, `readthrough_check_pairs`, `readthrough_check_strong_fraction`,
+  `params.alpha`, and `insert_size_censoring.at_read_length`. Every value is finite and
+  of a fixed type, 0 / 0.0 / `{}` on an empty input, so a cohort gather with a strict
+  schema needs only the new names.
+- **Three run warnings**, printed by both commands whatever `-q` says, each meaning a
+  parameter may be wrong for the library:
+  - `--error-rate`: when the plausibility gate is expected to refuse more than 0.1% of
+    true overlaps at the disagreement the run's detected overlaps show. The message
+    gives the refused count and a suggested value, and states the trade: raising the
+    rate recovers refused pairs but also merges more short or divergent overlaps, false
+    ones included (a 3′-degraded simulation: 240 wrong merges at 0.01, 745 at 0.036). On
+    the 46-bench truth panel only the extreme 5% 3′-ramp set warns; no full-scale
+    benchmark does.
+  - `--adapter-trimmed`: when more than 1% of the first 100,000 pairs still align best as
+    a strong read-through (honest input measures 0–0.11%, raw input 2–23%).
+  - when no pair in the run could merge at all under the chosen `--alpha` and
+    `--error-rate` (even a perfect overlap of the longest read falls short of the floor).
+- **A merge record in the `.zna` prologue.** `zna encode --merge-pairs` writes
+  `merge: {policy, zna_version, alpha, error_rate, adapter_trimmed, min_read_length,
+  npolicy}` before the first record; `zna shuffle` and ZNA → ZNA re-encode copy it
+  verbatim; `zna inspect` prints it and `--json` splices it. It is absent when the merge
+  history is unknown (the two-step path, zna < 0.6), and absent means unknown, never a
+  default. `ZnaProvenance.merge` exposes it; `ZnaWriter(merge_record=…)` writes it.
+- **API**: `find_overlap` returns the authoritative decision, an `Overlap(verdict, shift,
+  overlap_len, mismatches, informative_mismatches, score_q, fragment_length)` with
+  verdict `merge`, `none` or `implausible`; the bare argmax is `scan_unrestricted`, for
+  diagnostics. `MergeParams(alpha, error_rate, adapter_trimmed, min_read_length, npolicy,
+  rng_seed)` derives everything else and provides `merge_record()`. `PairResult` gains
+  `implausible`, `detected_bases`, `detected_mismatches` and `detected_overlap_len`.
+- **Backend contract `POLICY_ABI = 2`.** The kernel functions take the two `int64`
+  tables and the contract; `process_pair` returns 15 fields; the chunk functions return
+  a fourth histogram (detected overlap lengths) and `need`, the read length the tables
+  must grow to before the chunk can continue. A compiled extension that does not declare
+  it — every 0.5.x build, and any build of an older 0.6 tree — is refused as if it had
+  not been built.
+- `scripts/merge_bench/mine_panel.py` and `panel_eval.py`: the truth panel (245k pairs
+  mined from 14.1M over 46 simulated substrates) and its pair-level ledger, the method
+  by which this release was judged. `tests/conftest.py` adds `--merge-backend=python`,
+  which makes `auto` resolve to the reference backend for the session (tests that ask
+  for `accel` by name still get it, so the cross-backend differentials keep running). `tests/data/report_cases/` holds
+  the review's 19 ground-truth pairs as fixtures.
+
+### Fixed
+
+- **A kept pair could carry bases the consensus had rewritten.** When `--npolicy trim3`
+  cut a mate at an `N` so far that a merge verdict could no longer tile the fragment, the
+  pair was kept — with R1 as the consensus had already rewritten it for the merge that
+  did not happen. 167 kept pairs on the truth panel's N benches, 10 of their
+  substitutions to a wrong base. R1 is now re-derived from the input with only the N
+  policy applied, and the consensus counters do not count it.
+- The compiled and reference backends now agree on malformed input they used to handle
+  differently: lines ending in several carriage returns (the compiled side stripped one),
+  and an R1/R2 desync on a non-UTF-8 read name (the compiled side raised
+  `UnicodeDecodeError` instead of the desync message).
+- `scripts/merge_bench/dump_pairs.py` and `verify_tiebreak.py` had not run since the API
+  they called changed; ported, `dump_pairs.py` writes a `pairs.bin` byte-identical to
+  0.5.x's, and `verify_tiebreak.py` checks 144 ties with 0 violations.
+  `compare.py` is ported: kept pairs are scored for being whole, and `--alpha`,
+  `--error-rate` and `--adapter-trimmed` pass straight through.
+
+### Performance
+
+The floor starts the scan's incumbent at ~28 bits instead of 0.5.x's 8, and the contract
+is a compile-time template parameter; the gate is one table lookup after the scan. On an
+Apple M3 Max, µs/pair, 0.5.3 → 0.6:
+
+| | scan | `process_pair` | `merge_chunk` |
+|---|---|---|---|
+| chr22, 1M pairs, declared | 0.455 → 0.301 | 0.667 → 0.330 | 0.795 → 0.458 |
+| chr22, 1M pairs, undeclared | 0.443 → 0.376 | 0.667 → 0.509 | 0.792 → 0.633 |
+
+End to end, `zna merge --threads 1` on plain FASTQ: 1M chr22 pairs 1.07 → 0.92 s
+undeclared and 0.76 s declared; 1M hg38 pairs 1.05 → 0.89 s. Threaded memory matches
+0.5.3's (26–34 MB at 1–16 threads). Long reads cost table building once per run: a 10 kb
+read takes ~1.6 s before the first pair, against 0.09 s in 0.5.3.
+`docs/PERFORMANCE.md` has the rest.
+
+### Known limits
+
+- **Near-identical repeats still merge wrongly.** A perfect 15-base repeat is plausible
+  under any error model. The residual is fewer but more concentrated: on transcriptome
+  input one transcript carries 200 of the 589 remaining wrong merges on the clean set.
+- **Raw reads without the declaration** keep 0.5.3's false read-through merges and the
+  fragments they lose (hg38: 495 per 1M). The remedy is to trim and declare.
+- **The declaration is only as honest as the trimmer.** A fastp pass with `--cut_tail`
+  leaves 1–3 bp of adapter on 42 per 500k transcriptome pairs; declared, that forgoes
+  0.011% of correct merges and emits 47 adapter bases. The same single pass without
+  `--cut_tail` leaves 7 per 500k (declared: 0.002% forgone, 8 adapter bases; fastp 1.1.0
+  and 1.3.6 identical). Undeclared input is never harmed.
+
+### Downstream
+
+- **hulkrna** must drop `--threshold-merge`/`--threshold-trim` from its config, trim
+  adapters with one fastp pass without `--cut_tail` and pass `--adapter-trimmed`, and
+  expects the new JSON keys in its cohort gather.
+- **khorana** should require the prologue's `merge.policy == "zna-merge-0.6"` rather
+  than infer the policy from a version number, and treat a missing record as unknown.
+  It also refuses a file whose merge record lacks `adapter_trimmed: true`.
+
+### Tests
+
+**852** passed with the compiled backend; **434** on the reference backend
+(`--merge-backend=python`, the two merge suites); **781 passed, 78 skipped** without the
+merge extension. New: exact goldens for `T(N)` and `dfit`, the gate's closed-form
+sensitivity against exact enumeration, both contract ranges, N-informative gating, the
+review's 19 cases, the diagnostics checked by brute force against `find_overlap`, the
+merge record's round trip through encode, shuffle and re-encode, and cross-backend
+agreement on malformed input.
+
 ## [0.5.3] - 2026-08-19
 
 **The aarch64 re-measure 0.5.2 owed.** 0.5.2 changed the NEON code path blind — the

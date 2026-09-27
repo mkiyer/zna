@@ -1,18 +1,34 @@
 """Force ties and check WHICH shift the kernel picks.
 
-Ties need two shifts with identical (n, d): score = n*MW - d*STEP and MW/STEP is
-not a simple ratio, so equal score implies equal n and equal d. Equal n at
-different s happens on the two flanks (s = len1-n and s = n-len2) -- which for a
-PERIODIC sequence both align perfectly. Random sequence essentially never ties,
-which is why the previous sweep found none.
+    python verify_tiebreak.py r1.fq.gz r2.fq.gz
+
+Ties need two shifts with identical (n, d): score = n*match_q - d*step_q and
+match_q/step_q is not a simple ratio, so equal score implies equal n and equal d. Equal
+n at different s happens on the two flanks (s = len1-n and s = n-len2) -- which for a
+PERIODIC sequence both align perfectly. Random sequence essentially never ties, which is
+why the previous sweep found none.
+
+Probes the shipped backend's ``scan`` over every shift at a fixed 8-bit floor (the
+floor these probes were written for; 0.6's per-pair floor of ~28 bits at 2x150 would
+leave the short plateaus below it and prove nothing about them), in the kernel's own
+integers, against an exhaustive integer scoring of every shift. The rule it checks --
+max score, then max n, then min s -- is the argmax total order of ``docs/METHODS.md``,
+which 0.6 kept; the contract and the plausibility gate act after it.
 """
-import random, sys
-from zna.merge.overlap import FORWARD, NO_OVERLAP, find_overlap, reverse_complement, score_weights
+import sys
+
+from zna.merge import backend
 from zna.merge.fastqio import read_pairs
+from zna.merge.overlap import reverse_complement
+from zna.merge.params import SCALE, MergeParams
 
-MW, MMW = score_weights(0.01); STEP = MW + MMW
+P = MergeParams(error_rate="0.01")
+MQ, STEP = P.match_q, P.step_q
+FLOOR_Q = 8 * SCALE
+SCAN = backend.active().scan
 
-def exhaustive(s1, s2rc, t=8.0):
+
+def exhaustive(s1, s2rc):
     len1, len2 = len(s1), len(s2rc)
     out = []
     for s in range(-(len2 - 1), len1):
@@ -23,14 +39,14 @@ def exhaustive(s1, s2rc, t=8.0):
         d = 0
         for k in range(n):
             d += s1[lo + k] != s2rc[off + k]
-        sc = n * MW - d * STEP
-        if sc >= t: out.append((s, n, d, sc))
+        sc = n * MQ - d * STEP
+        if sc >= FLOOR_Q: out.append((s, n, d, sc))
     return out
 
 def kernel_s(s1, s2rc):
-    direction, shift, olen, diff, score = find_overlap(s1, s2rc, 8.0, 0.01)
-    if direction == NO_OVERLAP: return None
-    return (shift if direction == FORWARD else -shift), olen, diff
+    s, _score, olen, diff = SCAN(s1, s2rc, len(s1), len(s2rc), MQ, STEP, FLOOR_Q, 0)
+    if olen == 0: return None
+    return s, olen, diff
 
 def probe(s1, s2rc, label, tally):
     allsc = exhaustive(s1, s2rc)
@@ -38,7 +54,7 @@ def probe(s1, s2rc, label, tally):
     if not allsc:
         assert got is None, f"{label}: kernel {got}, exhaustive none"; return
     top = max(t[3] for t in allsc)
-    ties = sorted([t for t in allsc if abs(t[3] - top) < 1e-9])
+    ties = sorted([t for t in allsc if t[3] == top])        # exact: integer scores
     tally["cases"] += 1
     if len(ties) > 1:
         tally["tied"] += 1
@@ -49,17 +65,17 @@ def probe(s1, s2rc, label, tally):
         tally["bad_min_s"] += 1
         if tally["bad_min_s"] <= 4:
             print(f"  {label}: kernel {got} | min-s rule {want[:3]} | max-s rule {want_maxs[:3]}"
-                  f" | {len(ties)} tied at {top:.3f}")
+                  f" | {len(ties)} tied at {top / SCALE:.3f} bits")
     if len(ties) > 1 and got == (want_maxs[0], want_maxs[1], want_maxs[2]) and want != want_maxs:
         tally["matches_max_s"] += 1
 
 T = dict(cases=0, tied=0, bad_min_s=0, matches_max_s=0, max_tie=0)
 
 # --- 1. perfect tandem repeats: every flank pair ties exactly ---------------
-for period in ("CA", "AT", "CAG", "AAAC", "ACGT"):
+for period in (b"CA", b"AT", b"CAG", b"AAAC", b"ACGT"):
     for reps in range(6, 40):
         seq = (period * 100)[: len(period) * reps]
-        probe(seq, seq, f"rep{period}x{reps}", T)          # s1 == s2rc, fully periodic
+        probe(seq, seq, f"rep{period.decode()}x{reps}", T)          # s1 == s2rc, fully periodic
 print(f"tandem repeats: {T}")
 
 # --- 2. homopolymers: maximal tie degeneracy -------------------------------
@@ -84,6 +100,7 @@ for r1, r2 in read_pairs(sys.argv[1], sys.argv[2], 1):
     n += 1
     if n >= 800: break
 print(f"real 2x150 (n={n}): {T4}")
+print(f"backend: {backend.active_name()}")
 
 tot_bad = T["bad_min_s"] + T2["bad_min_s"] + T3["bad_min_s"] + T4["bad_min_s"]
 tot_tied = T["tied"] + T2["tied"] + T3["tied"] + T4["tied"]

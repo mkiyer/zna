@@ -193,14 +193,14 @@ def corpus(tmp_path_factory):
 
 
 class TestMergeToZna:
-    def test_merge_produced_all_three_outcomes(self, corpus):
+    def test_merge_produced_both_outcomes(self, corpus):
         """Guard the fixture itself: a corpus with no kept pairs would prove nothing."""
         _tmp, frags, by_id, _fq, stats = corpus
         singles = [f for f, r in by_id.items() if len(r) == 1]
         pairs = [f for f, r in by_id.items() if len(r) == 2]
         assert len(singles) >= 30 and len(pairs) >= 20
         assert stats["merged"] == len(singles)
-        assert stats["trimmed_pairs"] + stats["kept_pairs"] >= len(pairs)
+        assert stats["kept_pairs"] >= len(pairs)
         # Every emitted record belongs to a pair or a single — never an orphan.
         assert all(len(r) in (1, 2) for r in by_id.values())
 
@@ -351,16 +351,13 @@ class TestProvenanceReachesTheCorpus:
         _stats, recs = n_corpus
         assert sum(1 for r in recs if r[2][0] == 0) > 0, "every record was touched"
 
-    def test_the_trimmed_bit_counts_the_trimmed_pairs(self, n_corpus):
-        """PROV_TRIMMED is the one bit with no other home: a trimmed pair is emitted as
-        an ordinary pair, and nothing in the ZNA flag byte distinguishes it from a pair
-        that was kept whole. Both mates of every surviving trimmed pair carry it."""
-        stats, recs = n_corpus
-        from zna.merge._pymerge import PROV_TRIMMED
-        n_trimmed_recs = sum(1 for r in recs if r[2][0] & PROV_TRIMMED)
-        assert n_trimmed_recs == 2 * stats["trimmed_pairs"], (
-            f"{n_trimmed_recs} records carry PROV_TRIMMED but "
-            f"{stats['trimmed_pairs']} pairs were trimmed")
+    def test_the_retired_trimmed_bit_is_never_set(self, n_corpus):
+        """Bit 1 was PROV_TRIMMED until 0.6 removed the trim band. It is retired, not
+        reused, so it must never appear -- a set bit 1 in a corpus means 0.5.x."""
+        _stats, recs = n_corpus
+        from zna.merge import _pymerge
+        assert not hasattr(_pymerge, "PROV_TRIMMED")
+        assert not any(r[2][0] & 1 for r in recs)
 
     def test_trim3_never_claims_a_substitution(self, n_corpus):
         """The two N policies are mutually exclusive per run, and the bits say which
@@ -375,9 +372,8 @@ class TestProvenanceReachesTheCorpus:
         """A byte with an undefined bit set means the two sides disagree about what the
         column means, which is worse than an absent column."""
         _stats, recs = n_corpus
-        from zna.merge._pymerge import (PROV_NSUBBED, PROV_NTRIMMED, PROV_RESCUED,
-                                        PROV_TRIMMED)
-        known = PROV_TRIMMED | PROV_RESCUED | PROV_NTRIMMED | PROV_NSUBBED
+        from zna.merge._pymerge import PROV_NSUBBED, PROV_NTRIMMED, PROV_RESCUED
+        known = PROV_RESCUED | PROV_NTRIMMED | PROV_NSUBBED
         assert all(r[2][0] & ~known == 0 for r in recs)
 
     def test_the_other_labels_are_unaffected(self, n_corpus):
@@ -589,18 +585,25 @@ class TestMergePairsMatchesTheTwoStep:
         flags_two = _flags_of(two)
         assert flags_two == {16: 4}, flags_two
 
-    def test_merge_pairs_thresholds_reach_the_kernel(self, tmp_path):
+    def test_merge_pairs_policy_flags_reach_the_kernel(self, tmp_path):
         """A parameter parsed but never passed to MergeParams is invisible to
         every other test here; the merged-record count must move."""
         in1, in2 = make_inputs(tmp_path, seed=1305, n=200)
-        low = _mp_encode(tmp_path, in1, in2, "--threshold-merge", "28",
-                         name="low.zna")
-        high = _mp_encode(tmp_path, in1, in2, "--threshold-merge", "500",
-                          name="high.zna")
-        merged_low = _flags_of(low).get(16, 0)
-        merged_high = _flags_of(high).get(16, 0)
-        assert merged_low > merged_high, (merged_low, merged_high)
-        assert merged_high == 0
+        base = _mp_encode(tmp_path, in1, in2, name="base.zna")
+        # alpha = 1e-300 puts T near 1,000 bits: nothing a 150 bp read holds reaches it
+        tight = _mp_encode(tmp_path, in1, in2, "--alpha", "1e-300", name="tight.zna")
+        merged_base = _flags_of(base).get(16, 0)
+        assert merged_base > 0 and _flags_of(tight).get(16, 0) == 0
+        # the declaration removes the read-through merges (inserts under 150)
+        declared = _mp_encode(tmp_path, in1, in2, "--adapter-trimmed",
+                              name="declared.zna")
+        assert 0 < _flags_of(declared).get(16, 0) < merged_base
+        # and the error rate reaches the record the file carries
+        user = _mp_encode(tmp_path, in1, in2, "--error-rate", "0.0042",
+                          name="user.zna")
+        with open(user, "rb") as fh:
+            merge = ZnaReader(fh).provenance.merge
+        assert merge["error_rate"] == "0.0042"
 
     def test_merge_pairs_composes_with_strand_normalize(self, tmp_path):
         """The test that would have caught §0.2: --strand-normalize must not
@@ -754,3 +757,140 @@ class TestMergePairsRejections:
         assert proc.returncode == 0, proc.stderr
         with open(out, "rb") as fh:
             assert ZnaReader(fh).trailer.n_records == 0
+
+
+# --------------------------------------------------------------------------- #
+# the merge record: which policy made the records (MERGE_ACCURACY_PLAN.md §5)
+# --------------------------------------------------------------------------- #
+
+def _prov(path):
+    with open(path, "rb") as fh:
+        return ZnaReader(fh).provenance
+
+
+def _canon(obj):
+    import json
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+@pytest.fixture(scope="module")
+def merged(tmp_path_factory):
+    """One ``encode --merge-pairs`` run, with its --merge-json."""
+    tmp_path = tmp_path_factory.mktemp("mrec")
+    in1, in2 = make_inputs(tmp_path, seed=1401, n=120, with_n=True)
+    js = tmp_path / "merge.json"
+    out = _mp_encode(tmp_path, in1, in2, "--merge-json", str(js),
+                     "--npolicy", "random")
+    import json
+    return tmp_path, in1, in2, out, json.loads(js.read_text())
+
+
+class TestMergeRecord:
+    """``encode --merge-pairs`` writes the policy into the prologue; every copy of the
+    file carries it unchanged; a file whose origin is unknown carries none."""
+
+    def test_the_record_is_written_and_matches_the_run(self, merged):
+        _tmp, _in1, _in2, out, stats = merged
+        import zna
+        from fractions import Fraction
+        rec = _prov(out).merge
+        assert set(rec) == {"policy", "zna_version", "alpha", "error_rate",
+                            "adapter_trimmed", "min_read_length", "npolicy"}
+        assert rec["policy"] == stats["policy"] == "zna-merge-0.6"
+        assert rec["zna_version"] == zna.__version__
+        assert (rec["alpha"], rec["error_rate"]) == ("0.000001", "0.01")   # defaults
+        assert Fraction(rec["error_rate"]) == Fraction(repr(stats["error_rate"]))
+        assert (rec["adapter_trimmed"], rec["min_read_length"], rec["npolicy"]) == \
+            (False, MIN_READ_LENGTH, "random")
+
+    def test_the_encode_shuffle_pass_carries_it(self, merged):
+        tmp_path, in1, in2, out, _stats = merged
+        shuffled = _mp_encode(tmp_path, in1, in2, "--npolicy", "random",
+                              "--shuffle", "--seed", "3", name="mshuf.zna")
+        p0, p1 = _prov(out), _prov(shuffled)
+        assert p1.shuffled and _canon(p1.merge) == _canon(p0.merge)
+
+    def test_shuffle_then_reencode_preserve_it_byte_for_byte(self, merged):
+        """encode -> zna shuffle -> re-encode: the object round-trips exactly."""
+        tmp_path, _in1, _in2, out, _stats = merged
+        shuf = tmp_path / "shuf.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "shuffle", "-q", "-s", "5",
+               "-o", str(shuf), str(out)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        re_ = tmp_path / "re.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "-q", "-o", str(re_),
+               str(shuf)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        p0, p1, p2 = _prov(out), _prov(shuf), _prov(re_)
+        assert _canon(p0.merge) == _canon(p1.merge) == _canon(p2.merge)
+        assert p1.shuffled and p2.shuffled and p2.merged_in_process
+        # ...and the records survived too: a copy is a copy
+        with open(out, "rb") as a, open(re_, "rb") as b:
+            assert sorted(r[0] for r in ZnaReader(a).records()) == \
+                sorted(r[0] for r in ZnaReader(b).records())
+
+    def test_the_two_step_path_carries_no_record(self, tmp_path):
+        """A FASTQ intermediate cannot carry the policy, so the file it becomes does not
+        claim one: absent means unknown, never a default."""
+        in1, in2 = make_inputs(tmp_path, seed=1403, n=40)
+        merged_fq, _stats = run_merge(tmp_path, in1, in2)
+        two = tmp_path / "two.zna"
+        cmd = [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+               "--treat-unpaired-as-merged", "-o", str(two), str(merged_fq)]
+        assert subprocess.run(cmd, capture_output=True).returncode == 0
+        p = _prov(two)
+        assert p.merge is None and "merge" not in p.raw
+
+    def test_inspect_prints_it(self, merged):
+        _tmp, _in1, _in2, out, _stats = merged
+        proc = subprocess.run([sys.executable, "-m", "zna.cli", "inspect", str(out)],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "Merge record:" in proc.stdout
+        assert "zna-merge-0.6" in proc.stdout and "error_rate:" in proc.stdout
+        proc = subprocess.run([sys.executable, "-m", "zna.cli", "inspect", "--json",
+                               str(out)], capture_output=True, text=True)
+        import json
+        assert json.loads(proc.stdout)["provenance"]["merge"] == _prov(out).merge
+
+    def test_the_merge_json_carries_the_diagnostics(self, merged):
+        """The same diagnostics `zna merge --json` writes, from the same counters."""
+        _tmp, _in1, _in2, _out, stats = merged
+        assert stats["readthrough_check_pairs"] == 120
+        assert stats["detected_overlap_bases"] > 0
+        assert 0.0 <= stats["detected_overlap_mismatch_rate"] < 0.01
+        assert 0.0 < stats["readthrough_check_strong_fraction"] < 1.0   # raw reads
+        assert "implausible_refused" in stats and "trimmed_pairs" not in stats
+        for gone in ("error_rate_source", "error_sample_pairs", "error_prior_share"):
+            assert gone not in stats
+
+    def test_encode_warns_like_merge_does(self, tmp_path):
+        """A library whose true overlaps disagree at 8% against the default 1%: encode
+        --merge-pairs prints the same warning `zna merge` logs, even under -q, and at
+        the suggested value it is quiet."""
+        rng = random.Random(1405)
+        in1, in2 = tmp_path / "noisy_1.fq", tmp_path / "noisy_2.fq"
+        with open(in1, "wb") as f1, open(in2, "wb") as f2:
+            for i in range(40):
+                frag = _draw(rng, 250)
+                s1 = bytearray(frag[:READLEN])
+                for k in range(100, 150, 13):                  # 4 in the 50-base overlap
+                    s1[k] = ord("A") if s1[k] != ord("A") else ord("C")
+                s2 = rc(frag[100:])
+                f1.write(b"@n%d/1\n%b\n+\n%b\n" % (i, bytes(s1), b"I" * len(s1)))
+                f2.write(b"@n%d/2\n%b\n+\n%b\n" % (i, s2, b"I" * len(s2)))
+
+        def encode(*extra, name):
+            cmd = [sys.executable, "-m", "zna.cli", "encode", "--merge-pairs", "-q",
+                   "--min-read-length", str(MIN_READ_LENGTH), "-o",
+                   str(tmp_path / name), *extra, str(in1), str(in2)]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stderr
+            return proc.stderr
+        err = encode(name="noisy.zna")
+        assert "WARNING: merge:" in err
+        assert "at --error-rate 0.01 the test is expected to refuse" in err
+        assert "Rerun with --error-rate 0.08 " in err
+        assert "WARNING" not in encode("--error-rate", "0.08", name="set.zna")
