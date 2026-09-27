@@ -8,7 +8,7 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
-## [Unreleased] — 0.6.0
+## [0.6.0] - 2026-09-26
 
 **`zna merge` and `zna encode --merge-pairs` produce different output from 0.5.x, and
 every corpus built with them must be regenerated.** The merge decision changed: pairs
