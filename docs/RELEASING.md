@@ -158,6 +158,26 @@ Do this **after** the PyPI release is live and the GitHub tag exists.
 > "please review & merge" on it, a maintainer merged it within the hour. Adding that
 > label is a request to merge on green: **do not add it until the recipe body is the one
 > you want shipped.**
+>
+> On 0.6.0 the bot opened its PR (#69649) within an hour of the PyPI release; a bioconda
+> contributor cannot close it. Open the full-recipe PR anyway and comment on the bot's
+> "Superseded by #…" so a maintainer closes it.
+
+#### Keep `conda/meta.yaml` free of explanatory comments
+
+Bioconda reviewers ask for standard, uncommented recipes (0.6.0's PR was sent back for
+exactly this). Keep only conda selectors (`# [osx]`, `# [py<310]`). Why the recipe is the
+way it is lives here instead:
+
+- **`{{ stdlib('c') }}`** is bioconda's stdlib migration, not a package; do not drop it
+  (see "Test the conda build locally" below for the local `-m` requirement).
+- **`import zna.merge._accel`** and the `available_merge_backends()` assert: `zna merge` is
+  a second compiled extension, and a build that lost it would pass every other test while
+  the pure-Python reference backend quietly took over at ~50x the cost.
+- **`assert is_accelerated()`**, not a print: a build that fell back to the pure-Python
+  codec would otherwise pass its own test (bioconda's 0.3.5 recipe only printed it).
+- **`zna merge --help`** exercises the subcommand's registration, which must not need the
+  compiled backend just to print help.
 
 #### Fixing a recipe after it has merged
 
