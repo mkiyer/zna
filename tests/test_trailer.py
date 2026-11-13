@@ -294,6 +294,47 @@ class TestStamping(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Corrupt provenance prologue"):
             ZnaReader(io.BytesIO(bad)).provenance
 
+    FULL_FRAGMENT_RECORD = {"policy": "zna-full-fragment-0.7", "zna_version": "0.7.0",
+                            "read_length": 150, "unpaired_as_merged": False}
+
+    def test_the_full_fragment_record_round_trips_and_is_absent_by_default(self):
+        """Absent means UNKNOWN (zna < 0.7): a writer not given a record writes none."""
+        p = ZnaReader(io.BytesIO(build())).provenance
+        self.assertIsNone(p.full_fragment)
+        self.assertNotIn("full_fragment", p.raw)
+        p = ZnaReader(io.BytesIO(build(
+            full_fragment_record=self.FULL_FRAGMENT_RECORD))).provenance
+        self.assertEqual(p.full_fragment, self.FULL_FRAGMENT_RECORD)
+        self.assertEqual(p.raw["full_fragment"], self.FULL_FRAGMENT_RECORD)
+
+    def test_shuffle_propagates_the_full_fragment_record_verbatim(self):
+        """A permutation cannot change which rule set IS_FULL_FRAGMENT."""
+        import tempfile, pathlib as pl, json
+        with tempfile.TemporaryDirectory() as d:
+            src = pl.Path(d) / "in.zna"
+            dst = pl.Path(d) / "out.zna"
+            src.write_bytes(build(n_pairs=100, n_single=10, block_size=256,
+                                  merge_record=self.MERGE_RECORD,
+                                  full_fragment_record=self.FULL_FRAGMENT_RECORD))
+            shuffle_zna(str(src), str(dst), seed=3, buffer_bytes=1 << 16,
+                        block_size=256, tmp_dir=d, quiet=True)
+            p = ZnaReader(io.BytesIO(dst.read_bytes())).provenance
+        self.assertTrue(p.shuffled)
+        self.assertEqual(json.dumps(p.full_fragment, sort_keys=True),
+                         json.dumps(self.FULL_FRAGMENT_RECORD, sort_keys=True))
+        self.assertEqual(p.merge, self.MERGE_RECORD)
+
+    def test_a_malformed_full_fragment_record_is_corruption_not_absence(self):
+        import json
+        data = build(comp=COMPRESSION_NONE,
+                     full_fragment_record=self.FULL_FRAGMENT_RECORD)
+        obj = json.dumps(self.FULL_FRAGMENT_RECORD, sort_keys=True,
+                         separators=(",", ":")).encode()
+        self.assertEqual(data.count(obj), 1)
+        bad = data.replace(obj, b'"' + b"x" * (len(obj) - 2) + b'"')
+        with self.assertRaisesRegex(ValueError, "Corrupt provenance prologue"):
+            ZnaReader(io.BytesIO(bad)).provenance
+
 
 class TestWriterEdges(unittest.TestCase):
     def test_zero_record_file_has_a_trailer(self):

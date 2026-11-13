@@ -101,6 +101,14 @@ _FOOTER_VERSION = 1
 PROLOGUE_SCHEMA = 1
 TRAILER_SCHEMA = 1
 
+#: The rule ``zna encode`` sets ``IS_FULL_FRAGMENT`` by on the records it does not get
+#: from the merger, as written into the prologue's ``full_fragment`` record (METHODS
+#: §3.4, §3.8). A pair is full only when its mates are exact reverse complements AND
+#: shorter than the declared read length (``--read-length``), and no record that
+#: ``--npolicy trim3`` cut is ever full. Consumers compare it for equality; it changes
+#: whenever the rule does.
+FULL_FRAGMENT_POLICY = "zna-full-fragment-0.7"
+
 # Sequence-length field widths
 MIN_SEQ_LEN_BYTES = 1
 MAX_SEQ_LEN_BYTES = 4
@@ -320,6 +328,15 @@ def _merge_record_of(prologue: dict) -> dict | None:
     return m
 
 
+def _full_fragment_record_of(prologue: dict) -> dict | None:
+    """The prologue's ``full_fragment`` object, or ``None``; a present one must be an
+    object."""
+    m = prologue.get("full_fragment")
+    if m is not None and not isinstance(m, dict):
+        raise TypeError(f"'full_fragment' is a {type(m).__name__}, not an object")
+    return m
+
+
 @dataclass(slots=True)
 class ZnaProvenance:
     """The prologue: facts known at encode START, readable before any record.
@@ -343,6 +360,14 @@ class ZnaProvenance:
     #: two-step pipeline, or by zna < 0.6 -- which a consumer must treat as
     #: unknown, never as some default policy.
     merge: dict | None
+    #: The rule ``zna encode`` set ``IS_FULL_FRAGMENT`` by on records it did not
+    #: get from the merger (``policy``, ``zna_version``, ``read_length``,
+    #: ``unpaired_as_merged``; see :data:`FULL_FRAGMENT_POLICY`). Written by every
+    #: FASTQ encode from 0.7 on and carried verbatim by shuffle and re-encode.
+    #: ``None`` when UNKNOWN -- written by zna < 0.7, whose rule flagged every exact
+    #: reverse-complement pair at any length -- which a consumer must treat as
+    #: unknown, never as the current rule.
+    full_fragment: dict | None
     #: crc32 of the prologue payload as written; :class:`ZnaTrailer` re-states
     #: it, so the end of the file attests the start.
     crc32: int
@@ -448,6 +473,7 @@ class ZnaWriter:
         "_shuffled",
         "_merged_in_process",
         "_merge_record",
+        "_full_fragment_record",
         "_len_char",
         "_flag_counts",
         "_len_hist",
@@ -471,6 +497,7 @@ class ZnaWriter:
         shuffled: bool = False,
         merged_in_process: bool = False,
         merge_record: dict | None = None,
+        full_fragment_record: dict | None = None,
     ) -> None:
         self._fh = fh
         self._header = header
@@ -531,7 +558,8 @@ class ZnaWriter:
         self._shuffled = shuffled
         self._merged_in_process = merged_in_process
         self._merge_record = merge_record
-        self._len_char = {1: "B", 2: "H", 4: "I"}[header.seq_len_bytes]
+        self._full_fragment_record = full_fragment_record
+        self._len_char ={1: "B", 2: "H", 4: "I"}[header.seq_len_bytes]
         self._flag_counts = [0] * 256
         self._len_hist: dict[int, int] = {}
         self._len_hist_unpaired: dict[int, int] = {}
@@ -1000,11 +1028,14 @@ class ZnaWriter:
         learns what wrote the file -- and whether its order is shuffled --
         before decoding a single record.  Facts that need the whole encode go
         in the trailer instead.  Parameter echoes are QC material, not file
-        facts, with one exception: the ``merge`` record, because WHICH merge
-        policy made the records decides whether they may enter training, and
-        nothing else in the file can answer that (MERGE_ACCURACY_PLAN.md §5).
-        It is written only when known -- by ``--merge-pairs``, or copied from
-        the input by re-encode and shuffle -- and absent otherwise.
+        facts, with two exceptions, both records of a rule that made the
+        records and that nothing else in the file can answer: the ``merge``
+        record, because WHICH merge policy made the records decides whether
+        they may enter training (MERGE_ACCURACY_PLAN.md §5), and the
+        ``full_fragment`` record, because which rule set ``IS_FULL_FRAGMENT``
+        decides whether a consumer may trust both ends (METHODS §3.8).  Each
+        is written only when known -- by the encode that applied the rule, or
+        copied from the input by re-encode and shuffle -- and absent otherwise.
 
         A 0.4.1 reader decodes this as a valid empty block and moves on.
         """
@@ -1019,6 +1050,8 @@ class ZnaWriter:
             prov["merged_in_process"] = True
         if self._merge_record is not None:
             prov["merge"] = dict(self._merge_record)
+        if self._full_fragment_record is not None:
+            prov["full_fragment"] = dict(self._full_fragment_record)
 
         raw = _canonical_json(prov)
         payload = (self._compressor.compress(raw)
@@ -1236,6 +1269,7 @@ class ZnaReader:
                 shuffled=bool(d["shuffled"]),
                 merged_in_process=bool(d.get("merged_in_process", False)),
                 merge=_merge_record_of(d),
+                full_fragment=_full_fragment_record_of(d),
                 crc32=zlib.crc32(payload) & 0xFFFFFFFF,
                 raw=d,
             )

@@ -8,6 +8,84 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
+## [Unreleased] — 0.7.0
+
+**`zna encode` on paired FASTQ writes different flags from 0.6, and every corpus whose
+consumer places fragment-end supervision must be re-encoded from source.** An unmerged
+pair is now marked full overlap (`IS_FULL_FRAGMENT` on both mates) only when its mates are
+exact reverse complements *and* shorter than the sequenced read length, which the new
+`--read-length L` declares. **Without `--read-length`, no pair is marked**, so a pipeline
+that encodes paired reads without the new flag (hulkrna's `fastq_to_zna`, khorana's
+simulator) loses every full-overlap label until it passes the read length. With it, only
+pairs whose mates are exactly the read length long lose the label. A declared merged read
+(`--treat-unpaired-as-merged`) that `--npolicy trim3` cut is no longer marked whole. The
+merger (`--merge-pairs`, `zna merge`) is unchanged, and so is its policy, `zna-merge-0.6`.
+The `.zna` format did not change (format version 3, prologue schema 1), so nothing refuses
+a 0.6 file. A consumer that needs the new rule checks the prologue's new `full_fragment`
+record, which is absent on every file zna 0.6 wrote. No repair exists for files already
+written, because a copy carries the flag byte verbatim. The report, reproduction and
+measurements are `docs/FULL_OVERLAP_REPEAT_ISSUE.md` (#1); the rule is `docs/METHODS.md`
+§3.4. Open work has moved from `docs/ROADMAP.md` to
+[GitHub Issues](https://github.com/mkiyer/zna/issues).
+
+**Why.** An exact reverse-complement pair is not proof that the mates cover the same
+interval. A fragment longer than the read whose first and last read-length bases are the
+same sequence gives the same pair, and tandem repeats do this whenever the fragment minus
+the read length is a whole number of repeat units. Both mates then claimed an end at their
+inner edge, where the fragment does not end. That is over-labelling, the one direction
+METHODS §3.6 forbids. khorana found one in its 19,245,880-pair 2 × 150 aberration-library
+simulation: a 378-base UBC fragment of 228-base ubiquitin units, beside 110,923 correct
+full overlaps. A second GENCODE library had an ACAN pair of the same kind. Only a mate
+shorter than the read proves the molecule ended inside it.
+
+| exact reverse-complement pairs, by true insert | pairs | 0.6 | 0.7 with `--read-length 150` |
+|---|---:|---|---|
+| < 150 | 106,929 | full, correct | full, correct |
+| = 150 | 3,994 | full, correct | one-ended (under-labelled) |
+| > 150 (the UBC repeat) | 1 | **full, wrong** | one-ended, correct |
+
+### Added
+
+- **`zna encode --read-length L`**, the length the sequencer read. A read longer than L is
+  an error, since it proves the declaration wrong. A run in which no read reached L warns
+  whatever `-q` says, because too large an L lets full-length exact pairs be marked full
+  again. Refused with `--merge-pairs`, whose decision does not use it, and when re-encoding
+  a `.zna`, which copies flags verbatim.
+- **The prologue's `full_fragment` record**: `{"policy": "zna-full-fragment-0.7",
+  "read_length": L or null, "unpaired_as_merged": bool, "zna_version": ...}`, written by
+  every FASTQ encode (including `--merge-pairs`), carried verbatim by `zna shuffle` and
+  ZNA → ZNA re-encode, printed by `zna inspect`, and exposed as
+  `ZnaProvenance.full_fragment`. Absent means unknown, the 0.6 rule. A present record
+  that is not an object is corruption. `zna.FULL_FRAGMENT_POLICY` names the current rule.
+- **The encode summary says what the rule did**: how many pairs it marked full and how
+  many exact pairs it left one-ended, and how many declared merged reads trim3 cut.
+
+### Changed
+
+- **A full-overlap pair needs `--read-length`, and mates shorter than it** (above; #1).
+  An exact pair at the read length is left one-ended: each mate keeps the edge it was
+  read from, which is always true. Without `--read-length` no pair is marked.
+- **No record `--npolicy trim3` cut is marked full.** A cut record keeps `[0, first N)`,
+  so its far edge is interior. That applies to pairs, and to declared merged reads, which
+  0.6 marked whole however short trim3 left them. `zna merge`'s own output never carries
+  an `N`, so only merged reads from other tools were affected. (#2)
+- **`--npolicy`'s heavy-use warning gives the share of the input's bases** (#14). Under
+  trim3 it divided by the bases left after the cut, so it overstated the share and
+  could exceed 100% (a 161-base read cut at base 80 read 101.2%, not 50.3%). The 1%
+  threshold barely moves.
+- METHODS §3.4 no longer claims that an exact reverse-complement pair proves a full
+  overlap, and says why its old measurement (10051/10051 detected, 0/9949 false
+  positives) could not see repeats. §3.6 and §3.8 describe the new rule and record.
+
+### Not changed
+
+- **The merge decision.** A full-length pair that matches at zero offset still merges
+  into one read-length record with both ends, the UBC pair included. That is one case of
+  the homologous-ends residual METHODS §3.4 documents, and its rarest: a repeat fools
+  zero offset only if it is exact over a whole read. Gating it would refuse every true
+  insert of exactly the read length (22,018 merges in the same simulation) to fix about
+  one, and leave a hole at the read length in the merged-length distribution.
+
 ## [0.6.0] - 2026-09-26
 
 **`zna merge` and `zna encode --merge-pairs` produce different output from 0.5.x, and

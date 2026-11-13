@@ -1,4 +1,4 @@
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 from .core import (
@@ -7,6 +7,7 @@ from .core import (
     COMPRESSION_NONE, COMPRESSION_ZSTD,
     read_zna, write_zna,
     ZnaHeaderFlags, ZnaRecordFlags, FLAG_FIELDS, ENDS_BY_FLAG,
+    FULL_FRAGMENT_POLICY,
     reverse_complement,
 )
 from .dtypes import LabelDef, LabelDtype, parse_dtype, resolve_missing
@@ -24,6 +25,7 @@ __all__ = [
     "COMPRESSION_NONE", "COMPRESSION_ZSTD",
     "read_zna", "write_zna",
     "ZnaHeaderFlags", "ZnaRecordFlags", "FLAG_FIELDS", "ENDS_BY_FLAG",
+    "FULL_FRAGMENT_POLICY",
     "reverse_complement",
     "LabelDef", "LabelDtype", "parse_dtype", "resolve_missing",
     "is_accelerated",

@@ -1441,8 +1441,9 @@ class TestFullFragment:
             return [(r[4], r[5]) for r in ZnaReader(fh).records(with_ends=True)]
 
     def test_full_overlap_pair_detected(self, tmp_path):
-        """Mates whose insert was <= the read length span the same interval, so
-        they are exact reverse complements — detectable with no insert size."""
+        """Mates of an insert shorter than the read span the same interval, so they
+        are exact reverse complements -- detectable with no insert size, once the
+        read length says the mates are short (TestFullOverlapNeedsTheReadLength)."""
         frag = "ACGTACGTAAGGCCTTACGTACGT"
         src = tmp_path / "in.fq"
         self._write_fq(src, [
@@ -1450,7 +1451,7 @@ class TestFullFragment:
             ("ord/1", "AAAACCCCGGGGTTTT"), ("ord/2", "TTTTGGGGCCCCAAAA"),
         ])
         out = str(tmp_path / "o.zna")
-        encode_command(self._args([str(src)], out))
+        encode_command(self._args([str(src)], out, read_length=150))
         ends = self._ends(out)
         assert ends[0] == (True, True) and ends[1] == (True, True), "full-overlap pair"
         # the ordinary pair gets exactly one true edge per mate
@@ -1562,6 +1563,334 @@ class TestFullFragment:
         assert "Full-fragment:" in out
         assert "Fragment Geometry" in out
         assert "unstranded" in out
+
+
+def _rcn(s: str) -> str:
+    """Reverse complement that keeps N in place (zna.reverse_complement is ACGT-only)."""
+    return s.translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
+
+
+class TestFullOverlapNeedsTheReadLength:
+    """An exact reverse-complement pair is not proof of a full overlap.
+
+    For a stranded pair with fragment F and read length L, R2 = F[0, L) and
+    R1 = rc(F[|F| - L, |F|)), so R1 == rc(R2) exactly when F's first and last L
+    bases are the same sequence: a direct repeat spanning both ends, which a tandem
+    array gives whenever |F| - L is a whole number of repeat units.  The reads then
+    cannot tell an insert of exactly L from such a repeat, and only a mate SHORTER
+    than L proves the molecule ended inside it.  So a pair is full only when its
+    mates are exact reverse complements and shorter than --read-length, and without
+    --read-length no pair is full (docs/FULL_OVERLAP_REPEAT_ISSUE.md; METHODS §3.4).
+
+    The cases are the issue's §3 reproduction: 2 x 150 dUTP reads clipped to the
+    molecule, stranded normalization, so a one-ended R1 reads (False, True) and a
+    one-ended R2 (True, False).
+    """
+
+    L = 150
+
+    def _cases(self):
+        rng = random.Random(7)
+        seq = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        unit = seq(228)                      # UBC's ubiquitin unit length
+        return {
+            "tandem_repeat_378": (unit * 3)[:378],   # 378 - 150 = one unit
+            "short_insert_120": seq(120),
+            "ordinary_300": seq(300),
+            "insert_equals_read_150": seq(150),
+        }
+
+    def _pair(self, fragment):
+        n = min(self.L, len(fragment))
+        return _rcn(fragment[-n:]), fragment[:n]     # (R1 antisense, R2 sense)
+
+    def _args(self, files, out, **overrides):
+        class Args:
+            interleaved = True
+            fasta = False
+            fastq = True
+            read_group = "fo"
+            description = ""
+            strand_specific = True
+            strand_normalize = True
+            read1_sense = False
+            read2_antisense = False
+            output = out
+            seq_len_bytes = 2
+            block_size = 131072
+            compress_flag = False
+            level = 3
+            quiet = True
+            label = None
+            label_desc = None
+            label_defs = None
+            npolicy = "trim3"
+            treat_unpaired_as_merged = False
+            read_length = None
+        Args.files = files
+        for k, v in overrides.items():
+            setattr(Args, k, v)
+        return Args()
+
+    def _write(self, path, named_pairs):
+        with open(path, "w") as fh:
+            for name, (r1, r2) in named_pairs:
+                fh.write(f"@{name}/1\n{r1}\n+\n{'I' * len(r1)}\n")
+                fh.write(f"@{name}/2\n{r2}\n+\n{'I' * len(r2)}\n")
+
+    def _encode_cases(self, tmp_path, name="o.zna", **overrides):
+        cases = self._cases()
+        src = tmp_path / "cases.fq"
+        self._write(src, [(k, self._pair(f)) for k, f in cases.items()])
+        out = str(tmp_path / name)
+        encode_command(self._args([str(src)], out, **overrides))
+        with open(out, "rb") as fh:
+            ends = [(r[4], r[5]) for r in ZnaReader(fh).records(with_ends=True)]
+        return {k: (ends[2 * i], ends[2 * i + 1]) for i, k in enumerate(cases)}, out
+
+    ONE_ENDED = ((False, True), (True, False))      # (R1, R2) after normalization
+    FULL = ((True, True), (True, True))
+
+    def test_the_repeat_mates_are_exact_reverse_complements(self):
+        """The premise: the tandem repeat fools the exact test, at full read length."""
+        r1, r2 = self._pair(self._cases()["tandem_repeat_378"])
+        assert len(r1) == len(r2) == self.L and r1 == _rcn(r2)
+
+    def test_a_tandem_repeat_at_the_read_length_is_one_ended(self, tmp_path):
+        ends, _ = self._encode_cases(tmp_path, read_length=self.L)
+        assert ends["tandem_repeat_378"] == self.ONE_ENDED
+
+    def test_a_short_insert_stays_full(self, tmp_path):
+        ends, _ = self._encode_cases(tmp_path, read_length=self.L)
+        assert ends["short_insert_120"] == self.FULL
+
+    def test_an_insert_of_exactly_the_read_length_is_one_ended(self, tmp_path):
+        """The documented cost: the reads cannot tell it from the repeat."""
+        ends, _ = self._encode_cases(tmp_path, read_length=self.L)
+        assert ends["insert_equals_read_150"] == self.ONE_ENDED
+        assert ends["ordinary_300"] == self.ONE_ENDED
+
+    def test_without_a_read_length_no_pair_is_full(self, tmp_path):
+        ends, _ = self._encode_cases(tmp_path)
+        assert all(v == self.ONE_ENDED for v in ends.values()), ends
+
+    def test_the_summary_counts_the_exact_pairs_left_one_ended(self, tmp_path, capsys):
+        self._encode_cases(tmp_path, "a.zna", read_length=self.L, quiet=False)
+        err = capsys.readouterr().err
+        assert ("full overlaps: 1 pair flagged full (exact mates shorter than "
+                "--read-length 150); 2 exact pairs left one-ended") in err
+        self._encode_cases(tmp_path, "b.zna", quiet=False)
+        err = capsys.readouterr().err
+        assert ("full overlaps: none flagged, as no --read-length was given; "
+                "3 exact pairs left one-ended") in err
+
+    def test_a_read_longer_than_the_read_length_is_an_error(self, tmp_path):
+        with pytest.raises(ValueError, match="record 1 is 150 bases, longer than "
+                                             "--read-length 149"):
+            self._encode_cases(tmp_path, read_length=self.L - 1)
+
+    def test_the_cli_reports_a_too_long_read_without_a_traceback(self, tmp_path):
+        import subprocess
+        import sys
+        src = tmp_path / "x.fq"
+        self._write(src, [("p", self._pair(self._cases()["ordinary_300"]))])
+        proc = subprocess.run(
+            [sys.executable, "-m", "zna.cli", "encode", "--interleaved",
+             "--read-length", "100", "-o", str(tmp_path / "x.zna"), str(src)],
+            capture_output=True, text=True)
+        assert proc.returncode != 0
+        assert "longer than --read-length 100" in proc.stderr
+        assert "Traceback" not in proc.stderr
+
+    def test_no_read_reaching_the_read_length_warns_even_when_quiet(self, tmp_path,
+                                                                     capsys):
+        """Too large an L would let full-length exact pairs be flagged full."""
+        ends, _ = self._encode_cases(tmp_path, read_length=200, quiet=True)
+        err = capsys.readouterr().err
+        assert ("WARNING: no read reached --read-length 200; the longest was 150"
+                in err) and "--read-length 150" in err
+        assert ends["insert_equals_read_150"] == self.FULL   # what L=200 lets through
+
+    def test_no_warning_when_a_read_reaches_the_read_length(self, tmp_path, capsys):
+        self._encode_cases(tmp_path, read_length=self.L, quiet=True)
+        assert "WARNING" not in capsys.readouterr().err
+
+    def test_a_pair_trim3_cut_is_never_full(self, tmp_path, capsys):
+        """A molecule X + N + X: its mates are exact reverse complements before AND
+        after trim3 cuts both at the N, but each stored mate is now half the molecule,
+        so its far edge is interior.  The 0.6 rule tested the cut mates and flagged
+        them full."""
+        rng = random.Random(11)
+        x = "".join(rng.choice("ACGT") for _ in range(10))
+        frag = x + "N" + x
+        r1, r2 = _rcn(frag), frag
+        src = tmp_path / "n.fq"
+        self._write(src, [("cut", (r1, r2))])
+        out = str(tmp_path / "n.zna")
+        encode_command(self._args([str(src)], out, read_length=self.L, quiet=False))
+        with open(out, "rb") as fh:
+            recs = list(ZnaReader(fh).records(with_ends=True))
+        assert [len(r[0]) for r in recs] == [10, 10]
+        # Still exact: the submitted cut mates were reverse complements, and R1 is
+        # stored flipped (dUTP normalization), so the stored mates are equal.
+        assert recs[0][0] == recs[1][0] == x
+        assert [(r[4], r[5]) for r in recs] == list(self.ONE_ENDED)
+        assert "1 exact pair left one-ended" in capsys.readouterr().err
+
+    def test_read_length_is_refused_on_a_zna_input(self, tmp_path):
+        _, out = self._encode_cases(tmp_path, read_length=self.L)
+        with pytest.raises(SystemExit) as e:
+            encode_command(self._args([out], str(tmp_path / "re.zna"),
+                                      interleaved=False, read_length=self.L))
+        assert "copies each record's flag byte verbatim" in str(e.value.code)
+
+    def test_read_length_is_refused_with_merge_pairs(self, tmp_path):
+        r1, r2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
+        for p in (r1, r2):
+            p.write_text("@a\nACGT\n+\nIIII\n")
+        with pytest.raises(SystemExit) as e:
+            encode_command(self._args([str(r1), str(r2)], str(tmp_path / "m.zna"),
+                                      interleaved=False, merge_pairs=True,
+                                      read_length=self.L))
+        assert "under --merge-pairs the merger decides every pair" in str(e.value.code)
+
+    def test_read_length_must_be_positive(self, capsys):
+        import subprocess
+        import sys
+        proc = subprocess.run([sys.executable, "-m", "zna.cli", "encode",
+                               "--read-length", "0", "-o", "-", "-"],
+                              capture_output=True, text=True, input="")
+        assert proc.returncode == 2 and "0 is not a positive length" in proc.stderr
+
+
+class TestDeclaredMergedReadsCutByTrim3:
+    """--treat-unpaired-as-merged declares every unpaired record a whole fragment,
+    but --npolicy trim3 keeps only [0, first N) of a record: a merged read cut at an
+    N no longer reaches its fragment's far end, so it must not claim it."""
+
+    def _args(self, files, out, **overrides):
+        args = TestFullOverlapNeedsTheReadLength()._args(files, out, **overrides)
+        args.treat_unpaired_as_merged = True
+        args.strand_specific = args.strand_normalize = False
+        return args
+
+    def _ends(self, path):
+        with open(path, "rb") as fh:
+            return [(len(r[0]), r[4], r[5])
+                    for r in ZnaReader(fh).records(with_ends=True)]
+
+    RECORDS = [("whole merged_10_10", "ACGTACGTAAGGCCTTACGTACGTAC"),
+               ("cut merged_10_10", "ACGTACGTACGTNACGTACGTAAACCC")]
+
+    def _fq(self, path, records):
+        path.write_text("".join(f"@{n}\n{s}\n+\n{'I' * len(s)}\n" for n, s in records))
+
+    def test_single_end_input(self, tmp_path, capsys):
+        src = tmp_path / "se.fq"
+        self._fq(src, self.RECORDS)
+        out = str(tmp_path / "se.zna")
+        encode_command(self._args([str(src)], out, interleaved=False, quiet=False))
+        assert self._ends(out) == [(26, True, True), (12, True, False)]
+        assert ("--treat-unpaired-as-merged: 1 record cut by --npolicy trim3 left "
+                "one-ended") in capsys.readouterr().err
+
+    def test_interleaved_input(self, tmp_path):
+        """The grouped loop: singles beside a pair, as `zna merge` emits them."""
+        src = tmp_path / "il.fq"
+        self._fq(src, [self.RECORDS[0],
+                       ("p/1", "AAAACCCCGGGGTTTT"), ("p/2", "TTTTGGGGCCCCAAAA"),
+                       self.RECORDS[1]])
+        out = str(tmp_path / "il.zna")
+        encode_command(self._args([str(src)], out))
+        got = self._ends(out)
+        assert got[0] == (26, True, True) and got[3] == (12, True, False)
+
+    def test_the_random_policy_keeps_the_declaration(self, tmp_path):
+        """--npolicy random substitutes in place, so the record still spans it."""
+        src = tmp_path / "se.fq"
+        self._fq(src, self.RECORDS)
+        out = str(tmp_path / "rnd.zna")
+        encode_command(self._args([str(src)], out, interleaved=False,
+                                  npolicy="random"))
+        assert self._ends(out) == [(26, True, True), (27, True, True)]
+
+
+class TestFullFragmentRecord:
+    """The prologue says which rule set IS_FULL_FRAGMENT (METHODS §3.8): written by
+    every FASTQ encode, carried verbatim by every copy, absent meaning unknown."""
+
+    def _prov(self, path):
+        with open(path, "rb") as fh:
+            return ZnaReader(fh).provenance
+
+    def _encode(self, tmp_path, name, **overrides):
+        t = TestFullOverlapNeedsTheReadLength()
+        _, out = t._encode_cases(tmp_path, name, **overrides)
+        return out
+
+    def test_an_encode_records_its_rule_and_read_length(self, tmp_path):
+        import zna
+        p = self._prov(self._encode(tmp_path, "a.zna", read_length=150))
+        assert p.full_fragment == {"policy": zna.FULL_FRAGMENT_POLICY,
+                                   "zna_version": zna.__version__,
+                                   "read_length": 150,
+                                   "unpaired_as_merged": False}
+        assert zna.FULL_FRAGMENT_POLICY == "zna-full-fragment-0.7"
+
+    def test_no_read_length_is_recorded_as_null(self, tmp_path):
+        p = self._prov(self._encode(tmp_path, "b.zna", treat_unpaired_as_merged=True))
+        assert p.full_fragment["read_length"] is None
+        assert p.full_fragment["unpaired_as_merged"] is True
+        assert p.raw["full_fragment"]["read_length"] is None    # JSON null, not absent
+
+    def test_shuffle_and_reencode_carry_it_verbatim(self, tmp_path):
+        src = self._encode(tmp_path, "c.zna", read_length=150)
+        shuf, re_ = str(tmp_path / "shuf.zna"), str(tmp_path / "re.zna")
+        shuffle_zna(src, shuf, seed=5, quiet=True)
+        args = TestFullOverlapNeedsTheReadLength()._args([shuf], re_,
+                                                         interleaved=False)
+        encode_command(args)
+        p0, p1, p2 = self._prov(src), self._prov(shuf), self._prov(re_)
+        assert p0.full_fragment == p1.full_fragment == p2.full_fragment
+        assert p1.shuffled and p2.shuffled
+
+    def test_the_encode_shuffle_pass_carries_it(self, tmp_path):
+        p = self._prov(self._encode(tmp_path, "d.zna", read_length=150, shuffle=True,
+                                    seed=3, shuffle_buffer_size="1M"))
+        assert p.shuffled and p.full_fragment["read_length"] == 150
+
+    def test_a_copy_of_an_unknown_file_stays_unknown(self, tmp_path):
+        """A file with no record (zna < 0.7) re-encodes to a file with none: the
+        rule that set its bit 4 is the input's, and nobody knows it."""
+        src = tmp_path / "old.zna"
+        h = ZnaHeader(read_group="old", compression_method=COMPRESSION_NONE)
+        with open(src, "wb") as fh, ZnaWriter(fh, h) as w:
+            w.write_record("ACGTACGT", True, True, False, is_full_fragment=True)
+            w.write_record("ACGTACGT", True, False, True, is_full_fragment=True)
+        assert self._prov(src).full_fragment is None
+        re_ = str(tmp_path / "re.zna")
+        encode_command(TestFullOverlapNeedsTheReadLength()._args(
+            [str(src)], re_, interleaved=False, strand_specific=False,
+            strand_normalize=False))
+        p = self._prov(re_)
+        assert p.full_fragment is None and "full_fragment" not in p.raw
+
+    def test_inspect_prints_it_and_says_when_it_is_unknown(self, tmp_path, capsys):
+        import subprocess
+        import sys
+        out = self._encode(tmp_path, "e.zna", read_length=150)
+        proc = subprocess.run([sys.executable, "-m", "zna.cli", "inspect", out],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "Full-fragment record:" in proc.stdout
+        assert "zna-full-fragment-0.7" in proc.stdout and "read_length:" in proc.stdout
+        old = tmp_path / "old.zna"
+        h = ZnaHeader(read_group="old", compression_method=COMPRESSION_NONE)
+        with open(old, "wb") as fh, ZnaWriter(fh, h) as w:
+            w.write_record("ACGTACGT", False, False, False)
+        proc = subprocess.run([sys.executable, "-m", "zna.cli", "inspect", str(old)],
+                              capture_output=True, text=True)
+        assert "Full-fragment record: (none: rule unknown" in proc.stdout
 
 
 # --- N-Policy CLI Tests ---

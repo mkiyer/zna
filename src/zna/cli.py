@@ -20,7 +20,7 @@ from .core import (
     _FILE_HEADER_FMT, _FILE_HEADER_SIZE,
     _BLOCK_HEADER_FMT, _BLOCK_HEADER_SIZE, _VERSION,
     ZnaHeaderFlags, ZnaRecordFlags, reverse_complement,
-    FLAG_FIELDS,
+    FLAG_FIELDS, FULL_FRAGMENT_POLICY,
 )
 from . import _gzip
 from .dtypes import LabelDef, parse_dtype, label_bytes_per_record
@@ -957,8 +957,11 @@ def _is_reverse_complement(a: str, b: str) -> bool:
     """True when *b* is the reverse complement of *a*.
 
     Two mates of a pair whose insert was at or below the read length span the
-    identical fragment interval, so they are exact reverse complements — that is
-    how a full-fragment pair is recognised without knowing the insert size.
+    identical fragment interval, so they are exact reverse complements.  The
+    converse does not hold: a longer fragment whose first and last read-length
+    bases are the same sequence (a direct repeat at its two ends, as in a tandem
+    array) gives mates that are exact reverse complements too.  So this is the
+    evidence :func:`_full_fragment_flags` weighs, not the verdict.
 
     The end probes reject ~15/16 of ordinary pairs in two character
     comparisons, so the O(n) translate only runs on genuine candidates.
@@ -999,12 +1002,37 @@ def _fragment_units(records) -> Iterator[list]:
         yield [pending]
 
 
-def _full_fragment_flags(unit: list, treat_unpaired_as_merged: bool) -> list:
-    """Which records of *unit* span their entire fragment (both edges real)."""
+def _full_fragment_flags(unit: list, treat_unpaired_as_merged: bool,
+                         read_length: int | None, trimmed: bool) -> tuple[list, bool]:
+    """Which records of *unit* span their entire fragment (both edges real).
+
+    The rule :data:`~zna.core.FULL_FRAGMENT_POLICY` names (METHODS §3.4):
+
+    * **A pair** is full only when its mates are exact reverse complements AND
+      shorter than the sequenced read length *read_length*.  A mate shorter than
+      the read is the one positive evidence that the molecule ended inside it.  At
+      full read length an exact pair is either an insert of exactly the read
+      length or a direct repeat at the fragment's two ends, and the reads cannot
+      tell which, so it is left one-ended -- each mate keeps the edge it was read
+      from, which is always true.  Without *read_length* nothing is shorter than a
+      length nobody declared, so no pair is full.
+    * **An unpaired record** is full when the caller declared it
+      (``--treat-unpaired-as-merged``).
+    * **Nothing ``--npolicy trim3`` cut** is full (*trimmed*: any record of the
+      unit was cut).  A cut record keeps ``[0, first N)``, so its far edge is
+      interior however the rest of the rule came out.
+
+    Returns ``(flags, exact)``: one bool per record, and whether the unit is a pair
+    whose mates, as stored, are exact reverse complements -- so the summary can
+    count the exact pairs this rule left one-ended.
+    """
     if len(unit) == 1:
-        return [treat_unpaired_as_merged]
-    full = _is_reverse_complement(unit[0][0], unit[1][0])
-    return [full, full]
+        return [treat_unpaired_as_merged and not trimmed], False
+    r1 = unit[0][0]
+    exact = _is_reverse_complement(r1, unit[1][0])
+    full = (exact and not trimmed and read_length is not None
+            and len(r1) < read_length)
+    return [full, full], exact
 
 
 def _make_label_extractor(label_defs: tuple[LabelDef, ...], tag_map: dict):
@@ -1189,6 +1217,22 @@ def encode_command(args):
                      "merged record can be up to twice a read long, and with "
                      "1-byte lengths (max 255) a 2x150 merge would fail "
                      "mid-stream, leaving a partial file.")
+
+    # --read-length gates the encoder's own full-overlap decision (METHODS §3.4).
+    # Refused wherever that decision does not run, so the flag never sits on a
+    # command line looking as if it had done something.
+    read_length = getattr(args, 'read_length', None)
+    if read_length is not None:
+        if merge_pairs:
+            sys.exit("Error: --read-length gates the full-overlap test on pairs "
+                     "the encoder keeps unmerged; under --merge-pairs the merger "
+                     "decides every pair, and its decision does not use a read "
+                     "length (METHODS §3.4), so the flag would change nothing.")
+        if is_reencoding:
+            sys.exit(f"Error: --read-length decides full overlaps from FASTQ "
+                     f"input; re-encoding {files[0]} copies each record's flag "
+                     f"byte verbatim (METHODS §3.5), so it would change nothing. "
+                     f"Re-encode from the source FASTQ instead.")
 
     if is_reencoding:
         # Read existing header to use as defaults
@@ -1383,6 +1427,23 @@ def encode_command(args):
         # does the merge record, verbatim, or its absence (MERGE_ACCURACY_PLAN §5).
         merged_in_process_in = bool(_prov is not None and _prov.merged_in_process)
         merge_record_in = _prov.merge if _prov is not None else None
+    treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
+    # Which rule set IS_FULL_FRAGMENT, for the prologue (METHODS §3.8).  A copy
+    # carries the input's record, or its absence, verbatim -- bit 4 is copied, so
+    # the rule that set it is the input's.  Every FASTQ encode states its own,
+    # --merge-pairs included: there no record reaches this rule (the merger hands
+    # over each record's geometry), which is exactly what `read_length: null`
+    # and `unpaired_as_merged: false` say; the merge record covers the rest.
+    if is_reencoding:
+        full_fragment_record = _prov.full_fragment if _prov is not None else None
+    else:
+        from . import __version__ as _zna_version
+        full_fragment_record = {
+            "policy": FULL_FRAGMENT_POLICY,
+            "zna_version": _zna_version,
+            "read_length": read_length,
+            "unpaired_as_merged": bool(treat_unpaired_as_merged),
+        }
 
     with ExitStack() as stack:
         merge_acc = None
@@ -1427,6 +1488,7 @@ def encode_command(args):
             merged_in_process=merge_pairs or merged_in_process_in,
             merge_record=(merge_source.merge_record() if merge_source is not None
                           else merge_record_in),
+            full_fragment_record=full_fragment_record,
         ))
 
         def _trim3(seq):
@@ -1450,7 +1512,20 @@ def encode_command(args):
         def _count_subs(seq):
             """No-calls the codec is about to substitute under ``--npolicy random``."""
             return seq.count('N') + seq.count('n')
-        treat_unpaired_as_merged = getattr(args, 'treat_unpaired_as_merged', False)
+
+        def _longer_than_declared(n, index):
+            """A read longer than ``--read-length`` proves the declaration wrong."""
+            raise ValueError(
+                f"record {index + 1} is {n} bases, longer than --read-length "
+                f"{read_length}. --read-length is the length the sequencer read, "
+                f"so no read can exceed it: give the run's read length.")
+
+        # What the full-fragment rule did, for the summary below (METHODS §3.4).
+        longest = 0               # longest submitted read, checked against L
+        n_full_pairs = 0          # pairs flagged full
+        n_exact_one_ended = 0     # exact reverse-complement pairs left one-ended
+        n_cut_unpaired = 0        # declared-merged records trim3 cut, left one-ended
+        fragment_path = False     # the grouped (pair-aware) loop ran
 
         if merge_source is not None:
             stream = iter(merge_source)
@@ -1512,13 +1587,19 @@ def encode_command(args):
                             print(f"      Processed {count//1_000_000}M records...",
                                   end='\r', file=sys.stderr)
         elif single_end_input:
-            is_full = treat_unpaired_as_merged
             write_record = writer.write_record
             for rec in stream:
                 seq = rec[0]
+                if read_length is not None:
+                    n = len(seq)
+                    if n > read_length:
+                        _longer_than_declared(n, count)
+                    if n > longest:
+                        longest = n
                 # Membership on the sequence itself: the old test uppercased a
                 # copy of every read (150 bytes each) purely to look for one
                 # character.
+                cut = 0
                 if trim3:
                     seq, cut = _trim3(seq)
                     if cut:
@@ -1529,7 +1610,13 @@ def encode_command(args):
                     if subs:
                         npolicy_bases += subs
                         npolicy_records += 1
-                npolicy_total_bases += len(seq)
+                # The record as submitted, before any cut: the warning's share is of
+                # the input's bases (#14).
+                npolicy_total_bases += len(rec[0])
+                # Declared whole, unless trim3 just cut its far end off.
+                is_full = treat_unpaired_as_merged and not cut
+                if treat_unpaired_as_merged and cut:
+                    n_cut_unpaired += 1
                 if label_defs:
                     write_record(seq, rec[1], rec[2], rec[3],
                                  labels=rec[4], is_full_fragment=is_full)
@@ -1578,7 +1665,18 @@ def encode_command(args):
                         print(f"      Processed {count//1_000_000}M records...",
                               end='\r', file=sys.stderr)
         else:
+            fragment_path = True
             for unit in _fragment_units(stream):
+                if read_length is not None:
+                    for i, rec in enumerate(unit):
+                        n = len(rec[0])
+                        if n > read_length:
+                            _longer_than_declared(n, count + i)
+                        if n > longest:
+                            longest = n
+                # Before the cut: the warning's share is of the input's bases (#14).
+                npolicy_total_bases += sum(len(rec[0]) for rec in unit)
+                trimmed = False
                 if trim3:
                     # Per record, not per fragment: trimming never orphans a mate, so
                     # there is nothing here for the old pair-atomic drop to protect.
@@ -1588,6 +1686,7 @@ def encode_command(args):
                         if cut:
                             npolicy_bases += cut
                             npolicy_records += 1
+                            trimmed = True
                         cut_unit.append((seq,) + tuple(rec[1:]))
                     unit = cut_unit
                 elif codec_npolicy:
@@ -1596,8 +1695,15 @@ def encode_command(args):
                         if subs:
                             npolicy_bases += subs
                             npolicy_records += 1
-                npolicy_total_bases += sum(len(rec[0]) for rec in unit)
-                full = _full_fragment_flags(unit, treat_unpaired_as_merged)
+                full, exact = _full_fragment_flags(unit, treat_unpaired_as_merged,
+                                                   read_length, trimmed)
+                if exact:
+                    if full[0]:
+                        n_full_pairs += 1
+                    else:
+                        n_exact_one_ended += 1
+                elif trimmed and treat_unpaired_as_merged and len(unit) == 1:
+                    n_cut_unpaired += 1
                 if label_defs:
                     for rec, is_full in zip(unit, full):
                         writer.write_record(rec[0], rec[1], rec[2], rec[3],
@@ -1728,9 +1834,41 @@ def encode_command(args):
             if npolicy_total_bases and npolicy_bases / npolicy_total_bases > 0.01:
                 pct = 100.0 * npolicy_bases / npolicy_total_bases
                 print(f"[ZNA] WARNING: --npolicy {npolicy} affected {pct:.1f}% of "
-                      f"encoded bases. That is high enough to be a run problem (a dark "
+                      f"the input's bases. That is high enough to be a run problem (a dark "
                       f"cycle, a failed tile) rather than ordinary no-calls -- check "
                       f"the input before using this library.", file=sys.stderr)
+        # Always say what the full-fragment rule did, as for the N policy: the
+        # cost of the rule (exact pairs left one-ended) is otherwise invisible.
+        if fragment_path:
+            s_full = '' if n_full_pairs == 1 else 's'
+            s_left = '' if n_exact_one_ended == 1 else 's'
+            if read_length is not None:
+                print(f"[ZNA] full overlaps: {n_full_pairs} pair{s_full} flagged "
+                      f"full (exact mates shorter than --read-length "
+                      f"{read_length}); {n_exact_one_ended} exact pair{s_left} "
+                      f"left one-ended (at the read length, or cut by --npolicy "
+                      f"trim3).", file=sys.stderr)
+            else:
+                print(f"[ZNA] full overlaps: none flagged, as no --read-length "
+                      f"was given; {n_exact_one_ended} exact pair{s_left} left "
+                      f"one-ended. Give the sequenced read length to flag the "
+                      f"ones shorter than it.", file=sys.stderr)
+        if n_cut_unpaired:
+            s = '' if n_cut_unpaired == 1 else 's'
+            print(f"[ZNA] --treat-unpaired-as-merged: {n_cut_unpaired} record{s} "
+                  f"cut by --npolicy trim3 left one-ended.", file=sys.stderr)
+
+    # Printed whatever -q says, like the merge run's warnings: it means the
+    # declaration that guards the full-fragment rule is probably wrong.  Too
+    # small an L only costs labels; too large an L lets full-length exact pairs
+    # -- which may be direct repeats -- be flagged full, the defect the gate
+    # exists to remove.  A read longer than L already failed the encode above;
+    # this catches the other direction.
+    if fragment_path and read_length is not None and count and longest < read_length:
+        print(f"[ZNA] WARNING: no read reached --read-length {read_length}; the "
+              f"longest was {longest}. If {longest} is the run's read length, exact "
+              f"pairs of that length were flagged full and may be direct repeats: "
+              f"re-encode with --read-length {longest}.", file=sys.stderr)
 
 
 # --- COMMAND: DECODE ---
@@ -2294,7 +2432,15 @@ def inspect_command(args):
                 # schema adds shows up here without a code change.
                 print("Merge record:")
                 for k, v in prov.merge.items():
-                    print(f"  {k + ':':<19}{v}")
+                    print(f"  {k + ':':<21}{v}")
+            # Which rule set IS_FULL_FRAGMENT (METHODS §3.8), printed the same way.
+            # Absent means unknown -- zna < 0.7, whose rule flagged every exact pair.
+            if prov.full_fragment is not None:
+                print("Full-fragment record:")
+                for k, v in prov.full_fragment.items():
+                    print(f"  {k + ':':<21}{v}")
+            else:
+                print("Full-fragment record: (none: rule unknown, written by zna < 0.7)")
         else:
             print("(none: written by zna < 0.5, or truncated)")
 
@@ -2386,6 +2532,17 @@ def inspect_command(args):
              print("Compression Ratio:  1.00x")
 
 
+def _positive_int(text: str) -> int:
+    """argparse type: an integer >= 1 (a read length of 0 declares nothing)."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive length")
+    return value
+
+
 def get_zna_version():
     try:
         from . import __version__
@@ -2475,9 +2632,23 @@ def main():
                            help="Unpaired records span their whole fragment, so BOTH edges "
                                 "are true fragment boundaries (IS_FULL_FRAGMENT). Use for "
                                 "overlap-merged reads. Default off: an unpaired record is "
-                                "assumed to have one real edge, like a single-end read. "
-                                "Full-overlap PAIRS are detected automatically and need no flag.")
-    
+                                "assumed to have one real edge, like a single-end read. A "
+                                "record --npolicy trim3 cuts is never marked whole: its far "
+                                "edge is then interior. Full-overlap PAIRS are governed by "
+                                "--read-length instead.")
+    meta_group.add_argument("--read-length", dest="read_length", type=_positive_int,
+                           metavar="L", default=None,
+                           help="The length the sequencer read (e.g. 150 for 2x150). A pair "
+                                "is marked full overlap (IS_FULL_FRAGMENT on both mates) "
+                                "only when its mates are exact reverse complements AND "
+                                "shorter than L: a read shorter than L is the evidence that "
+                                "the molecule ended inside it. An exact pair AT L is left "
+                                "one-ended, since an insert of exactly L and a longer "
+                                "fragment with a direct repeat at both ends give the same "
+                                "reads. Without this flag no pair is marked. A read longer "
+                                "than L is an error. Refused with --merge-pairs and when "
+                                "re-encoding a .zna, where it would change nothing.")
+
     # R1 strand orientation (mutually exclusive)
     # Default: R1 is antisense (dUTP protocol)
     r1_strand = meta_group.add_mutually_exclusive_group()

@@ -446,14 +446,28 @@ class TestEncodeReportsItsNpolicy:
         assert n_one > 0 and n_both > n_one, (n_one, n_both)
 
     def test_a_heavy_policy_warns(self, tmp_path):
-        """Above 1% of encoded bases the line stops being informational: that is a run
-        problem, not ordinary no-calls."""
+        """Above 1% of the input's bases the line stops being informational: that is a
+        run problem, not ordinary no-calls.
+
+        The share is of the bases as submitted (#14). Each 161-base read here loses 81
+        bases to trim3, so the share is 81/161 = 50.3%; before 0.7 the denominator was
+        the 80 bases left after the cut, and the line read 101.2%."""
         seqs = [b"ACGT" * 20 + b"N" + b"ACGT" * 20 for _ in range(50)]
         fq = tmp_path / "heavy.fastq"
         fq.write_bytes(b"".join(b"@r%d\n%b\n+\n%b\n" % (i, s, b"I" * len(s))
                                 for i, s in enumerate(seqs)))
         err = self._encode(tmp_path, [fq], "trim3", "h.zna")
-        assert "WARNING" in err and "% of encoded bases" in err, err
+        assert "WARNING" in err and "affected 50.3% of the input's bases" in err, err
+
+    def test_the_share_is_of_the_input_on_paired_input_too(self, tmp_path):
+        """The grouped (paired) loop counts the input's bases before the cut as well."""
+        r = b"ACGT" * 20 + b"N" + b"ACGT" * 20
+        in1, in2 = tmp_path / "h1.fastq", tmp_path / "h2.fastq"
+        for p in (in1, in2):
+            p.write_bytes(b"".join(b"@r%d\n%b\n+\n%b\n" % (i, r, b"I" * len(r))
+                                   for i in range(25)))
+        err = self._encode(tmp_path, [in1, in2], "trim3", "h2.zna")
+        assert "affected 50.3% of the input's bases" in err, err
 
     def test_reencoding_a_zna_claims_no_policy_ran(self, tmp_path):
         """ZNA stores two bits per base, so a decoded record cannot contain a no-call
@@ -894,3 +908,63 @@ class TestMergeRecord:
         assert "at --error-rate 0.01 the test is expected to refuse" in err
         assert "Rerun with --error-rate 0.08 " in err
         assert "WARNING" not in encode("--error-rate", "0.08", name="set.zna")
+
+
+# --------------------------------------------------------------------------- #
+# full-length direct repeats through the merger (FULL_OVERLAP_REPEAT_ISSUE.md)
+# --------------------------------------------------------------------------- #
+
+class TestFullLengthRepeatsThroughTheMerger:
+    """The issue's §3 cases through `zna encode --merge-pairs`, pinning 0.7's decision.
+
+    The merger is NOT gated by a read length: a merge at zero offset of two full-length
+    mates is its most reliable kind (a repeat fools it only if it is exact over a whole
+    read), so a tandem repeat whose fragment minus the read length is one unit still
+    merges into one read-length record with both ends -- one case of the homologous-ends
+    residual METHODS §3.4 documents. The merge policy stays `zna-merge-0.6`, and the
+    file's full-fragment record says no record reached the encoder's own rule.
+    """
+
+    L = 150
+
+    @staticmethod
+    def _backend():
+        from zna.merge.backend import available_merge_backends
+        return "accel" if "accel" in available_merge_backends() else "python"
+
+    def _inputs(self, tmp_path):
+        rng = random.Random(7)
+        seq = lambda n: "".join(rng.choice("ACGT") for _ in range(n))
+        unit = seq(228)
+        frags = [(unit * 3)[:378], seq(120), seq(300), seq(150)]
+        in1, in2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
+        with open(in1, "w") as f1, open(in2, "w") as f2:
+            for i, frag in enumerate(frags):
+                n = min(self.L, len(frag))
+                r1 = rc(frag[-n:].encode()).decode()
+                r2 = frag[:n]
+                f1.write(f"@p{i}/1\n{r1}\n+\n{'I' * len(r1)}\n")
+                f2.write(f"@p{i}/2\n{r2}\n+\n{'I' * len(r2)}\n")
+        return in1, in2
+
+    @pytest.mark.parametrize("declared", [False, True], ids=["raw", "adapter-trimmed"])
+    def test_the_merger_still_merges_a_read_length_repeat(self, tmp_path, declared):
+        in1, in2 = self._inputs(tmp_path)
+        extra = ["--merge-backend", self._backend()]
+        if declared:
+            extra.append("--adapter-trimmed")
+        out = _mp_encode(tmp_path, in1, in2, *extra)
+        with open(out, "rb") as fh:
+            got = [(len(r[0]), r[1], (r[4], r[5]))
+                   for r in ZnaReader(fh).records(with_ends=True)]
+        assert got == [
+            (150, False, (True, True)),    # tandem repeat, 378 bases: merged (residual)
+            (120, False, (True, True)),    # short insert: merged, correct
+            (150, True, (True, False)),    # ordinary 300: kept whole, one end each
+            (150, True, (True, False)),
+            (150, False, (True, True)),    # insert of exactly L: merged, correct
+        ]
+        p = _prov(out)
+        assert p.merge["policy"] == "zna-merge-0.6"
+        assert p.full_fragment["read_length"] is None
+        assert p.full_fragment["unpaired_as_merged"] is False

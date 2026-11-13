@@ -700,6 +700,15 @@ Metadata:
                          - trim3: cut the read at its first N, keeping [0, N)
                          - random: substitute a base from a seeded stream
                            (--seed), reproducibly
+  --read-length L        The length the sequencer read (e.g. 150 for 2x150). A
+                         pair is marked full overlap only when its mates are
+                         exact reverse complements AND shorter than L; an exact
+                         pair at L is left one-ended. Without it no pair is
+                         marked. A read longer than L is an error. Refused with
+                         --merge-pairs and when re-encoding a .zna.
+  --treat-unpaired-as-merged
+                         Unpaired records span their whole fragment (merged
+                         reads); a record --npolicy trim3 cut is never marked
 
 Format Options:
   -o, --output FILE      Output file (default: stdout)
@@ -1300,19 +1309,33 @@ orientation itself rather than the boundary geometry.
 length — every overlap-merged read, and any pair after adapter trimming — the
 record spans the *whole* fragment and both edges are true boundaries. `IS_RC`
 names only one edge, so that case is carried by a separate flag,
-`IS_FULL_FRAGMENT`, which `with_ends` folds in for you. Full-overlap **pairs**
-are detected automatically at encode time (mates covering the same interval are
-exact reverse complements); for **unpaired** records the encoder cannot tell a
-merged read from a genuine single-end read, so declare it:
+`IS_FULL_FRAGMENT`, which `with_ends` folds in for you. Both sources of it are
+declared, because the reads alone cannot prove either:
+
+- **Full-overlap pairs** need the sequenced read length. Mates covering the same
+  interval are exact reverse complements, but so are the mates of a longer
+  fragment whose first and last read-length bases are the same sequence (a
+  tandem repeat such as UBC's). Only a mate *shorter* than the read proves the
+  molecule ended inside it, so a pair is marked full only when its mates are
+  exact reverse complements shorter than `--read-length`. An exact pair at full
+  read length is left one-ended, and so is every pair when no read length is
+  given.
+- **Unpaired records**: the encoder cannot tell a merged read from a genuine
+  single-end read, so declare it.
 
 ```bash
+# 2 x 150 reads: pairs shorter than 150 that match exactly are full overlaps
+zna encode --read-length 150 R1.fq.gz R2.fq.gz -o out.zna
 # reads from an overlap merger: unpaired records span their whole fragment
 zna encode --interleaved --treat-unpaired-as-merged -o out.zna merged.fq.gz
 ```
 
-Without the flag an unpaired record is assumed to have one real edge, which is
+Without either declaration a record is assumed to have one real edge, which is
 the safe reading — a tool marking fragment ends will under-label rather than
-place a marker at an interior position.
+place a marker at an interior position. A record that `--npolicy trim3` cut is
+never marked full: its far edge is then interior. The rule and the read length
+are recorded in the file's prologue (`zna inspect` prints them), so a consumer
+can check which rule set the flag (docs/METHODS.md §3.8).
 
 `restore_strand=True` is not a substitute: it *consumes* the flag to undo the
 reverse-complement and hand back original-orientation reads.  A caller that

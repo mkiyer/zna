@@ -1,8 +1,23 @@
 # Issue: an exact reverse-complement pair is not proof of a full overlap
 
-Status: **open.** Reported 2026-11-13 from khorana's aberration-library build on khorana3
-(zna 0.6.0; `src/zna/cli.py` identical at main 0a19141). For a zna session to fix and
-release.
+Status: **fixed in 0.7.0** (option A, the length gate; [issue #1](https://github.com/mkiyer/zna/issues/1)). Reported 2026-11-13 from khorana's
+aberration-library build on khorana3 (zna 0.6.0; `src/zna/cli.py` identical at main
+0a19141). The operator's four decisions (§6, §8):
+
+1. **L is declared**, as `zna encode --read-length L`. A read longer than L is an error,
+   and a run in which no read reached L warns.
+2. **Without L, no pair is marked full.** The summary counts the exact pairs left
+   one-ended. That changes the default, hence a minor release.
+3. **The merger is unchanged** (policy `zna-merge-0.6`). Zero offset is its most reliable
+   merge, and the repeat case there is part of the homologous-ends residual METHODS §3.4
+   documents. `--read-length` is refused with `--merge-pairs`.
+4. **Files already written are re-encoded from source.** No ZNA → ZNA repair exists. The
+   prologue's new `full_fragment` record (METHODS §3.8) is absent on every 0.6 file, so a
+   consumer that requires it refuses them.
+
+The same release stops a record `--npolicy trim3` cut from being marked full, which 0.6 did
+for declared merged reads. The rule is METHODS §3.4. The rest of this report is kept as it
+was written.
 
 ## 1. Summary
 
