@@ -1514,6 +1514,25 @@ class TestFullFragment:
         assert all("N" not in x for x in seqs)
         assert seqs[0] != seqs[2], "the two clean records should not collide"
 
+    def test_trim3_cuts_at_the_first_no_call_of_either_case(self, tmp_path, capsys):
+        """#17: trim3 looked for 'n' only when there was no 'N', so an 'n' before the
+        first 'N' survived into the codec and the whole encode aborted with "Invalid
+        character in sequence"."""
+        src = tmp_path / "in.fq"
+        self._write_fq(src, [
+            ("n_before_N", "ACGTnACGTACGTNACGT"),   # the failing case: cut at 4
+            ("N_before_n", "ACGTNACGTnACGT"),       # cut at 4
+            ("lower_only", "ACGTACGTnACGT"),        # cut at 8
+            ("upper_only", "ACGTACGTACNGT"),        # cut at 10
+            ("n_at_0", "nACGT"),                    # cut at 0: an empty record
+        ])
+        out = str(tmp_path / "o.zna")
+        encode_command(self._args([str(src)], out, quiet=False))
+        with open(out, "rb") as fh:
+            seqs = [r[0] for r in ZnaReader(fh).records()]
+        assert [len(x) for x in seqs] == [4, 4, 8, 10, 0], seqs
+        assert "removed 37 bases in 5 records" in capsys.readouterr().err
+
     def _norm_zna(self, path):
         header = ZnaHeader(read_group="g", strand_specific=False,
                            strand_normalized=True, seq_len_bytes=1)

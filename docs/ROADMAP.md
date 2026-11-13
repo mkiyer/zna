@@ -49,12 +49,14 @@ sidecar will be built.
 This section used to record a live inconsistency: the compiled backend substituted the
 policy base for **any** unencodable character while the reference substituted only
 `N`/`n` and raised on the rest. 0.4.0's alphabet strictness (`docs/archive/NPOLICY_PLAN.md`
-§8.2) resolved it in the strict direction — **both backends now raise, naming the
-character and its offset**, and only `N`/`n` is ever substitutable, under every policy.
-Verified directly against both backends (`encode_block` with an `R` under
-`--npolicy random`: both raise) while auditing for the 0.5.0 trailer work, which found
-this section still claiming the divergence was open. No divergence between the codec
-backends is currently known.
+§8.2) resolved it in the strict direction — **both backends now raise**, and only
+`N`/`n` is ever substitutable, under every policy. Verified directly against both backends
+(`encode_block` with an `R` under `--npolicy random`: both raise) while auditing for the
+0.5.0 trailer work, which found this section still claiming the divergence was open. No
+divergence in what the backends store is known. Their error *messages* differ: the
+compiled codec names the character and its offset, and the reference codec does not.
+This section used to say both name them, which was checked and corrected on 2026-11-13
+(issue #18).
 
 ---
 

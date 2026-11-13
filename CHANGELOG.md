@@ -73,6 +73,16 @@ shorter than the read proves the molecule ended inside it.
   trim3 it divided by the bases left after the cut, so it overstated the share and
   could exceed 100% (a 161-base read cut at base 80 read 101.2%, not 50.3%). The 1%
   threshold barely moves.
+- **`zna encode --npolicy trim3` cuts at the first no-call of either case** (#17). It
+  looked for `n` only when a record had no `N`, so in `ACGTnACGTACGTNACGT` it cut at the
+  `N`. The earlier `n` reached the codec, and the whole encode aborted with "Invalid
+  character in sequence", leaving a file with no trailer. Mixed case occurs in reads cut
+  from a soft-masked reference. `--npolicy random` and `zna merge` were not affected.
+- METHODS §4.1 describes the N policies zna has had since 0.4.0, `trim3` and `random`
+  (#16). It no longer lists the removed `drop` and `A`/`C`/`G`/`T`. It notes the `ZN` byte's
+  per-record mark, and gives each backend's invalid-character message, which only the
+  compiled codec makes specific (#18). ROADMAP's record of the resolved codec divergence
+  made the same claim about the message and is corrected too.
 - METHODS §3.4 no longer claims that an exact reverse-complement pair proves a full
   overlap, and says why its old measurement (10051/10051 detected, 0/9949 false
   positives) could not see repeats. §3.6 and §3.8 describe the new rule and record.

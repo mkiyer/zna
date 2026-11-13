@@ -1504,9 +1504,13 @@ def encode_command(args):
             it is "bases removed", not "no-calls found" -- the same quantity `zna merge`
             reports, so the two halves of the pipeline are directly comparable.
             """
+            # The first no-call of EITHER case (#17). Looking for 'n' only when
+            # there was no 'N' cut "ACGTnACGTNACGT" at the N and left the earlier n
+            # for the codec, which refused it and aborted the whole encode.
             i = seq.find('N')
-            if i < 0:
-                i = seq.find('n')
+            j = seq.find('n', 0, i if i >= 0 else len(seq))
+            if j >= 0:
+                i = j
             return (seq, 0) if i < 0 else (seq[:i], len(seq) - i)
 
         def _count_subs(seq):
