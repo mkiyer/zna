@@ -7,6 +7,9 @@ two C++ extensions with pure-Python fallbacks, and a CLI (`zna encode|decode|ins
 Deeper references: [`docs/METHODS.md`](../docs/METHODS.md) for how the format and the
 merge kernel actually work, [`docs/ROADMAP.md`](../docs/ROADMAP.md) for what has already
 been tried and closed by measurement, [`CHANGELOG.md`](../CHANGELOG.md) for what shipped.
+Open work (bugs, planned work, ideas, open questions) is in
+[GitHub Issues](https://github.com/mkiyer/zna/issues), not in a document: a fix says
+`Fixes #N` in its commit, and docs and code cite `issue #N`.
 
 ## Layout
 

@@ -1,128 +1,36 @@
 # ZNA roadmap
 
-What is scheduled, what is being considered, and — the section most worth reading before
-proposing something — what has already been tried and closed by measurement.
+What has already been tried and closed by measurement — the section most worth reading
+before proposing something. Open work, whether scheduled, considered or an open question,
+is in [GitHub Issues](https://github.com/mkiyer/zna/issues).
 
 Shipped work is not described here; see [CHANGELOG.md](../CHANGELOG.md). How the current
 algorithms work is [METHODS.md](METHODS.md).
 
 ---
 
-## Scheduled
+## Moved to GitHub Issues
 
-### Fix — an exact reverse-complement pair is not proof of a full overlap
+On 2026-11-13 the open items this file held became issues, each with its text and a line
+naming the section it came from:
 
-`zna encode` flags an unmerged pair `IS_FULL_FRAGMENT` whenever R1 is the exact reverse
-complement of R2. A fragment longer than the read whose two ends carry the same read-length
-sequence passes that test, so both mates claim an end they do not have. Tandem repeats such as
-UBC do this. On a 19.2M-pair 2 × 150 transcriptome simulation, 1 such pair sits beside 110,923
-correct ones. Of those, 3,994 have inserts of exactly the read length, the cost of the
-recommended length gate. Report, reproduction, measurements and options:
-[FULL_OVERLAP_REPEAT_ISSUE.md](FULL_OVERLAP_REPEAT_ISSUE.md).
+| Section here | Issue |
+|---|---|
+| Fix — an exact reverse-complement pair is not proof of a full overlap | [#1](https://github.com/mkiyer/zna/issues/1), fixed in 0.7.0 |
+| Next — `zna encode`'s per-record driver into C++, which also lets `pigz` go | [#3](https://github.com/mkiyer/zna/issues/3) |
+| Faster table building for very long reads | [#4](https://github.com/mkiyer/zna/issues/4) |
+| `zna sample --fraction` | [#5](https://github.com/mkiyer/zna/issues/5) |
+| String labels | [#6](https://github.com/mkiyer/zna/issues/6) |
+| Categorical / dictionary-encoded labels | [#7](https://github.com/mkiyer/zna/issues/7) |
+| Per-column compression | [#8](https://github.com/mkiyer/zna/issues/8) |
+| Label indexes | [#9](https://github.com/mkiyer/zna/issues/9) |
+| Label arithmetic | [#10](https://github.com/mkiyer/zna/issues/10) |
+| Arrow / Parquet export | [#11](https://github.com/mkiyer/zna/issues/11) |
+| Open questions in the label model | [#12](https://github.com/mkiyer/zna/issues/12), [#13](https://github.com/mkiyer/zna/issues/13) |
 
-### Next — `zna encode`'s per-record driver into C++, which also lets `pigz` go
+---
 
-Scheduled as 0.6.0 until the merge-accuracy work took that number (a breaking change to
-the merge output belongs in a minor release of its own). Nothing about it changed.
-
-Two items in one because the second falls out of the first for free, and the second is
-the reason not to treat 0.5.2's gzip work as finished.
-
-**ZNA now has four ways to inflate a `.gz`** — ISA-L, a `pigz` subprocess, a `gzip`
-subprocess, and the stdlib — which is one more than 0.5.1 had and three more than anyone
-wants. The end state is **two**: ISA-L, and the stdlib behind it. What stands in the way
-is not the decompressor, it is *how `zna encode` reads*.
-
-`zna merge` hands raw buffers to a C++ chunk parser and reads them in big blocks on a
-prefetch thread, so an in-process inflate that releases the GIL overlaps perfectly and
-ISA-L wins outright. `zna encode` drives `readline` from the main thread, so its inflate
-competes with a GIL-bound parse loop and a separate *process* beats a faster
-*implementation* — 5.50 s against 6.54 s on 1M records. That is why `pigz` is still first
-there and cannot simply be deleted.
-
-**A prefetch thread does not rescue it, and this was measured rather than assumed.**
-Wrapping ISA-L in a Python prefetching reader recovers only 1.08x (3.05 s → 2.85 s) and
-is still 0.79x of the `pigz` pipe: the `readinto` hop and the buffer copy give back what
-the overlap wins, and the GIL is still in the loop. There is no arrangement of threads
-that fixes a main-thread `readline` parse.
-
-So the ordering is: **move the encode driver to C++ first** — which is worth doing on its
-own evidence, since the compiled codec is ~3% of `zna encode` and the Python per-record
-work is most of the rest (see the numbers below) — and *then* encode reads chunks like
-merge does, ISA-L wins there too, and the two subprocess paths, `_DecompressPipe`,
-`_GUNZIP_COMMANDS`, the child reaping and the SIGPIPE special-casing all delete. 0.5.1
-had to fix a leaked `pigz` child and prefetch thread; that whole class of bug goes with
-them.
-
-Until then 0.5.2's four paths are a deliberate way station, not the design.
-
-#### Why the codec itself is not the target
-
-
-
-Recorded here because the obvious guess is wrong and cost this round a detour. Profiling
-`zna encode` found the **compiled codec at ~3% of the time**: zstd is another 3%
-(`--uncompressed` 4.95 s against `--level 9` 5.10 s on 1M records), the Python FASTQ
-parse is ~27%, and the rest is the per-record driver — `_read_key`, `write_record`,
-`_trim3`, `_pair_interleaved`, `_fragment_units`, one Python call each per record.
-
-**And the codec kernels have no SIMD headroom left**, which is worth knowing before
-someone repeats the merge fix on them. Measured on 30 Mbase, baseline flags:
-
-| kernel | shipped scalar | hand-written SSE2 |
-|---|---|---|
-| decode (packed → ASCII, `DECODE_LUT4`) | **5465 Mbase/s** | 2679 (0.49x) |
-| encode (ASCII → packed, table) | **1723 Mbase/s** | 1527 (0.89x) |
-
-Decode at 5465 Mbase/s is ~5.5 GB/s of stores — already memory-bandwidth-bound on this
-part, so no kernel can help. Encode is limited by four dependent table lookups per output
-byte, and beating that needs `pshufb` (SSSE3, not baseline) for a ~1.5% CLI win. Both
-left alone.
-
-The real fix is moving the per-record loop into C++, which is what `--merge-pairs`
-already does for the paired path — a minor-release-shaped change, not a patch release.
-
-
-## Considered, not scheduled
-
-### Faster table building for very long reads
-
-0.6's merge floor and plausibility table are exact integers built once per run and grown
-by doubling (`docs/METHODS.md` §2.1). `dfit` is now one exact step per overlap length
-(capacity 16,384 in 0.41 s, down from 44 s in the first port), but `T(N)` is still one
-50-digit `Decimal` logarithm per entry: ~1.2 s to reach a 10 kb read, against 0.09 s for
-the whole of 0.5.3's run on the same input. Irrelevant at Illumina lengths (a 2×150
-library never regrows past 256), and paid once per run, so it was accepted. The obvious
-shortcut — a float `log2` checked against exact bounds, falling back to `Decimal` only
-near a rounding boundary — would remove it; it has to keep the tables bit-identical,
-which is the whole reason they are exact.
-
-### `zna sample --fraction`
-
-A command writing a new ZNA holding a random fraction of an input's blocks or records.
-
-```bash
-zna sample --fraction 0.05 big.zna -o small.zna
-zna sample --records 1000000 big.zna -o small.zna
-```
-
-**Why it is not the first answer for training.** Training iterates the same corpus for
-many epochs and wants *different* reads each pass; a static subset freezes one draw. The
-runtime path already covers that — `block_index()` to size the file, `blocks(indices=…)`
-to draw a fresh block subset per epoch — without materialising anything.
-
-It is still worth having for publishing a small public excerpt, cheap CI fixtures, and
-pinning an evaluation set that must not vary between runs.
-
-**Sketch.** Block-granular sampling is nearly free: copy whole compressed payloads
-through without decoding, rewriting only block headers. Record granularity needs a
-decode/re-encode pass. Start with blocks, and treat `--records N` as rounding to whole
-blocks. Both require a shuffled input to be statistically meaningful.
-
-Since format version 3 a block holds whole fragments, so the block-granular path cannot
-orphan a mate and needs no fragment logic of its own — it copies payloads and is done.
-The record-granular path would have to group mates itself, which is the second reason to
-start with blocks.
+## Superseded
 
 ### Stored block index (sidecar) — SUPERSEDED by the 0.5.0 trailer
 
@@ -133,48 +41,6 @@ indexes it with no full download — the remote-corpus case this item existed fo
 bump (count-0 pseudo-blocks; 0.4.1 readers decode them as valid empty blocks), which
 dissolves the "a footer would be misread" objection that justified a sidecar. No
 sidecar will be built.
-
-### String labels
-
-The fixstr (`Z`) dtype was dropped to simplify the initial format. Three ways back:
-
-| Option | Shape | Cost |
-|---|---|---|
-| **A — quoted strings** | `MD:Z:"50 A2"`; unquoted values still split on whitespace | minimal format change, backward-compatible |
-| B — binary-safe fixed-width | programmatic API only, null-padded; headers stay numeric-only | no parser change, no header support |
-| C — variable-length (`V`) | 2-byte length + UTF-8 | needs a different block layout (offset table); most flexible, most complex |
-
-Start with **A** when string labels are actually needed.
-
-### Categorical / dictionary-encoded labels
-
-Tags like `tp:A` have a tiny alphabet. A per-block dictionary plus per-record indices
-compresses ~8× for a 4-value categorical against raw `uint8`. New dtype code `E`,
-dictionary written before the column, falling back to raw storage above a cardinality
-threshold.
-
-### Per-column compression
-
-Today a block is one ZSTD frame over flags ‖ labels ‖ lengths ‖ sequences. Compressing
-each column independently would allow per-column strategies (RLE for flags, delta for
-sorted labels, plain ZSTD for near-random sequences) and — the real win — **selective
-column reads**, skipping the sequence payload entirely when only labels are wanted. The
-block header would carry per-column compressed sizes.
-
-### Label indexes
-
-For "all reads where `AS > 100`": store `(min, max)` per label per block in the block
-header and skip blocks whose range cannot match. Zero cost at write time.
-
-### Label arithmetic
-
-Some labels are derivable rather than stored — `insert_size`, an alignment-score gap, an
-is-mapped predicate. A small expression engine could compute them during encoding.
-
-### Arrow / Parquet export
-
-ZNA already stores labels columnar, so exporting them is mostly a metadata mapping —
-enabling zero-copy pandas/polars and SQL over label columns.
 
 ---
 
@@ -189,30 +55,6 @@ Verified directly against both backends (`encode_block` with an `R` under
 `--npolicy random`: both raise) while auditing for the 0.5.0 trailer work, which found
 this section still claiming the divergence was open. No divergence between the codec
 backends is currently known.
-
----
-
-## Open questions in the label model
-
-Two cases are currently *defined but not validated*, and both concern paired input:
-
-- **R1 and R2 with different tag subsets.** Each mate is read independently, so a tag
-  present on only one resolves to that label's `missing` value on the other. Nothing
-  reports it.
-- **Conflicting tag values on a merged read.** `zna merge` builds the merged record's
-  name from R1's header, so R1's tags survive and R2's are discarded. That is right for a
-  per-*fragment* tag (the production case — transcript and gene assignment agree across
-  mates by construction) and lossy for a genuinely per-*mate* one.
-
-  The subtle part: **whether a fragment contributes one label row or two is decided by the
-  merge policy**, so for a per-mate tag the column's meaning varies with sequence content
-  and with `--alpha`, `--error-rate` and `--adapter-trimmed`. Nothing per record says
-  which branch a fragment took beyond its shape (one full-fragment record or two mates).
-
-  `zna merge` cannot validate this — it is a FASTQ tool with no concept of label
-  definitions, and comparing all tags would false-positive on legitimately per-mate ones.
-  The check belongs in `--merge-pairs`, where the encoder holds both headers *and* knows
-  which tags were declared as labels. See [MERGE_PAIRS_PLAN.md](archive/MERGE_PAIRS_PLAN.md) §3.5.
 
 ---
 

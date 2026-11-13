@@ -167,8 +167,8 @@ long reads among 2,000 chr22 pairs:
 The port rebuilt each `dfit` tail from `bⁿ` down, 6.7× per doubling; 0.6.0 advances
 the exact tail one step per overlap length (`binom_cap`, `params.py`), capacity 16,384 in
 0.41 s. What remains is the floor table, one 50-digit `Decimal` logarithm per entry,
-~1.2 s to capacity 16,384 — on the main thread, once per run. `docs/ROADMAP.md` records
-the shortcut that would remove it. The scan itself is O(L²) per pair and takes
+~1.2 s to capacity 16,384 — on the main thread, once per run. [Issue #4](https://github.com/mkiyer/zna/issues/4)
+records the shortcut that would remove it. The scan itself is O(L²) per pair and takes
 milliseconds for such a read.
 
 ### Sanitizers

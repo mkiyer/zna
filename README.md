@@ -137,7 +137,7 @@ per stored byte at Zstd level 9 on random (worst-case, incompressible) sequence.
 > left alone:** its two kernels measure 5,465 Mbase/s (decode, already memory-bandwidth
 > bound) and 1,723 Mbase/s (encode), and hand-written SSE2 was *slower* than both. What
 > `zna encode` is actually limited by is its per-record Python driver — the compiled codec
-> is ~3% of the command — see `docs/ROADMAP.md`.
+> is ~3% of the command — see [issue #3](https://github.com/mkiyer/zna/issues/3).
 
 | Read Type | Encode (MB/s) | Decode (MB/s) | Encode (rec/s) | Decode (rec/s) | Compression |
 |---|---|---|---|---|---|
@@ -171,7 +171,7 @@ reference and the Python API are all below.
 | [docs/MERGE_BENCHMARK_RESULTS.md](docs/MERGE_BENCHMARK_RESULTS.md) | `zna merge` scored against known ground truth: 0.5.x head to head with fastp, and 0.6 against 0.5.3 pair by pair. Read this before changing `--alpha` or `--error-rate` |
 | [docs/archive/MERGE_ACCURACY_PLAN.md](docs/archive/MERGE_ACCURACY_PLAN.md) | the 0.6 merge policy, executed in 0.6.0: why each piece is there, what was measured and rejected, how it was qualified, and its known limits |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | compression ratios, throughput, and tuning |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | what is scheduled, what is being considered, and what was tried and closed by measurement |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | what was tried and closed by measurement; open work is in [GitHub Issues](https://github.com/mkiyer/zna/issues) |
 | [docs/RELEASING.md](docs/RELEASING.md) | publishing to PyPI and Bioconda *(maintainers)* |
 | [docs/TRAILER_PLAN.md](docs/TRAILER_PLAN.md) | the self-describing container: prologue, trailer, footer, `inspect --verify` — executed in 0.5.0; §14 records the amendments |
 | [docs/archive/MERGE_PAIRS_PLAN.md](docs/archive/MERGE_PAIRS_PLAN.md) | `zna encode --merge-pairs` — executed in 0.5.0 |
@@ -1652,8 +1652,9 @@ mypy src/zna/
 
 ## Future Enhancements
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) — what is scheduled, what is under consideration,
-and what has already been tried and closed by measurement.
+Open work, scheduled or under consideration, is in
+[GitHub Issues](https://github.com/mkiyer/zna/issues). What has already been tried and
+closed by measurement is [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ---
 

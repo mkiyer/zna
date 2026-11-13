@@ -354,7 +354,7 @@ Follow the house conventions: behavioral names, both backends, compiled and exte
 |---|---|
 | Format version bump to 4 | D1 — additive suffices; bump costs the ecosystem and buys only a cleaner refusal message. Revisit only if a change ever *reinterprets* existing bytes. |
 | `writer_version`/`shuffled` as header bits | D4 — bits don't round-trip 0.4.1 and `_shuffle.py` rebuilds headers; one source of truth. |
-| Per-column compression, label min/max indexes, string/categorical label dtypes (ROADMAP "considered") | Real format work with no current consumer; none is additive-only; each can ride a future genuine bump. Not this release. |
+| Per-column compression, label min/max indexes, string/categorical label dtypes (ROADMAP "considered"; now issues #6–#9) | Real format work with no current consumer; none is additive-only; each can ride a future genuine bump. Not this release. |
 | x86 merge-kernel tuning (ROADMAP 0.4.2) | Orthogonal to the format; needs a Linux box; unchanged schedule. |
 | msgpack/CBOR payload | JSON is stdlib, self-describing, debuggable, and small (a 100k-block file's index is ~2 MB raw, ~hundreds of KB compressed); zero new dependencies. |
 | khorana-side facts derivation (decode a bare `.zna` in khorana) | Superseded by this plan: the file describes itself, `zna verify` recounts, and khorana never re-implements format arithmetic. Pre-0.5 files get "re-encode with current zna". |
