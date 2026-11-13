@@ -10,6 +10,16 @@ algorithms work is [METHODS.md](METHODS.md).
 
 ## Scheduled
 
+### Fix — an exact reverse-complement pair is not proof of a full overlap
+
+`zna encode` flags an unmerged pair `IS_FULL_FRAGMENT` whenever R1 is the exact reverse
+complement of R2. A fragment longer than the read whose two ends carry the same read-length
+sequence passes that test, so both mates claim an end they do not have. Tandem repeats such as
+UBC do this. On a 19.2M-pair 2 × 150 transcriptome simulation, 1 such pair sits beside 110,923
+correct ones. Of those, 3,994 have inserts of exactly the read length, the cost of the
+recommended length gate. Report, reproduction, measurements and options:
+[FULL_OVERLAP_REPEAT_ISSUE.md](FULL_OVERLAP_REPEAT_ISSUE.md).
+
 ### Next — `zna encode`'s per-record driver into C++, which also lets `pigz` go
 
 Scheduled as 0.6.0 until the merge-accuracy work took that number (a breaking change to
