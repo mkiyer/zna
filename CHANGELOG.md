@@ -8,7 +8,7 @@ version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 rather than hold the change. Read the notes, not the number: a release that breaks your
 files says so in its first paragraph.
 
-## [Unreleased] — 0.7.0
+## [0.7.0] - 2026-11-14
 
 **`zna encode` on paired FASTQ writes different flags from 0.6, and every corpus whose
 consumer places fragment-end supervision must be re-encoded from source.** An unmerged
