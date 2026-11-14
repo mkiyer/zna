@@ -83,6 +83,11 @@ shorter than the read proves the molecule ended inside it.
   per-record mark, and gives each backend's invalid-character message, which only the
   compiled codec makes specific (#18). ROADMAP's record of the resolved codec divergence
   made the same claim about the message and is corrected too.
+- **CI and the release's macOS wheels run on GitHub's `macos-15` runner.** GitHub no longer
+  runs `macos-14`: since at least 2026-11-13 it refuses the job before any step runs, which
+  the run lists as cancelled, not failed. That silently dropped macOS from CI, and the
+  release workflow's macOS wheel build would have failed. `macos-15` is arm64 like
+  `macos-14`. cibuildwheel still builds x86_64 there too, for macOS 11.0 and later.
 - METHODS §3.4 no longer claims that an exact reverse-complement pair proves a full
   overlap, and says why its old measurement (10051/10051 detected, 0/9949 false
   positives) could not see repeats. §3.6 and §3.8 describe the new rule and record.
